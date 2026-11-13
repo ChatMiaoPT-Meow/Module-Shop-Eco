@@ -1,0 +1,350 @@
+package cn.autoforged.module_shop.client.screen;
+
+import cn.autoforged.module_shop.network.payload.ServerboundShopActionPayload;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
+import net.neoforged.neoforge.network.PacketDistributor;
+
+/**
+ * 兑换码输入弹窗（第七轮 P4）：半透明深色面板 + 单个输入框。
+ * <p>
+ * 交互：输入框自动聚焦、支持 Ctrl+V、输入内容自动大写去首尾空格；回车 = 确认；
+ * 确认后按钮置灰显示「兑换中...」防连点；失败时输入框变红并左右抖动、下方显示红色原因；
+ * 成功时显示奖励提示并短暂停留后自动关闭（奖励已进邮箱）。
+ */
+public class RedeemCodeScreen extends SkiaDialog {
+    private static final int PANEL_W = 280;
+    private static final int PANEL_H = 136;
+    /** 当前打开的弹窗（用于接收服务端回传结果）。 */
+    private static RedeemCodeScreen open;
+
+    private EditBox box;
+    private final java.util.List<Region> regions = new java.util.ArrayList<>();
+    private String hint = "";
+    private boolean error;
+    private boolean pending;
+    private boolean success;
+    private int shakeTicks;
+    /** 粘贴按钮命中区（输入框右侧的小图标）。 */
+    private final int[] pasteRect = new int[4];
+    /**
+     * 已输入的兑换码（纯界面状态）：从这里点「生成器 / 列表」再回来时本界面会被重新 init()，
+     * 不存一份刚敲的码就没了。
+     */
+    private static String codeStash;
+
+    public RedeemCodeScreen() {
+        super(Component.translatable("gui.module_shop.redeem.title"));
+    }
+
+    @Override
+    protected void init() {
+        open = this;
+        if (skiaInit()) {
+            return;
+        }
+        int x = (this.width - PANEL_W) / 2;
+        int y = (this.height - PANEL_H) / 2;
+        // 输入框右侧留出粘贴按钮的位置（28px）。
+        this.box = new EditBox(this.font, x + 22, y + 41, PANEL_W - 44 - 28, 18,
+                Component.translatable("gui.module_shop.redeem.hint"));
+        this.box.setMaxLength(48);
+        this.box.setHint(Component.translatable("gui.module_shop.redeem.hint"));
+        this.box.setBordered(false);
+        if (codeStash != null && !codeStash.isEmpty()) {
+            this.box.setValue(codeStash);   // 从生成器/列表返回：把刚输入的码填回去
+        }
+        this.addRenderableWidget(this.box);
+        this.setInitialFocus(this.box);
+    }
+
+    @Override
+    public boolean isPauseScreen() {
+        return false;
+    }
+
+    @Override
+    public void onClose() {
+        open = null;
+        codeStash = null;   // 真正离开这个界面：下次进来是干净的
+        Nav.back();
+    }
+
+    @Override
+    public void tick() {
+        super.tick();
+        if (this.shakeTicks > 0) {
+            this.shakeTicks--;
+        }
+        if (this.success && this.shakeTicks <= 0) {
+            // 成功提示展示约 1.5 秒后自动关闭
+            this.successTicks++;
+            if (this.successTicks > 30) {
+                onClose();
+            }
+        }
+    }
+
+    private int successTicks;
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_ENTER || keyCode == org.lwjgl.glfw.GLFW.GLFW_KEY_KP_ENTER) {
+            confirm();
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    private void confirm() {
+        if (this.pending || this.success) {
+            return;
+        }
+        // 只保留大写字母 / 数字 / 连字符，避免粘贴时带入空格或不可见字符。
+        String code = this.box.getValue().trim().toUpperCase(java.util.Locale.ROOT)
+                .replaceAll("[^A-Z0-9\\-]", "");
+        this.box.setValue(code);
+        if (code.isEmpty()) {
+            this.error = true;
+            this.hint = Component.translatable("msg.module_shop.redeem.empty").getString();
+            this.shakeTicks = 8;
+            return;
+        }
+        this.pending = true;
+        this.error = false;
+        this.hint = Component.translatable("gui.module_shop.redeem.ok").getString();
+        CompoundTag tag = new CompoundTag();
+        tag.putString("action", "redeem_code");
+        tag.putString("code", code);
+        ServerboundShopActionPayload.send(tag);
+    }
+
+    /** 服务端回传结果（ok + reason），由 ClientPayloadHandler 调用。 */
+    public static void applyResult(CompoundTag data) {
+        if (open == null) {
+            return;
+        }
+        open.pending = false;
+        if (data.getBoolean("ok")) {
+            open.error = false;
+            open.success = true;
+            open.successTicks = 0;
+            open.hint = Component.translatable("gui.module_shop.redeem.success").getString();
+        } else {
+            open.error = true;
+            open.success = false;
+            open.shakeTicks = 8;
+            open.hint = Component.translatable("msg.module_shop.redeem." + data.getString("reason")).getString();
+        }
+    }
+
+    @Override
+    public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
+        if (skiaRender(g, mouseX, mouseY, partialTick)) {
+            return;
+        }
+        super.render(g, mouseX, mouseY, partialTick);
+        this.regions.clear();
+        int x = (this.width - PANEL_W) / 2;
+        int y = (this.height - PANEL_H) / 2;
+        // 抖动：失败时整个面板左右晃动
+        int shake = this.shakeTicks > 0 ? (this.shakeTicks % 2 == 0 ? -2 : 2) : 0;
+        x += shake;
+        g.fill(x, y, x + PANEL_W, y + PANEL_H, 0xE6101114);
+        IOStyle.ring(g, x, y, PANEL_W, PANEL_H, 10, this.error ? IOStyle.RED : IOStyle.HAIR);
+        IOStyle.centerAt(g, this.font, Component.translatable("gui.module_shop.redeem.title"),
+                x + PANEL_W / 2, y + 12, IOStyle.TEXT);
+        if (this.box != null) {
+            this.box.setX(x + 22);
+        }
+        // 输入框描边（错误时红色）
+        IOStyle.ring(g, x + 20, y + 39, PANEL_W - 40 - 26, 22, 5, this.error ? IOStyle.RED : IOStyle.TAB_BORDER);
+        // 粘贴按钮：输入框右侧的小图标（悬停显示「粘贴」）
+        boolean pasteHover = IOStyle.inside(x + PANEL_W - 44, y + 39, 24, 22, mouseX, mouseY);
+        IOStyle.rounded(g, x + PANEL_W - 44, y + 39, 24, 22, 5,
+                pasteHover ? IOStyle.BLUE_TINT : IOStyle.FIELD_BG);
+        IOStyle.ring(g, x + PANEL_W - 44, y + 39, 24, 22, 5,
+                pasteHover ? IOStyle.TAB_SEL_BORDER : IOStyle.TAB_BORDER);
+        drawPasteIcon(g, x + PANEL_W - 38, y + 44, pasteHover ? IOStyle.BLUE : IOStyle.TEXT_2);
+        this.pasteRect[0] = x + PANEL_W - 44;
+        this.pasteRect[1] = y + 39;
+        this.pasteRect[2] = 24;
+        this.pasteRect[3] = 22;
+        addRegion(x + PANEL_W - 44, y + 39, 24, 22, "paste", null, null);
+        IOStyle.button(g, x + 20, y + PANEL_H - 52, 110, 18,
+                Component.translatable(this.pending ? "gui.module_shop.redeem.ok" : "gui.module_shop.confirm"),
+                this.font, mouseX, mouseY, !this.pending && !this.success, IOStyle.Btn.PRIMARY);
+        IOStyle.button(g, x + PANEL_W - 130, y + PANEL_H - 52, 110, 18,
+                Component.translatable("gui.module_shop.cancel"), this.font, mouseX, mouseY, true, IOStyle.Btn.GRAY);
+        // 管理员入口：固定在弹窗**左下角**（与确认/取消分行，不再互相压住）。
+        if (cn.autoforged.module_shop.client.ClientShopData.canAdmin) {
+            IOStyle.rounded(g, x + 16, y + PANEL_H - 24, 104, 16, 5, IOStyle.BLUE_TINT);
+            IOStyle.centerAt(g, this.font, Component.translatable("gui.module_shop.redeem.generator"),
+                    x + 68, y + PANEL_H - 20, IOStyle.BLUE);
+            addRegion(x + 16, y + PANEL_H - 24, 104, 16, "open_generator", null, null);
+        }
+        if (!this.hint.isEmpty()) {
+            IOStyle.centerAt(g, this.font, Component.literal(this.hint), x + PANEL_W / 2, y + PANEL_H - 66,
+                    this.error ? IOStyle.RED : this.success ? IOStyle.GREEN : IOStyle.TEXT_2);
+        }
+        // 悬停提示最后画，永远在最上层。
+        if (pasteHover) {
+            g.renderTooltip(this.font, Component.translatable("gui.module_shop.redeem.paste"), mouseX, mouseY);
+        }
+    }
+
+    // ------------------------------------------------------------------ Skija
+
+    private cn.autoforged.module_shop.client.ui.widget.SkiaTextField skBox;
+
+    @Override
+    protected void initSkia() {
+        String keep = this.box == null ? codeStash : this.box.getValue();
+        this.skBox = field(48, Component.translatable("gui.module_shop.redeem.hint").getString());
+        this.box = this.skBox.editBox();
+        if (keep != null && !keep.isEmpty()) {
+            this.box.setValue(keep);
+        }
+        this.skBox.onChange(t -> {
+            if (this.error) {
+                this.error = false;
+            }
+        });
+        this.skBox.focus();
+    }
+
+    @Override
+    protected void paint(io.github.humbleui.skija.Canvas c) {
+        float w = 270.0F;
+        boolean admin = cn.autoforged.module_shop.client.ClientShopData.canAdmin;
+        float h = HEADER_H + 12 + 20 + 22 + 20 + PAD + (admin ? 22 : 0);
+        float shake = this.shakeTicks > 0 ? (this.shakeTicks % 2 == 0 ? -2.5F : 2.5F) : 0;
+        float x = Math.round((this.width - w) / 2.0F) + shake;
+        float y = Math.round((this.height - h) / 2.0F);
+        float innerX = x + PAD;
+        float innerW = w - PAD * 2;
+        panel(c, x, y, w, h, this.title.getString());
+        if (this.error) {
+            cn.autoforged.module_shop.client.ui.render.Draw.stroke(c, x, y, w, h, 0, 1, IOStyle.RED);
+        }
+        float fy = y + HEADER_H + 12;
+        this.skBox.bounds(innerX, fy, innerW - 26, 20);
+        if (this.error) {
+            cn.autoforged.module_shop.client.ui.render.Draw.stroke(c, innerX - 1, fy - 1, innerW - 24, 22, 4, 1.2F,
+                    IOStyle.RED);
+        }
+        // 粘贴按钮
+        float px = innerX + innerW - 22;
+        float hv = hover("paste", px, fy, 22, 20);
+        cn.autoforged.module_shop.client.ui.render.Draw.fill(c, px, fy, 22, 20, 3,
+                cn.autoforged.module_shop.client.ui.render.Draw.lerp(IOStyle.FIELD_BG, IOStyle.BLUE_TINT, hv));
+        cn.autoforged.module_shop.client.ui.render.Draw.stroke(c, px, fy, 22, 20, 3, 1,
+                cn.autoforged.module_shop.client.ui.render.Draw.lerp(IOStyle.BORDER_DIM, IOStyle.BLUE, hv));
+        int ic = cn.autoforged.module_shop.client.ui.render.Draw.lerp(IOStyle.TEXT_2, IOStyle.BLUE, hv);
+        cn.autoforged.module_shop.client.ui.render.Draw.stroke(c, px + 6.5F, fy + 5, 9, 11, 1.5F, 1.1F, ic);
+        cn.autoforged.module_shop.client.ui.render.Draw.fill(c, px + 9, fy + 4, 4, 2.5F, 1, ic);
+        hit(px, fy, 22, 20, this::pasteFromClipboard, null);
+        if (hv > 0.5F) {
+            tip(Component.translatable("gui.module_shop.redeem.paste"));
+        }
+        // 提示行
+        float hy = fy + 20 + 11;
+        if (!this.hint.isEmpty()) {
+            center(c, this.hint, innerX, hy, innerW,
+                    this.error ? IOStyle.RED : this.success ? IOStyle.GREEN : IOStyle.TEXT_2);
+        }
+        float by = fy + 20 + 22;
+        float bw = (innerW - 8) / 2;
+        button(c, "confirm", Component.translatable(this.pending ? "gui.module_shop.redeem.ok"
+                        : "gui.module_shop.confirm").getString(), innerX, by, bw, 20,
+                cn.autoforged.module_shop.client.ui.widget.Button.Kind.ACCENT, !this.pending && !this.success,
+                this::confirm);
+        button(c, "cancel", Component.translatable("gui.module_shop.cancel").getString(), innerX + bw + 8, by, bw, 20,
+                cn.autoforged.module_shop.client.ui.widget.Button.Kind.NORMAL, true, this::onClose);
+        if (admin) {
+            float ay = by + 26;
+            cn.autoforged.module_shop.client.ui.render.Draw.fill(c, x + 1, ay - 4, w - 2, 0.5F, 0, IOStyle.HAIR);
+            float lw = cn.autoforged.module_shop.client.ui.render.Text.width(
+                    Component.translatable("gui.module_shop.redeem.generator").getString(),
+                    cn.autoforged.module_shop.client.ui.AtomUi.REGULAR, cn.autoforged.module_shop.client.ui.render.Text.SMALL);
+            float ahv = hover("gen", innerX, ay, lw + 14, 14);
+            small(c, Component.translatable("gui.module_shop.redeem.generator").getString() + " ›", innerX, ay + 7,
+                    innerW, cn.autoforged.module_shop.client.ui.render.Draw.lerp(IOStyle.TEXT_2, IOStyle.BLUE, ahv));
+            hit(innerX, ay, lw + 14, 14, () -> {
+                codeStash = this.box.getValue();
+                Nav.open(new RedeemGeneratorScreen());
+            }, null);
+        }
+    }
+
+    /** 手绘小剪贴板图标（10×11）：外框 + 顶部夹子 + 右下角内页，风格与模组其它图标一致。 */
+    private void drawPasteIcon(GuiGraphics g, int x, int y, int color) {
+        IOStyle.ring(g, x, y + 1, 9, 10, 2, color);
+        g.fill(x + 3, y, x + 6, y + 1, color);
+        IOStyle.rounded(g, x + 4, y + 5, 6, 6, 1, IOStyle.withAlpha(IOStyle.BLUE, 200));
+        IOStyle.ring(g, x + 4, y + 5, 6, 6, 1, color);
+    }
+
+    /** 粘贴系统剪贴板内容到输入框（只保留大写字母 / 数字 / 连字符）。 */
+    private void pasteFromClipboard() {
+        String clip = net.minecraft.client.Minecraft.getInstance().keyboardHandler.getClipboard();
+        if (clip == null || clip.isEmpty()) {
+            return;
+        }
+        String cleaned = clip.trim().toUpperCase(java.util.Locale.ROOT).replaceAll("[^A-Z0-9\\-]", "");
+        if (!cleaned.isEmpty()) {
+            this.box.setValue(cleaned);
+            this.error = false;
+            this.hint = "";
+        }
+    }
+
+    private void addRegion(int x, int y, int w, int h, String action, String rightAction, CompoundTag extra) {
+        this.regions.add(new Region(x, y, w, h, action, rightAction, extra));
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (skia()) {
+            return skiaClicked(mouseX, mouseY, button);
+        }
+        for (Region region : this.regions) {
+            if (!IOStyle.inside(region.x, region.y, region.w, region.h, mouseX, mouseY)) {
+                continue;
+            }
+            if (button == 0 && "open_generator".equals(region.action)) {
+                Bricks.click();
+                codeStash = this.box.getValue();
+                Nav.open(new RedeemGeneratorScreen());
+                return true;
+            }
+            if (button == 0 && "paste".equals(region.action)) {
+                Bricks.click();
+                pasteFromClipboard();
+                return true;
+            }
+            return true;
+        }
+        int x = (this.width - PANEL_W) / 2;
+        int y = (this.height - PANEL_H) / 2;
+        if (button == 0 && mouseX >= x + 20 && mouseX < x + 130 && mouseY >= y + PANEL_H - 52
+                && mouseY < y + PANEL_H - 34) {
+            Bricks.click();
+            confirm();
+            return true;
+        }
+        if (button == 0 && mouseX >= x + PANEL_W - 130 && mouseX < x + PANEL_W - 20
+                && mouseY >= y + PANEL_H - 52 && mouseY < y + PANEL_H - 34) {
+            Bricks.click();
+            onClose();
+            return true;
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    private record Region(int x, int y, int w, int h, String action, String rightAction, CompoundTag extra) {
+    }
+}

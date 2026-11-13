@@ -1,0 +1,114 @@
+package cn.autoforged.module_shop.event;
+
+import cn.autoforged.module_shop.ModuleShopMod;
+import cn.autoforged.module_shop.command.ShopCommands;
+import cn.autoforged.module_shop.shop.NotificationManager;
+import cn.autoforged.module_shop.shop.ShopManager;
+import cn.autoforged.module_shop.shop.TradeManager;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
+
+@EventBusSubscriber(modid = ModuleShopMod.MODID)
+public final class ShopServerEvents {
+    private static int tickCounter;
+    /** 模板初始化只尝试一次（放在 tick 里做，比依赖 ServerStartedEvent 更稳）。 */
+    private static boolean templateInitChecked;
+
+    private ShopServerEvents() {
+    }
+
+    @SubscribeEvent
+    public static void onServerStarted(net.neoforged.neoforge.event.server.ServerStartedEvent event) {
+        cn.autoforged.module_shop.shop.http.ShopHttpApi.start(event.getServer());
+        // 新世界首次启动：用客户端 / 服务器的默认模板初始化商店。
+        // 老世界、已初始化过的世界、商品被改过的世界都不会被覆盖（判定见 TemplateService）。
+        try {
+            if (cn.autoforged.module_shop.Config.INSTANCE.templateInitEnabled.get()) {
+                cn.autoforged.module_shop.shop.TemplateService.initNewWorldIfNeeded(event.getServer());
+            }
+        } catch (Throwable ignored) {
+            // 初始化失败绝不阻断服务器启动
+        }
+        cn.autoforged.module_shop.shop.auction.AuctionService.reset();
+        cn.autoforged.module_shop.shop.stall.StallService.reset();
+        cn.autoforged.module_shop.shop.ShopManager.resetShippingTick();
+        cn.autoforged.module_shop.eco.profession.ProfessionConfig.reload();
+        cn.autoforged.module_shop.eco.quality.QualityEvaluator.reloadConfig();
+        cn.autoforged.module_shop.eco.profession.ProfessionBehaviorListeners.registerOptionalModHooks();
+        cn.autoforged.module_shop.eco.profession.PlacedBlockTracker.clearAll();
+    }
+
+    @SubscribeEvent
+    public static void onServerTick(ServerTickEvent.Post event) {
+        MinecraftServer server = event.getServer();
+        if (!templateInitChecked) {
+            templateInitChecked = true;
+            try {
+                if (cn.autoforged.module_shop.Config.INSTANCE.templateInitEnabled.get()) {
+                    cn.autoforged.module_shop.shop.TemplateService.initNewWorldIfNeeded(server);
+                } else {
+                    org.slf4j.LoggerFactory.getLogger("module_shop")
+                            .info("模板初始化已在配置中关闭（templateInitEnabled=false）");
+                }
+            } catch (Throwable error) {
+                org.slf4j.LoggerFactory.getLogger("module_shop")
+                        .warn("模板初始化调用失败：{}", error.toString(), error);
+            }
+        }
+        // 签到活动日：给「补发给离线玩家」的活动日补发（每个现实日期只执行一次）。
+        ShopManager.tickActivityDayOffline(server);
+        tickCounter++;
+        ShopManager.tickAuctions(server);
+        // 出货箱：每天早上 6:00 起的窗口内结算一次（内部有"当天已结算"的短路）。
+        ShopManager.tickShipping(server);
+        // 购物城：到「补货设置」里的时刻就把卖掉的库存补回目标数量（没开启时立刻返回）。
+        ShopManager.tickMallRestock(server);
+        TradeManager.tick(server);
+        NotificationManager.tick(server);
+        if (tickCounter % 20 == 0) {
+            ShopManager.tickDaily(server);
+            cn.autoforged.module_shop.eco.ClearingHouse.tickBlackMarketDaily(server, ShopManager.data(server));
+            // 摊位：到「下架时间」就把到期商品撤下（永久 / 时长 0 时立刻返回）。
+            ShopManager.tickStallExpire(server);
+            // 求购：到「下架时间」就撤下并退还托管的悬赏。
+            ShopManager.tickDemandExpire(server);
+            // 购物城：按「库存设置」的周期整店刷新库存（off 时立刻返回）。
+            ShopManager.tickMallRefresh(server);
+        }
+        // 放在最后：把本 tick 里所有 broadcastSnapshots 请求合并成一次下发。
+        ShopManager.flushBroadcastSnapshots(server);
+    }
+
+    @SubscribeEvent
+    public static void onLogin(PlayerEvent.PlayerLoggedInEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            ShopManager.onLogin(player);
+        }
+    }
+
+    @SubscribeEvent
+    public static void onLogout(PlayerEvent.PlayerLoggedOutEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            ShopManager.onLogout(player);
+            cn.autoforged.module_shop.network.ModNetwork.forgetPlayer(player.getUUID());
+        }
+    }
+
+    @SubscribeEvent
+    public static void onRegisterCommands(RegisterCommandsEvent event) {
+        ShopCommands.register(event.getDispatcher());
+    }
+
+    @SubscribeEvent
+    public static void onServerStopping(ServerStoppingEvent event) {
+        // 可选 HTTP API：关服时停掉监听
+        cn.autoforged.module_shop.shop.http.ShopHttpApi.stop();
+        TradeManager.shutdown(event.getServer());
+    }
+}
