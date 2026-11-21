@@ -10,6 +10,8 @@ import cn.autoforged.module_shop.data.ConfiguredOffer;
 import cn.autoforged.module_shop.data.DailyBuybackEntry;
 import cn.autoforged.module_shop.data.MallItem;
 import cn.autoforged.module_shop.data.PlayerAccount;
+import cn.autoforged.module_shop.data.PriceSpec;
+import cn.autoforged.module_shop.data.PriceSpec.CurrencyMode;
 import cn.autoforged.module_shop.data.Rarity;
 import cn.autoforged.module_shop.data.ShippingBin;
 import cn.autoforged.module_shop.data.ShopNbt;
@@ -21,8 +23,11 @@ import cn.autoforged.module_shop.eco.quality.QualityEvaluator;
 import cn.autoforged.module_shop.shop.ShippingRules;
 import cn.autoforged.module_shop.shop.ShopManager;
 import cn.autoforged.module_shop.shop.TransactionLog;
+import cn.autoforged.module_shop.shop.currency.CurrencySettlement;
+import cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -116,6 +121,10 @@ public final class ClearingHouse {
         int restored = 0;
         boolean eco = EcoPricing.isEcoActive();
         for (MallItem item : data.mallPool) {
+            if (item.permanentLimit) {
+                // 每人永久限购商品：绝不随定时刷新或自动补货重置玩家已购记录或补发库存
+                continue;
+            }
             boolean changed = false;
             if (!item.unlimited() && item.stockMax >= 0) {
                 int target;
@@ -176,37 +185,60 @@ public final class ClearingHouse {
         }
     }
 
-    /** 实时查询某玩家出售单件物品的官方到手预估单价（不扣减专注，供 API 与界面展示）。 */
+    /** 实时查询某玩家出售单件物品的官方到手预估单价（仅星币通道，供旧 API 兼容）。 */
     public static long liveQuoteShippingUnit(MinecraftServer server, UUID playerId, ItemStack stack) {
+        PriceSpec spec = liveQuoteShippingSpec(server, playerId, stack);
+        return spec.supportsStar() ? spec.starPrice : 0L;
+    }
+
+    /** 实时查询某玩家出售单件物品的官方到手预估双账本定价规格。 */
+    public static PriceSpec liveQuoteShippingSpec(MinecraftServer server, UUID playerId, ItemStack stack) {
         if (server == null || stack == null || stack.isEmpty()) {
-            return 0L;
+            return PriceSpec.ZERO;
         }
         ShippingRules.Rule rule = ShippingRules.match(stack);
         if (rule == null) {
-            return 0L;
+            return PriceSpec.ZERO;
+        }
+        PriceSpec baseSpec = rule.resolvePriceSpec();
+        if (CurrencySettlement.isBlockingBuybackAndShippingForSpec(
+                stack, baseSpec, server.registryAccess(), rule.kind() == ShippingRules.Kind.ITEM)) {
+            return PriceSpec.ZERO;
         }
         QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(stack);
         if (qr.rejected()) {
-            return 0L;
+            return PriceSpec.ZERO;
+        }
+        if (!baseSpec.supportsStar()) {
+            return baseSpec;
         }
         ShopSavedData data = ShopManager.data(server);
         PlayerAccount account = playerId == null ? null : data.account(playerId);
         long gameDay = server.overworld().getDayTime() / 24000L;
         double profMult = ProfessionManager.previewProfessionMultiplier(data, account, gameDay, stack);
-        ShippingApi.EvalResult ext = ShippingModifierRegistry.evaluate(playerId, stack, rule.price(), rule.dailyMax());
-        long basePrice = Math.max(rule.price(), qr.intrinsicBaseFloor());
-        return EcoPricing.computeBuyoutUnitAtStock(
+        ShippingApi.EvalResult ext = ShippingModifierRegistry.evaluate(
+                playerId, stack, baseSpec.starPrice, rule.dailyMax());
+        long basePrice = Math.max(baseSpec.starPrice, qr.intrinsicBaseFloor());
+        long dynStar = EcoPricing.computeBuyoutUnitAtStock(
                 data, stack, basePrice,
                 qr.multiplier(),
                 profMult * ext.priceMultiplier(),
                 rule.dailyMax(), 0
         );
+        if (dynStar <= 0L) {
+            if (baseSpec.mode == CurrencyMode.EITHER && baseSpec.supportsPhys()) {
+                return PriceSpec.phys(baseSpec.physTierKey, baseSpec.physCount);
+            }
+            return PriceSpec.ZERO;
+        }
+        return baseSpec.withStarPrice(dynStar);
     }
 
     /**
-     * 原子结算单个玩家的出货箱：
-     * 逐件检查品质拒收 -> 黑市满仓停收 -> 专注点余额动态切换 -> 个人日限额 -> 钱包空间 -> 官方总钱箱保底余额。
-     * 任何一步受限都只截断本次卖出数量，未卖出的物品 100% 原封不动留在箱内，绝不吞半个物品！
+     * 原子结算单个玩家的出货箱（双独立并行账本版本）：
+     * - 星币账本严格走 {@link ShopTreasury}、星币日限额与钱包上限；
+     * - 实体货币账本完全旁路总钱箱与星币日限额，严格在实体链内发放；
+     * - 任何一步受限都只截断本次卖出数量，未卖出的物品 100% 原封不动留在箱内。
      */
     public static void settleShippingBinEco(MinecraftServer server, ShopSavedData data, UUID owner,
                                             PlayerAccount account, long gameDay, long realDay,
@@ -253,8 +285,14 @@ public final class ClearingHouse {
         boolean treasuryCapped = false;
         boolean warehouseCapped = false;
         boolean wasteRejected = false;
+        boolean currencyBlocked = false;
+        boolean physUnavailable = false;
 
-        long totalPayout = 0L;
+        PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+        boolean physActive = physCfg.isActive();
+
+        long totalStarPayout = 0L;
+        Map<String, Long> physPayoutByTier = new LinkedHashMap<>();
         long specialtyPayout = 0L;
         int totalSoldCount = 0;
         List<String> soldSummary = new ArrayList<>();
@@ -270,18 +308,42 @@ public final class ClearingHouse {
             if (rule == null) {
                 continue;
             }
+            PriceSpec ruleSpec = rule.resolvePriceSpec();
+            if (!ruleSpec.isValid()) {
+                continue;
+            }
+            if (server != null && CurrencySettlement.isBlockingBuybackAndShippingForSpec(
+                    stack, ruleSpec, server.registryAccess(), rule.kind() == ShippingRules.Kind.ITEM)) {
+                currencyBlocked = true;
+                continue;
+            }
             QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(stack);
             if (qr.rejected()) {
-                wasteRejected = true; // 烧糊菜 / 黑暗料理 / 失败品留在箱内拒收，绝不给钱也不销毁
+                wasteRejected = true;
                 continue;
             }
 
-            ShippingApi.EvalResult ext = ShippingModifierRegistry.evaluate(owner, stack, rule.price(), rule.dailyMax());
+            long starRefForExt = ruleSpec.supportsStar() ? ruleSpec.starPrice : 0L;
+            ShippingApi.EvalResult ext = ShippingModifierRegistry.evaluate(owner, stack, starRefForExt, rule.dailyMax());
             int perDayMax = rule.dailyMax() <= 0 ? 0
                     : Math.max(1, (int) Math.round(rule.dailyMax() * ext.ruleDailyMaxMultiplier()));
             int usedCount = bin.ruleUsed.getOrDefault(rule.line(), 0);
             int maxByRule = perDayMax <= 0 ? stack.getCount() : Math.max(0, perDayMax - usedCount);
             if (maxByRule <= 0) {
+                continue;
+            }
+
+            boolean physReady = false;
+            String canonTierKey = "";
+            if (ruleSpec.supportsPhys() && server != null && physActive) {
+                var resolved = physCfg.findResolvedTier(ruleSpec.physTierKey, server.registryAccess());
+                if (resolved != null) {
+                    canonTierKey = resolved.spec.tierKey();
+                    physReady = true;
+                }
+            }
+            if ((ruleSpec.mode == CurrencyMode.PHYS_ONLY || ruleSpec.mode == CurrencyMode.BOTH) && !physReady) {
+                physUnavailable = true;
                 continue;
             }
 
@@ -292,50 +354,100 @@ public final class ClearingHouse {
                     profLevel, Config.INSTANCE.baseFocusCostPerItem.get());
             double focusBonusMult = EcoPricing.computeProfessionFocusMultiplier(
                     profLevel, Config.INSTANCE.maxProfessionPriceBonus.get(), scarcityMult);
-            long baseUnit = Math.max(rule.price(), qr.intrinsicBaseFloor());
+            long baseStarUnit = ruleSpec.supportsStar()
+                    ? Math.max(ruleSpec.starPrice, qr.intrinsicBaseFloor())
+                    : 0L;
+            int warehouseLeft = eco ? EcoPricing.remainingWarehouseCapacity(data, stack, rule.dailyMax()) : Integer.MAX_VALUE;
 
             int soldInThisSlot = 0;
-            long gainInThisSlot = 0L;
+            long starGainInThisSlot = 0L;
+            long physGainInThisSlot = 0L;
             boolean anyFocusUsedInSlot = false;
 
             int tryCount = Math.min(stack.getCount(), maxByRule);
             for (int k = 0; k < tryCount; k++) {
+                if (eco && soldInThisSlot >= warehouseLeft) {
+                    warehouseCapped = true;
+                    break;
+                }
+
+                if (ruleSpec.mode == CurrencyMode.PHYS_ONLY) {
+                    soldInThisSlot++;
+                    physGainInThisSlot += ruleSpec.physCount;
+                    continue;
+                }
+
                 boolean canUseFocus = ProfessionManager.isEnabled()
                         && !profId.isEmpty()
                         && account.career.focusSellEnabled
                         && account.career.focusPoints + 1e-6D >= focusCostPerUnit;
                 double profMult = (canUseFocus ? focusBonusMult : scarcityMult) * ext.priceMultiplier();
+                long starUnit = EcoPricing.computeBuyoutUnitAtStock(
+                        data, stack, baseStarUnit, qr.multiplier(), profMult, rule.dailyMax(), soldInThisSlot);
 
-                long unitPrice = EcoPricing.computeBuyoutUnitAtStock(
-                        data, stack, baseUnit, qr.multiplier(), profMult, rule.dailyMax(), soldInThisSlot);
-                if (unitPrice <= 0L) {
-                    warehouseCapped = true; // 该物资已满仓停收
+                boolean starQuotaOk = remainingQuota == Long.MAX_VALUE || starUnit <= remainingQuota;
+                boolean starTreasuryOk = !eco || starUnit <= treasurySpendable;
+                boolean starAffordable = starUnit > 0L && starQuotaOk && starTreasuryOk;
+
+                if (ruleSpec.mode == CurrencyMode.EITHER) {
+                    if (starAffordable) {
+                        if (canUseFocus) {
+                            account.career.focusPoints = Math.max(0.0D, account.career.focusPoints - focusCostPerUnit);
+                            anyFocusUsedInSlot = true;
+                        }
+                        soldInThisSlot++;
+                        starGainInThisSlot += starUnit;
+                        if (remainingQuota != Long.MAX_VALUE) {
+                            remainingQuota -= starUnit;
+                        }
+                        if (eco) {
+                            treasurySpendable -= starUnit;
+                        }
+                        continue;
+                    }
+                    if (physReady) {
+                        soldInThisSlot++;
+                        physGainInThisSlot += ruleSpec.physCount;
+                        continue;
+                    }
+                    if (starUnit <= 0L) {
+                        warehouseCapped = true;
+                    } else if (!starTreasuryOk) {
+                        treasuryCapped = true;
+                    }
                     break;
                 }
-                if (remainingQuota != Long.MAX_VALUE && unitPrice > remainingQuota) {
+
+                // STAR_ONLY or BOTH
+                if (starUnit <= 0L) {
+                    warehouseCapped = true;
                     break;
                 }
-                if (eco && unitPrice > treasurySpendable) {
+                if (!starQuotaOk) {
+                    break;
+                }
+                if (!starTreasuryOk) {
                     treasuryCapped = true;
                     break;
                 }
-
-                // 单件校验全部通过，扣减本件专注与额度
                 if (canUseFocus) {
                     account.career.focusPoints = Math.max(0.0D, account.career.focusPoints - focusCostPerUnit);
                     anyFocusUsedInSlot = true;
                 }
                 soldInThisSlot++;
-                gainInThisSlot += unitPrice;
+                starGainInThisSlot += starUnit;
+                if (ruleSpec.mode == CurrencyMode.BOTH) {
+                    physGainInThisSlot += ruleSpec.physCount;
+                }
                 if (remainingQuota != Long.MAX_VALUE) {
-                    remainingQuota -= unitPrice;
+                    remainingQuota -= starUnit;
                 }
                 if (eco) {
-                    treasurySpendable -= unitPrice;
+                    treasurySpendable -= starUnit;
                 }
             }
 
-            if (soldInThisSlot <= 0 || gainInThisSlot <= 0L) {
+            if (soldInThisSlot <= 0 || (starGainInThisSlot <= 0L && physGainInThisSlot <= 0L)) {
                 continue;
             }
 
@@ -349,73 +461,36 @@ public final class ClearingHouse {
                     ? stack.copyWithCount(stack.getCount() - soldInThisSlot)
                     : ItemStack.EMPTY);
 
-            totalPayout += gainInThisSlot;
+            totalStarPayout += starGainInThisSlot;
+            if (physGainInThisSlot > 0L && !canonTierKey.isEmpty()) {
+                physPayoutByTier.merge(canonTierKey, physGainInThisSlot, Long::sum);
+            }
             totalSoldCount += soldInThisSlot;
-            if (!profId.isEmpty()) {
-                specialtyPayout += gainInThisSlot;
-                account.career.recordVerifiedRevenue(gameDay, profId, gainInThisSlot);
+            if (!profId.isEmpty() && starGainInThisSlot > 0L) {
+                specialtyPayout += starGainInThisSlot;
+                account.career.recordVerifiedRevenue(gameDay, profId, starGainInThisSlot);
             }
             soldSummary.add(soldCopy.getHoverName().getString() + "×" + soldInThisSlot);
             ResourceLocation itemKey = BuiltInRegistries.ITEM.getKey(soldCopy.getItem());
             settledLines.add(new ShippingSettledEvent.SettledLine(
                     itemKey == null ? "unknown" : itemKey.toString(),
                     soldInThisSlot,
-                    gainInThisSlot / soldInThisSlot,
-                    gainInThisSlot,
+                    starGainInThisSlot / soldInThisSlot,
+                    starGainInThisSlot,
                     profId,
                     anyFocusUsedInSlot
             ));
         }
 
-        ServerPlayer online = server.getPlayerList().getPlayer(owner);
-        if (totalPayout <= 0L) {
+        ServerPlayer online = server == null ? null : server.getPlayerList().getPlayer(owner);
+        if (totalSoldCount <= 0 || (totalStarPayout <= 0L && physPayoutByTier.isEmpty())) {
             if (online != null && !bin.isEmpty()) {
-                String msgKey;
-                if (treasuryCapped) {
-                    msgKey = "msg.module_shop.treasury_capped";
-                } else if (warehouseCapped) {
-                    msgKey = "msg.module_shop.warehouse_full";
-                } else if (wasteRejected) {
-                    msgKey = "msg.module_shop.waste_rejected";
-                } else if (bankFull) {
-                    msgKey = "msg.module_shop.shipping_bank_full";
-                } else {
-                    msgKey = "msg.module_shop.shipping_capped";
-                }
-                online.displayClientMessage(Component.translatable(msgKey).withStyle(ChatFormatting.YELLOW), false);
-            }
-            return;
-        }
-
-        // 从官方总钱箱实扣星币并入玩家钱包
-        long paidByTreasury = eco
-                ? data.treasury.outflowUpTo(totalPayout, treasuryMinFloor, realDay)
-                : totalPayout;
-        long credited = ShopManager.credit(account, paidByTreasury, maxBalance);
-        if (credited < paidByTreasury) {
-            long rest = paidByTreasury - credited;
-            ShopManager.addMoneyMail(server, owner, rest, ItemStack.EMPTY, "shipping_unpaid", "", null);
-        }
-
-        bin.soldToday += paidByTreasury;
-        bin.lastPayout = paidByTreasury;
-        bin.lastCount = totalSoldCount;
-        data.setDirty();
-
-        TransactionLog.record(server, owner, TransactionLog.SELL, "出货箱", paidByTreasury, account.balance,
-                String.join("、", soldSummary.size() > 6 ? soldSummary.subList(0, 6) : soldSummary)
-                        + (soldSummary.size() > 6 ? " 等" : ""));
-
-        // 补齐事件广播：驱动星途纪行与股市实业公司模块
-        ApiEvents.post(new SellCompletedEvent(owner, "shipping", "shipping-bin", ItemStack.EMPTY, totalSoldCount, paidByTreasury));
-        ApiEvents.post(new ShippingSettledEvent(owner, gameDay, paidByTreasury, specialtyPayout,
-                totalSoldCount, settledLines));
-
-        if (online != null) {
-            online.displayClientMessage(Component.translatable("msg.module_shop.shipping_sold",
-                    totalSoldCount, paidByTreasury).withStyle(ChatFormatting.GREEN), false);
-            if (!bin.isEmpty()) {
-                if (treasuryCapped) {
+                if (physUnavailable) {
+                    online.displayClientMessage(Component.translatableWithFallback(
+                            "msg.module_shop.phys_tier_unavailable",
+                            "出货箱所需实体货币档位未启用或不存在，部分物品已保留")
+                            .withStyle(ChatFormatting.YELLOW), false);
+                } else if (treasuryCapped) {
                     online.displayClientMessage(Component.translatable("msg.module_shop.treasury_capped")
                             .withStyle(ChatFormatting.YELLOW), false);
                 } else if (warehouseCapped) {
@@ -424,6 +499,87 @@ public final class ClearingHouse {
                 } else if (wasteRejected) {
                     online.displayClientMessage(Component.translatable("msg.module_shop.waste_rejected")
                             .withStyle(ChatFormatting.YELLOW), false);
+                } else if (currencyBlocked) {
+                    online.displayClientMessage(Component.translatableWithFallback(
+                            "msg.module_shop.phys_sell_blocked_arbitrage",
+                            "防套利保护：已启用的实体货币物品禁止通过出货箱出售")
+                            .withStyle(ChatFormatting.RED), false);
+                } else if (bankFull) {
+                    online.displayClientMessage(Component.translatable("msg.module_shop.shipping_bank_full")
+                            .withStyle(ChatFormatting.YELLOW), false);
+                } else {
+                    online.displayClientMessage(Component.translatable("msg.module_shop.shipping_capped")
+                            .withStyle(ChatFormatting.YELLOW), false);
+                }
+            }
+            return;
+        }
+
+        // 1) 星币账本发放（受总钱箱调控）
+        long paidByTreasury = 0L;
+        if (totalStarPayout > 0L) {
+            paidByTreasury = CurrencySettlement.payoutStarOnly(
+                    server, owner, account, data, totalStarPayout, true, true,
+                    "shipping_unpaid", "", net.minecraft.world.item.ItemStack.EMPTY);
+        }
+
+        // 2) 实体货币账本发放（完全旁路总钱箱，按配置档位发放实体币/满包转邮箱）
+        for (Map.Entry<String, Long> pe : physPayoutByTier.entrySet()) {
+            if (pe.getValue() > 0L) {
+                CurrencySettlement.payoutPhysTier(server, owner, pe.getKey(), pe.getValue(), "shipping");
+            }
+        }
+
+        String payoutText = formatShippingPayoutSummary(server, paidByTreasury, physPayoutByTier);
+        bin.soldToday += paidByTreasury;
+        bin.lastPayout = paidByTreasury;
+        bin.lastPhysPayout.clear();
+        bin.lastPhysPayout.putAll(physPayoutByTier);
+        bin.lastPayoutSummary = payoutText;
+        bin.lastCount = totalSoldCount;
+        data.setDirty();
+
+        String itemNote = String.join("、", soldSummary.size() > 6 ? soldSummary.subList(0, 6) : soldSummary)
+                + (soldSummary.size() > 6 ? " 等" : "");
+        if (!physPayoutByTier.isEmpty() && paidByTreasury <= 0L) {
+            itemNote = itemNote + " [" + payoutText + "]";
+        }
+        TransactionLog.record(server, owner, TransactionLog.SELL, "出货箱", paidByTreasury, account.balance, itemNote);
+
+        ApiEvents.post(new SellCompletedEvent(owner, "shipping", "shipping-bin", ItemStack.EMPTY, totalSoldCount, paidByTreasury));
+        ApiEvents.post(new ShippingSettledEvent(owner, gameDay, paidByTreasury, specialtyPayout,
+                totalSoldCount, settledLines));
+
+        if (online != null) {
+            if (physPayoutByTier.isEmpty()) {
+                online.displayClientMessage(Component.translatable("msg.module_shop.shipping_sold",
+                        totalSoldCount, paidByTreasury).withStyle(ChatFormatting.GREEN), false);
+            } else {
+                online.displayClientMessage(Component.translatableWithFallback(
+                        "msg.module_shop.shipping_sold_dual",
+                        "出货箱结算完成：共卖出 %s 件，获得 %s",
+                        totalSoldCount, payoutText).withStyle(ChatFormatting.GREEN), false);
+            }
+            if (!bin.isEmpty()) {
+                if (physUnavailable) {
+                    online.displayClientMessage(Component.translatableWithFallback(
+                            "msg.module_shop.phys_tier_unavailable",
+                            "出货箱所需实体货币档位未启用或不存在，部分物品已保留")
+                            .withStyle(ChatFormatting.YELLOW), false);
+                } else if (treasuryCapped) {
+                    online.displayClientMessage(Component.translatable("msg.module_shop.treasury_capped")
+                            .withStyle(ChatFormatting.YELLOW), false);
+                } else if (warehouseCapped) {
+                    online.displayClientMessage(Component.translatable("msg.module_shop.warehouse_full")
+                            .withStyle(ChatFormatting.YELLOW), false);
+                } else if (wasteRejected) {
+                    online.displayClientMessage(Component.translatable("msg.module_shop.waste_rejected")
+                            .withStyle(ChatFormatting.YELLOW), false);
+                } else if (currencyBlocked) {
+                    online.displayClientMessage(Component.translatableWithFallback(
+                            "msg.module_shop.phys_sell_blocked_arbitrage",
+                            "防套利保护：已启用的实体货币物品禁止通过出货箱出售")
+                            .withStyle(ChatFormatting.RED), false);
                 }
             }
             if (postSyncCallback != null) {
@@ -434,9 +590,33 @@ public final class ClearingHouse {
         }
     }
 
-    /** 预估当前出货箱内待结算物品可得总金额（含动态供需、品质溢价、专注点与总钱箱可用上限）。 */
+    public static String formatShippingPayoutSummary(MinecraftServer server, long starAmount,
+                                                     Map<String, Long> physCounts) {
+        List<String> parts = new ArrayList<>();
+        if (starAmount > 0L) {
+            parts.add(starAmount + " " + ShopManager.currencyName(server));
+        }
+        if (physCounts != null) {
+            for (Map.Entry<String, Long> e : physCounts.entrySet()) {
+                if (e.getValue() != null && e.getValue() > 0L) {
+                    parts.add(e.getValue() + " " + CurrencySettlement.tierDisplayName(e.getKey(), server));
+                }
+            }
+        }
+        return parts.isEmpty() ? ("0 " + ShopManager.currencyName(server)) : String.join(" + ", parts);
+    }
+
+    /** 预估当前出货箱内待结算物品可得星币金额（仅统计星币轨道）。 */
     public static long previewShippingPendingValue(MinecraftServer server, ShopSavedData data,
                                                    UUID owner, PlayerAccount account, long realDay) {
+        return previewShippingPending(server, data, owner, account, realDay).starTotal();
+    }
+
+    public record PendingShippingQuote(long starTotal, Map<String, Long> physCounts) {
+    }
+
+    public static PendingShippingQuote previewShippingPending(MinecraftServer server, ShopSavedData data,
+                                                              UUID owner, PlayerAccount account, long realDay) {
         ShippingBin bin = account.shipping;
         ProfessionManager.ensureFocusRefreshed(account);
         long gameDay = server == null ? 0L : server.overworld().getDayTime() / 24000L;
@@ -454,8 +634,12 @@ public final class ClearingHouse {
                 : Long.MAX_VALUE;
         remaining = Math.min(remaining, treasurySpendable);
 
+        PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+        boolean physActive = physCfg.isActive();
+
         double simulatedFocus = account.career.focusPoints;
         long total = 0L;
+        Map<String, Long> physTotals = new LinkedHashMap<>();
         Map<Integer, Integer> countedByRule = new HashMap<>();
         Map<String, Integer> virtualStockOffsets = new HashMap<>();
 
@@ -467,11 +651,20 @@ public final class ClearingHouse {
             if (rule == null) {
                 continue;
             }
+            PriceSpec ruleSpec = rule.resolvePriceSpec();
+            if (!ruleSpec.isValid()) {
+                continue;
+            }
+            if (server != null && CurrencySettlement.isBlockingBuybackAndShippingForSpec(
+                    stack, ruleSpec, server.registryAccess(), rule.kind() == ShippingRules.Kind.ITEM)) {
+                continue;
+            }
             QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(stack);
             if (qr.rejected()) {
                 continue;
             }
-            ShippingApi.EvalResult ext = ShippingModifierRegistry.evaluate(owner, stack, rule.price(), rule.dailyMax());
+            ShippingApi.EvalResult ext = ShippingModifierRegistry.evaluate(
+                    owner, stack, ruleSpec.supportsStar() ? ruleSpec.starPrice : 0L, rule.dailyMax());
             int perDay = rule.dailyMax() <= 0 ? 0
                     : Math.max(1, (int) Math.round(rule.dailyMax() * ext.ruleDailyMaxMultiplier()));
             int used = bin.soldDay == realDay ? bin.ruleUsed.getOrDefault(rule.line(), 0) : 0;
@@ -482,30 +675,67 @@ public final class ClearingHouse {
                 continue;
             }
 
+            boolean physReady = ruleSpec.supportsPhys() && physActive && server != null
+                    && physCfg.findResolvedTier(ruleSpec.physTierKey, server.registryAccess()) != null;
+            String canonTierKey = physReady ? physCfg.canonicalTierKey(ruleSpec.physTierKey) : "";
+            if ((ruleSpec.mode == CurrencyMode.PHYS_ONLY || ruleSpec.mode == CurrencyMode.BOTH) && !physReady) {
+                continue;
+            }
+
             String profId = ProfessionManager.matchProfessionForOutput(stack);
             int profLv = profId.isEmpty() ? 1 : account.career.getLevel(profId);
             double scarcity = profId.isEmpty() ? 1.0D : ProfessionManager.computeScarcityMultiplier(data, gameDay, profId);
             double focusCost = EcoPricing.computeFocusCostPerItem(profLv, Config.INSTANCE.baseFocusCostPerItem.get());
             double focusMult = EcoPricing.computeProfessionFocusMultiplier(
                     profLv, Config.INSTANCE.maxProfessionPriceBonus.get(), scarcity);
-            long baseUnit = Math.max(rule.price(), qr.intrinsicBaseFloor());
+            long baseUnit = ruleSpec.supportsStar() ? Math.max(ruleSpec.starPrice, qr.intrinsicBaseFloor()) : 0L;
             String bKey = EcoPricing.bucketKey(stack);
+            int warehouseLeft = eco ? EcoPricing.remainingWarehouseCapacity(data, stack, rule.dailyMax()) : Integer.MAX_VALUE;
 
             int soldHere = 0;
             for (int k = 0; k < tryCount; k++) {
+                if (eco && soldHere >= warehouseLeft) {
+                    break;
+                }
+                if (ruleSpec.mode == CurrencyMode.PHYS_ONLY) {
+                    physTotals.merge(canonTierKey, ruleSpec.physCount, Long::sum);
+                    soldHere++;
+                    continue;
+                }
                 boolean useFocus = ProfessionManager.isEnabled() && !profId.isEmpty()
                         && account.career.focusSellEnabled && simulatedFocus + 1e-6D >= focusCost;
                 double profMult = (useFocus ? focusMult : scarcity) * ext.priceMultiplier();
                 int offset = virtualStockOffsets.getOrDefault(bKey, 0);
                 long unit = EcoPricing.computeBuyoutUnitAtStock(
                         data, stack, baseUnit, qr.multiplier(), profMult, rule.dailyMax(), offset);
-                if (unit <= 0L || (remaining != Long.MAX_VALUE && total + unit > remaining)) {
+                boolean starFit = unit > 0L && (remaining == Long.MAX_VALUE || total + unit <= remaining);
+                if (ruleSpec.mode == CurrencyMode.EITHER) {
+                    if (starFit) {
+                        if (useFocus) {
+                            simulatedFocus -= focusCost;
+                        }
+                        total += unit;
+                        soldHere++;
+                        virtualStockOffsets.put(bKey, offset + 1);
+                        continue;
+                    }
+                    if (physReady) {
+                        physTotals.merge(canonTierKey, ruleSpec.physCount, Long::sum);
+                        soldHere++;
+                        continue;
+                    }
+                    break;
+                }
+                if (!starFit) {
                     break;
                 }
                 if (useFocus) {
                     simulatedFocus -= focusCost;
                 }
                 total += unit;
+                if (ruleSpec.mode == CurrencyMode.BOTH) {
+                    physTotals.merge(canonTierKey, ruleSpec.physCount, Long::sum);
+                }
                 soldHere++;
                 virtualStockOffsets.put(bKey, offset + 1);
             }
@@ -513,12 +743,11 @@ public final class ClearingHouse {
                 countedByRule.merge(rule.line(), soldHere, Integer::sum);
             }
         }
-        return total;
+        return new PendingShippingQuote(total, physTotals);
     }
 
     /**
-     * 为指定玩家生成动态出货箱规则文本（下发给客户端 ShippingBinScreen / ShippingPage 实时显示涨跌后单价）。
-     * 注意：管理页编辑读取的是 adminShippingRaw，因此这里下发动态单价绝不会污染 TOML 原文！
+     * 为指定玩家生成动态出货箱规则文本（仅对支持星币通道部分缩放动态价格，纯实体部分原样保留）。
      */
     public static String buildDynamicShipRulesText(MinecraftServer server, ServerPlayer player, ShopSavedData data) {
         if (!EcoPricing.isEcoActive() || server == null || player == null) {
@@ -541,16 +770,18 @@ public final class ClearingHouse {
             }
             ShippingRules.Rule r = entry.rule();
             ItemStack sample = i < sampleStacks.size() ? sampleStacks.get(i) : ItemStack.EMPTY;
-            long dynPrice = r.price();
+            PriceSpec spec = r.resolvePriceSpec();
+            PriceSpec dynSpec = spec;
             int dynMax = r.dailyMax();
             if (!sample.isEmpty()) {
                 double profMult = ProfessionManager.previewProfessionMultiplier(data, account, gameDay, sample);
                 ShippingApi.EvalResult ext = ShippingModifierRegistry.evaluate(
-                        player.getUUID(), sample, r.price(), r.dailyMax());
-                long q = EcoPricing.computeBuyoutUnitAtStock(
-                        data, sample, r.price(), 1.0D, profMult * ext.priceMultiplier(), r.dailyMax(), 0);
-                // 若满仓停收(q==0)，保留配置行但压至 1 或在出货箱概览展示停收，避免格式报错
-                dynPrice = Math.max(1L, q);
+                        player.getUUID(), sample, spec.supportsStar() ? spec.starPrice : 0L, r.dailyMax());
+                if (spec.supportsStar()) {
+                    long q = EcoPricing.computeBuyoutUnitAtStock(
+                            data, sample, spec.starPrice, 1.0D, profMult * ext.priceMultiplier(), r.dailyMax(), 0);
+                    dynSpec = spec.withStarPrice(Math.max(1L, q));
+                }
                 if (dynMax > 0) {
                     dynMax = Math.max(1, (int) Math.round(dynMax * ext.ruleDailyMaxMultiplier()));
                 }
@@ -560,7 +791,7 @@ public final class ClearingHouse {
                 case NAMESPACE -> r.value() + ":*";
                 case ITEM -> r.value();
             };
-            sb.append(left).append('=').append(dynPrice);
+            sb.append(left).append('=').append(dynSpec.toRuleText());
             if (dynMax > 0) {
                 sb.append(" x").append(dynMax);
             }
@@ -570,8 +801,8 @@ public final class ClearingHouse {
     }
 
     /**
-     * 每日收购定向生成（「4 本职槽 + 2 跨职社交槽」+ 当日锁定动态报价）：
-     * 保证专精玩家每天有 4 个本职消耗急单，同时留 2 个跨职槽促进玩家逛摊位互买物资凑全清大奖。
+     * 每日收购定向生成（「4 本职槽 + 2 跨职社交槽」+ 当日锁定双账本报价）：
+     * 纯实体条目绕过星币总钱箱与乘数；星币部分若被压价/拒收则剔除或降级（EITHER -> PHYS_ONLY）。
      */
     public static void generateDailyBuybackEco(ServerPlayer player, PlayerAccount account, ShopSavedData data,
                                                int maxDailySlots) {
@@ -581,32 +812,66 @@ public final class ClearingHouse {
         long gameDay = player.server.overworld().getDayTime() / 24000L;
         boolean eco = EcoPricing.isEcoActive();
         int defaultCap = Config.INSTANCE.buybackCapacity.get();
+        PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+        boolean physActive = physCfg.isActive();
 
-        // 先逐项试算今日动态收购单价：已满仓停收(dyn == 0)或受 1 星币防套利锁禁收的条目直接剔除出候选池，
-        // 绝不退回原价绕过限制，也避免刷出无法交付的死单卡住玩家的「全清奖励」。
-        java.util.IdentityHashMap<ConfiguredOffer, Long> quotedPrices = new java.util.IdentityHashMap<>();
+        java.util.IdentityHashMap<ConfiguredOffer, PriceSpec> quotedSpecs = new java.util.IdentityHashMap<>();
         List<ConfiguredOffer> allPool = new ArrayList<>();
         for (ConfiguredOffer offer : data.buybackPool) {
-            if (offer == null || offer.stack == null || offer.stack.isEmpty() || offer.price <= 0L) {
+            if (offer == null || offer.stack == null || offer.stack.isEmpty()) {
                 continue;
             }
-            long unitPrice = offer.price;
+            PriceSpec spec = offer.resolvePriceSpec();
+            if (!spec.isValid()) {
+                continue;
+            }
+            if (CurrencySettlement.isBlockingBuybackAndShippingForSpec(
+                    offer.stack, spec, player.server.registryAccess(), true)) {
+                continue;
+            }
+            boolean physReady = spec.supportsPhys() && physActive
+                    && physCfg.findResolvedTier(spec.physTierKey, player.server.registryAccess()) != null;
+            if ((spec.mode == CurrencyMode.PHYS_ONLY || spec.mode == CurrencyMode.BOTH) && !physReady) {
+                continue;
+            }
             if (eco) {
                 QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(offer.stack);
                 if (qr.rejected()) {
                     continue;
                 }
-                double profMult = ProfessionManager.previewProfessionMultiplier(data, account, gameDay, offer.stack);
-                long dyn = EcoPricing.computeBuyoutUnitAtStock(
-                        data, offer.stack, Math.max(offer.price, qr.intrinsicBaseFloor()),
-                        Math.max(1.0D, qr.multiplier()), profMult,
-                        offer.amountOr(defaultCap), 0);
-                if (dyn <= 0L) {
-                    continue;
-                }
-                unitPrice = dyn;
             }
-            quotedPrices.put(offer, unitPrice);
+
+            PriceSpec effectiveSpec = spec;
+            if (spec.supportsStar()) {
+                long starUnit = spec.starPrice;
+                if (eco) {
+                    QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(offer.stack);
+                    double profMult = ProfessionManager.previewProfessionMultiplier(data, account, gameDay, offer.stack);
+                    long dyn = EcoPricing.computeBuyoutUnitAtStock(
+                            data, offer.stack, Math.max(spec.starPrice, qr.intrinsicBaseFloor()),
+                            Math.max(1.0D, qr.multiplier()), profMult,
+                            offer.amountOr(defaultCap), 0);
+                    if (dyn <= 0L) {
+                        if (spec.mode == CurrencyMode.EITHER && physReady) {
+                            effectiveSpec = PriceSpec.phys(physCfg.canonicalTierKey(spec.physTierKey), spec.physCount);
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        effectiveSpec = spec.withStarPrice(dyn);
+                    }
+                }
+            } else if (eco && EcoPricing.remainingWarehouseCapacity(data, offer.stack, offer.amountOr(defaultCap)) <= 0) {
+                continue;
+            }
+
+            if (effectiveSpec.supportsPhys() && physReady) {
+                effectiveSpec = effectiveSpec.withPhysTierKey(physCfg.canonicalTierKey(effectiveSpec.physTierKey));
+            } else if (effectiveSpec.mode == CurrencyMode.EITHER && !physReady) {
+                effectiveSpec = PriceSpec.star(effectiveSpec.starPrice);
+            }
+
+            quotedSpecs.put(offer, effectiveSpec);
             allPool.add(offer);
         }
         if (allPool.isEmpty()) {
@@ -623,7 +888,7 @@ public final class ClearingHouse {
         List<ConfiguredOffer> pickedList = new ArrayList<>(slots);
 
         if (!majorJob.isEmpty() && slots >= 4) {
-            int wantMajor = Math.max(1, (slots * 2) / 3); // 6 槽时取 4 本职 + 2 跨职
+            int wantMajor = Math.max(1, (slots * 2) / 3);
             List<ConfiguredOffer> majorPool = new ArrayList<>();
             List<ConfiguredOffer> crossPool = new ArrayList<>();
             for (ConfiguredOffer offer : allPool) {
@@ -654,11 +919,11 @@ public final class ClearingHouse {
         }
 
         for (ConfiguredOffer picked : pickedList) {
-            long unitPrice = quotedPrices.getOrDefault(picked, picked.price);
-            if (unitPrice <= 0L) {
+            PriceSpec finalSpec = quotedSpecs.getOrDefault(picked, picked.resolvePriceSpec());
+            if (!finalSpec.isValid()) {
                 continue;
             }
-            DailyBuybackEntry entry = new DailyBuybackEntry(picked.stack.copy(), unitPrice);
+            DailyBuybackEntry entry = new DailyBuybackEntry(picked.stack.copy(), finalSpec);
             entry.rarity = picked.rarity == null ? Rarity.COMMON : picked.rarity;
             entry.limit = Math.max(1, picked.amountOr(defaultCap));
             account.dailyBuyback.add(entry);
@@ -691,13 +956,36 @@ public final class ClearingHouse {
         long personalExUsed = account.exchangeDay == quotaDay ? account.exchangeToday : 0L;
         ecoTag.putLong("exchangePersonalCap", personalExCap);
         ecoTag.putLong("exchangePersonalUsed", personalExUsed);
+        ecoTag.putLong("exchangePersonalBaseCap", Math.max(0L, Config.INSTANCE.playerDailyExchangeCap.get()));
+        ecoTag.putLong("exchangeGlobalCapCfg", Math.max(0L, Config.INSTANCE.globalDailyFxCap.get()));
         ecoTag.putLong("exchangeGlobalRoom", computeGlobalExchangeRoom(data, quotaDay));
 
-        // 玩家专注点与职业列表
+        // 玩家专注点与职业列表 + 职业专精可配置参数同步
+        ProfessionConfig profCfg = ProfessionConfig.get();
+        int profMaxLv = profCfg.resolvedMaxLevel();
         ecoTag.putInt("focus", (int) Math.floor(Math.max(0.0D, account.career.focusPoints)));
         ecoTag.putInt("focusMax", Config.INSTANCE.maxFocusCap.get());
         ecoTag.putInt("focusDaily", Config.INSTANCE.dailyFocusRestore.get());
         ecoTag.putBoolean("focusOn", account.career.focusSellEnabled);
+        ecoTag.putInt("profMaxLevel", profMaxLv);
+        ecoTag.putDouble("profStarterBonus", profCfg.starterPriceBonus);
+        ecoTag.putDouble("profMaxBonus", profCfg.maxPriceBonus);
+        ecoTag.putDouble("profBaseFocusCost", Config.INSTANCE.baseFocusCostPerItem.get());
+        ecoTag.putDouble("profScarcityBonusMax", Config.INSTANCE.scarcityBonusMax.get());
+        ecoTag.putLong("profXpBase", profCfg.xpBase);
+        ecoTag.putLong("profXpLinear", profCfg.xpLinear);
+        ecoTag.putDouble("profXpQuad", profCfg.xpQuad);
+        long[] xpArr = new long[Math.max(0, profMaxLv - 1)];
+        for (int lv = 1; lv < profMaxLv; lv++) {
+            xpArr[lv - 1] = profCfg.xpRequiredForNextLevel(lv);
+        }
+        ecoTag.putLongArray("profLevelXp", xpArr);
+        int[] bonusBpsArr = new int[profMaxLv];
+        double fallbackMaxBonus = Config.INSTANCE.maxProfessionPriceBonus.get();
+        for (int lv = 1; lv <= profMaxLv; lv++) {
+            bonusBpsArr[lv - 1] = (int) Math.round(profCfg.bonusRatioForLevel(lv, fallbackMaxBonus) * 10000.0D);
+        }
+        ecoTag.putIntArray("profLevelBonusBps", bonusBpsArr);
 
         ListTag profList = new ListTag();
         for (ProfessionConfig.ProfessionSpec spec : ProfessionManager.activeSpecs()) {
@@ -730,12 +1018,18 @@ public final class ClearingHouse {
         }
         ecoTag.put("professions", profList);
 
-        // 下发所有商城与出货规则物品的「官方收价 / 官方卖价」参考字典，供玩家摊位同台比价显示！
+        // 下发所有商城与出货规则物品的「官方收价 / 官方卖价」参考字典（严格按星币价，避免把实体币条目 0 当官方星币锚点）
         CompoundTag refPrices = new CompoundTag();
         for (ShippingRules.Entry e : ShippingRules.entries()) {
             if (e.rule() != null && e.rule().kind() == ShippingRules.Kind.ITEM) {
-                CompoundTag rp = new CompoundTag();
-                rp.putLong("bid", e.rule().price());
+                PriceSpec rSpec = e.rule().resolvePriceSpec();
+                CompoundTag rp = refPrices.contains(e.rule().value())
+                        ? refPrices.getCompound(e.rule().value())
+                        : new CompoundTag();
+                if (rSpec.supportsStar()) {
+                    rp.putLong("bid", rSpec.starPrice);
+                }
+                rp.put("bidSpec", rSpec.toTag());
                 refPrices.put(e.rule().value(), rp);
             }
         }
@@ -744,11 +1038,17 @@ public final class ClearingHouse {
                 ResourceLocation rl = BuiltInRegistries.ITEM.getKey(mi.stack.getItem());
                 if (rl != null) {
                     String k = rl.toString();
+                    PriceSpec mSpec = mi.resolvePriceSpec();
                     CompoundTag rp = refPrices.contains(k) ? refPrices.getCompound(k) : new CompoundTag();
-                    long ask = (!mi.unlimited() && mi.supplyMode == SupplyMode.PLAYER_POOL)
-                            ? EcoPricing.computeMallAskAtStock(mi, Math.max(0, mi.stock))
-                            : mi.price;
-                    rp.putLong("ask", ask);
+                    if (mSpec.supportsStar()) {
+                        long ask = (!mi.unlimited() && mi.supplyMode == SupplyMode.PLAYER_POOL)
+                                ? EcoPricing.computeMallAskAtStock(mi, Math.max(0, mi.stock))
+                                : mSpec.starPrice;
+                        rp.putLong("ask", ask);
+                        rp.put("askSpec", mSpec.withStarPrice(ask).toTag());
+                    } else {
+                        rp.put("askSpec", mSpec.toTag());
+                    }
                     refPrices.put(k, rp);
                 }
             }
@@ -770,7 +1070,8 @@ public final class ClearingHouse {
                 bestLv = Math.max(bestLv, p.level);
             }
         }
-        double mult = 1.0D + ((bestLv - 1) / 99.0D);
+        int maxLv = ProfessionConfig.get().resolvedMaxLevel();
+        double mult = 1.0D + ((Math.min(maxLv, bestLv) - 1) / (double) Math.max(1, maxLv - 1));
         return Math.round(base * mult);
     }
 

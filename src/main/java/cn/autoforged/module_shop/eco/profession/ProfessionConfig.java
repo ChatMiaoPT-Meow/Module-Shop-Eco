@@ -25,8 +25,12 @@ import org.slf4j.LoggerFactory;
  * </ul>
  */
 public final class ProfessionConfig {
-    private static final Logger LOG = LoggerFactory.getLogger("module_shop_eco/professions");
-    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+    private static final class LogHolder {
+        private static final Logger LOG = LoggerFactory.getLogger("module_shop_eco/professions");
+    }
+    private static final class GsonHolder {
+        private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+    }
 
     public static final String COMBAT = "combat";
     public static final String ENCHANTING = "enchanting";
@@ -102,13 +106,107 @@ public final class ProfessionConfig {
     /** 调酒师绑定的酿酒/冰柜/榨汁方块列表。 */
     public List<String> boundBartendingBlocks = new ArrayList<>();
 
+    // ---- 职业专精成长与加价限制配置（支持游戏内「职业专精配置」界面热编辑落盘） ----
+    /** 职业最大等级（默认 100，支持 2~500 任意配置）。 */
+    public int maxLevel = 100;
+    /** Lv.1 起步专注精销加价比例（默认 0.05 = +5%）。 */
+    public double starterPriceBonus = 0.05D;
+    /** 满级专注精销最高加价比例上限（默认 0.60 = +60%）。 */
+    public double maxPriceBonus = 0.60D;
+    /** 默认经验公式参数：xp(lv) = xpBase + xpLinear * lv + xpQuad * lv * lv（当每级覆盖表未填或 <=0 时使用）。 */
+    public long xpBase = 50L;
+    public long xpLinear = 10L;
+    public double xpQuad = 0.5D;
+    /** 每级升级所需经验覆盖表：索引 i 对应 Lv.(i+1) -> Lv.(i+2) 所需经验（>0 生效）。 */
+    public List<Long> levelXpTable = new ArrayList<>();
+    /** 每级加价限制（售价加成比例上限，小数，如 0.25 = +25%）：索引 i 对应 Lv.(i+1) 的加价限制（>=0 生效）。 */
+    public List<Double> levelBonusCaps = new ArrayList<>();
+
     private static volatile ProfessionConfig instance;
+
+    /** 纯只读获取已加载的实例（不触发 FMLPaths，便于纯 JUnit 单测零依赖安全调用）。 */
+    public static ProfessionConfig getIfLoaded() {
+        return instance;
+    }
 
     public static synchronized ProfessionConfig get() {
         if (instance == null) {
             reload();
         }
         return instance;
+    }
+
+    public int resolvedMaxLevel() {
+        return Math.max(2, Math.min(500, this.maxLevel <= 0 ? 100 : this.maxLevel));
+    }
+
+    public static long formulaXp(int level, long base, long linear, double quad) {
+        int lv = Math.max(1, level);
+        long b = Math.max(0L, base);
+        long l = Math.max(0L, linear);
+        double q = Math.max(0.0D, quad);
+        return Math.max(1L, Math.round(b + l * (double) lv + q * (double) lv * (double) lv));
+    }
+
+    /** 查询从 currentLevel 升到 currentLevel + 1 所需经验（已达最大等级返回 0）。 */
+    public long xpRequiredForNextLevel(int currentLevel) {
+        int maxLv = resolvedMaxLevel();
+        if (currentLevel >= maxLv) {
+            return 0L;
+        }
+        int lv = Math.max(1, currentLevel);
+        int idx = lv - 1;
+        if (this.levelXpTable != null && idx >= 0 && idx < this.levelXpTable.size()) {
+            Long custom = this.levelXpTable.get(idx);
+            if (custom != null && custom > 0L) {
+                return custom;
+            }
+        }
+        return formulaXp(lv, this.xpBase, this.xpLinear, this.xpQuad);
+    }
+
+    /** 查询指定等级的专注精销加价限制比例（小数，如 0.25 表示 +25%）。 */
+    public double bonusRatioForLevel(int level, double fallbackMaxBonus) {
+        int maxLv = resolvedMaxLevel();
+        int lv = Math.max(1, Math.min(maxLv, level));
+        int idx = lv - 1;
+        if (this.levelBonusCaps != null && idx >= 0 && idx < this.levelBonusCaps.size()) {
+            Double custom = this.levelBonusCaps.get(idx);
+            if (custom != null && custom >= 0.0D && Double.isFinite(custom)) {
+                return Math.min(5.0D, custom);
+            }
+        }
+        double top = Math.max(0.0D, Math.min(5.0D, this.maxPriceBonus >= 0.0D ? this.maxPriceBonus : fallbackMaxBonus));
+        double starter = Math.min(Math.max(0.0D, this.starterPriceBonus), top);
+        return starter + (top - starter) * ((lv - 1) / (double) Math.max(1, maxLv - 1));
+    }
+
+    /** 归一化成长与加价配置字段，确保老版 professions.json 升级后无 null 或越界值。 */
+    public void sanitizeProgression() {
+        this.maxLevel = Math.max(2, Math.min(500, this.maxLevel <= 0 ? 100 : this.maxLevel));
+        if (!Double.isFinite(this.starterPriceBonus) || this.starterPriceBonus < 0.0D) {
+            this.starterPriceBonus = 0.05D;
+        }
+        if (!Double.isFinite(this.maxPriceBonus) || this.maxPriceBonus < 0.0D) {
+            this.maxPriceBonus = 0.60D;
+        }
+        this.starterPriceBonus = Math.min(5.0D, this.starterPriceBonus);
+        this.maxPriceBonus = Math.min(5.0D, Math.max(this.starterPriceBonus, this.maxPriceBonus));
+        if (this.xpBase < 0L) {
+            this.xpBase = 50L;
+        }
+        if (this.xpLinear < 0L) {
+            this.xpLinear = 10L;
+        }
+        if (!Double.isFinite(this.xpQuad) || this.xpQuad < 0.0D) {
+            this.xpQuad = 0.5D;
+        }
+        if (this.levelXpTable == null) {
+            this.levelXpTable = new ArrayList<>();
+        }
+        if (this.levelBonusCaps == null) {
+            this.levelBonusCaps = new ArrayList<>();
+        }
     }
 
     public static synchronized void reload() {
@@ -118,17 +216,20 @@ public final class ProfessionConfig {
             Files.createDirectories(dir);
             Path file = dir.resolve("professions.json");
             if (Files.isRegularFile(file)) {
-                ProfessionConfig parsed = GSON.fromJson(Files.readString(file, StandardCharsets.UTF_8), ProfessionConfig.class);
+                ProfessionConfig parsed = GsonHolder.GSON.fromJson(Files.readString(file, StandardCharsets.UTF_8), ProfessionConfig.class);
                 if (parsed != null && parsed.professions != null && !parsed.professions.isEmpty()) {
+                    parsed.sanitizeProgression();
                     instance = parsed;
                     return;
                 }
             } else {
-                Files.writeString(file, GSON.toJson(defaults), StandardCharsets.UTF_8);
+                defaults.sanitizeProgression();
+                Files.writeString(file, GsonHolder.GSON.toJson(defaults), StandardCharsets.UTF_8);
             }
         } catch (Throwable ex) {
-            LOG.warn("[ModuleShop-Eco] 读取 professions.json 失败，使用内置默认职业配置：{}", ex.toString());
+            LogHolder.LOG.warn("[ModuleShop-Eco] 读取 professions.json 失败，使用内置默认职业配置：{}", ex.toString());
         }
+        defaults.sanitizeProgression();
         instance = defaults;
     }
 
@@ -140,10 +241,10 @@ public final class ProfessionConfig {
             Path dir = FMLPaths.CONFIGDIR.get().resolve("module_shop_eco");
             Files.createDirectories(dir);
             Path file = dir.resolve("professions.json");
-            Files.writeString(file, GSON.toJson(instance), StandardCharsets.UTF_8);
+            Files.writeString(file, GsonHolder.GSON.toJson(instance), StandardCharsets.UTF_8);
             return true;
         } catch (Throwable ex) {
-            LOG.warn("[ModuleShop-Eco] 保存 professions.json 失败：{}", ex.toString());
+            LogHolder.LOG.warn("[ModuleShop-Eco] 保存 professions.json 失败：{}", ex.toString());
             return false;
         }
     }
@@ -334,7 +435,7 @@ public final class ProfessionConfig {
                         "minecraft:feather", "minecraft:honey_bottle", "minecraft:honeycomb",
                         "minecraft:beef", "minecraft:porkchop", "minecraft:chicken", "minecraft:mutton", "minecraft:rabbit",
                         "#minecraft:wool", "#c:crops", "#c:seeds", "#c:eggs",
-                        "flavor_immersed_daily_argo:*", "guaniao:*", "wilderflowers:*"
+                        "flavor_immersed_daily_argo:*", "guaniao:*", "wilderflowers:*", "kaleidoscope_flora:*"
                 )
         ));
 
@@ -352,7 +453,7 @@ public final class ProfessionConfig {
                         "upgrade_aquatic:cooked_pike", "upgrade_aquatic:cooked_perch", "upgrade_aquatic:cooked_lionfish",
                         "tlm_overture:sweet_berry_cake", "tlm_overture:sweet_berry_candy",
                         "kaleidoscope_cookery:*", "kaleidoscope_chinesefood:*", "kaleidoscope_nether:*",
-                        "kaleidoscope_end:*", "kaleidoscope_flora:*", "baishi_pantry:*",
+                        "kaleidoscope_end:*", "baishi_pantry:*",
                         "fidworkblock:*", "flavor_immersed_daily:*", "bakeries:*",
                         "orients_hotpot_chronicles:*", "bountifulfares:*", "farmersdelight:*"
                 )

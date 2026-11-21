@@ -12,7 +12,7 @@ import net.minecraft.network.chat.Component;
 
 /**
  * 把附属模组的 {@link AddonPage}（公共 API）接到内部的 {@link ShopPage} 路由上：
- * 绘制、鼠标、输入框登记、切页时取消输入全部复用内置页面的那一套。
+ * 绘制、鼠标、键盘、输入框登记、切页时取消输入全部复用内置页面的那一套。
  *
  * <p><b>兼容兜底</b>：附属是对某个版本的模块商店编译的。主体升级后如果附属页面出错
  * （抛异常，或 {@link LinkageError}：调用了已不存在的方法 / 类），这里只记一次日志、把页面标记为失效，
@@ -168,6 +168,58 @@ public final class AddonPageAdapter implements ShopPage {
         } catch (Throwable error) {
             fail(error);
             return true;
+        }
+    }
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (broken()) {
+            return false;
+        }
+        try {
+            return this.page.keyPressed(keyCode, scanCode, modifiers);
+        } catch (Throwable error) {
+            fail(error);
+            return true;
+        }
+    }
+
+    @Override
+    public boolean keyReleased(int keyCode, int scanCode, int modifiers) {
+        if (broken()) {
+            return false;
+        }
+        try {
+            return this.page.keyReleased(keyCode, scanCode, modifiers);
+        } catch (Throwable error) {
+            fail(error);
+            return true;
+        }
+    }
+
+    @Override
+    public boolean charTyped(char codePoint, int modifiers) {
+        if (broken()) {
+            return false;
+        }
+        try {
+            return this.page.charTyped(codePoint, modifiers);
+        } catch (Throwable error) {
+            fail(error);
+            return true;
+        }
+    }
+
+    @Override
+    public boolean isInputFocused() {
+        if (broken()) {
+            return false;
+        }
+        try {
+            return this.page.isInputFocused();
+        } catch (Throwable error) {
+            fail(error);
+            return false;
         }
     }
 

@@ -1,6 +1,7 @@
 package cn.autoforged.module_shop;
 
 import net.neoforged.neoforge.common.ModConfigSpec;
+import java.util.ArrayList;
 import java.util.List;
 import org.apache.commons.lang3.tuple.Pair;
 
@@ -1315,23 +1316,65 @@ public final class Config {
         return Math.max(1, INSTANCE.shippingLevelSlots.get().size());
     }
 
-    /** 第 level 级（1 起）的槽位数。 */
+    /** 第 level 级（1 起）的槽位数（超出列表长度时每升 1 级平滑递增 9 格直至 54 格上限）。 */
     public static int shippingSlotsFor(int level) {
         List<? extends String> list = INSTANCE.shippingLevelSlots.get();
-        int index = Math.max(0, Math.min(list.size() - 1, level - 1));
-        return Math.max(1, Math.min(54, parseIntSafe(list.get(index), 9)));
+        if (list.isEmpty()) {
+            return Math.max(9, Math.min(54, Math.max(1, level) * 9));
+        }
+        int lv = Math.max(1, level);
+        if (lv <= list.size()) {
+            return Math.max(1, Math.min(54, parseIntSafe(list.get(lv - 1), 9)));
+        }
+        int lastSlots = Math.max(1, parseIntSafe(list.get(list.size() - 1), 27));
+        int extraLevels = lv - list.size();
+        return Math.max(1, Math.min(54, lastSlots + extraLevels * 9));
     }
 
-    /** 从 level 升到 level+1 的花费；已满级返回 -1。 */
+    /** 从 level 升到 level+1 的花费（仅星币视角兼容）；已满级返回 -1。 */
     public static long shippingUpgradeCost(int level) {
-        List<? extends String> costs = INSTANCE.shippingUpgradeCosts.get();
-        // 第 1 项对应「1 → 2 级」，第 2 项对应「2 → 3 级」，所以下标是 level-1
-        // （以前写成 level，于是 1→2 级读的是第 2 项、2→3 级直接读不到 → 界面显示"已满级"）。
-        int index = level - 1;
-        if (index < 0 || index >= costs.size()) {
+        cn.autoforged.module_shop.data.PriceSpec spec = shippingUpgradeSpec(level);
+        if (spec == null) {
             return -1L;
         }
-        return Math.max(0L, parseLongSafe(costs.get(index), 0L));
+        return spec.supportsStar() ? spec.starPrice : 0L;
+    }
+
+    public static cn.autoforged.module_shop.data.PriceSpec shippingUpgradeSpec(int level) {
+        List<cn.autoforged.module_shop.data.PriceSpec> list = shippingUpgradeSpecList();
+        int index = level - 1;
+        if (index < 0 || index >= list.size()) {
+            return null;
+        }
+        return list.get(index);
+    }
+
+    public static List<cn.autoforged.module_shop.data.PriceSpec> dailyRefreshSpecList() {
+        return parseSpecList(INSTANCE.dailyRefreshCosts.get());
+    }
+
+    public static List<cn.autoforged.module_shop.data.PriceSpec> buybackRefreshSpecList() {
+        return parseSpecList(INSTANCE.buybackRefreshCosts.get());
+    }
+
+    public static List<cn.autoforged.module_shop.data.PriceSpec> shippingUpgradeSpecList() {
+        return parseSpecList(INSTANCE.shippingUpgradeCosts.get());
+    }
+
+    public static List<cn.autoforged.module_shop.data.PriceSpec> parseSpecList(List<? extends String> raw) {
+        List<cn.autoforged.module_shop.data.PriceSpec> out = new ArrayList<>();
+        if (raw == null) {
+            return out;
+        }
+        for (String entry : raw) {
+            cn.autoforged.module_shop.data.PriceSpec parsed = cn.autoforged.module_shop.data.PriceSpec.parseRuleText(entry);
+            out.add(parsed == null ? cn.autoforged.module_shop.data.PriceSpec.ZERO : parsed);
+        }
+        return out;
+    }
+
+    public static long buybackAllBonus() {
+        return Math.max(0L, INSTANCE.buybackAllBonus.get());
     }
 
     /** 第 level 级的每日结算上限（0 = 不限 → 返回 Long.MAX_VALUE）。 */

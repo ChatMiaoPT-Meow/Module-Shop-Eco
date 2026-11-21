@@ -27,11 +27,16 @@ import net.minecraft.sounds.SoundSource;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.food.FoodProperties;
+import net.minecraft.world.item.ArmorItem;
 import net.minecraft.world.item.EnchantedBookItem;
+import net.minecraft.world.item.FishingRodItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.PotionItem;
+import net.minecraft.world.item.ShearsItem;
+import net.minecraft.world.item.SpawnEggItem;
+import net.minecraft.world.item.TieredItem;
 
 /**
  * 八大职业核心服务：产出物归属识别、专注点恢复与结算、冷门紧缺倍率核算、经验发放与升级通知。
@@ -162,6 +167,13 @@ public final class ProfessionManager {
             }
         }
 
+        // 非商业产出守卫：屏蔽刷怪蛋、钞票、农具/渔具、电脑/无人机、餐具/厨具/建材等（第 1 优先级精确白名单仍可放行）
+        if (stack.getItem() instanceof SpawnEggItem
+                || ProfessionOutputFilter.isExcludedNonOutputItem(ns, path)
+                || (isLifestyleToolOrGear(stack.getItem()) && isLifestyleNamespace(ns))) {
+            return "";
+        }
+
         // 第 2 优先级：强语义物品类别细分（防止命名空间通配误伤同模组下的生熟/鱼农分界）
         if (stack.getItem() instanceof EnchantedBookItem && active.containsKey(ProfessionConfig.ENCHANTING)) {
             return ProfessionConfig.ENCHANTING;
@@ -171,11 +183,11 @@ public final class ProfessionManager {
         }
         if ((stack.is(ItemTags.FISHES)
                 || "starcatcher".equals(ns)
-                || ("flavor_immersed_daily_argo".equals(ns) && path.startsWith("raw_") && isSeafoodPath(path)))
+                || ("flavor_immersed_daily_argo".equals(ns) && ProfessionOutputFilter.isFidaSeafoodOutputPath(path)))
                 && active.containsKey(ProfessionConfig.FISHING)) {
             return ProfessionConfig.FISHING;
         }
-        if ("flavor_immersed_daily_argo".equals(ns) && isFidaCookedDishPath(path)
+        if ("flavor_immersed_daily_argo".equals(ns) && ProfessionOutputFilter.isFidaCookedDishPath(path)
                 && active.containsKey(ProfessionConfig.COOKING)) {
             return ProfessionConfig.COOKING;
         }
@@ -190,7 +202,7 @@ public final class ProfessionManager {
                 || "bakeries".equals(ns) || "bountifulfares".equals(ns)
                 || "farmersdelight".equals(ns) || "twilightforest".equals(ns)
                 || "flavor_immersed_daily".equals(ns) || "flavor_immersed_daily_argo".equals(ns))
-                && isRawCropOrSeed(stack, path) && active.containsKey(ProfessionConfig.FARMING)) {
+                && isRawCropOrSeed(stack, ns, path) && active.containsKey(ProfessionConfig.FARMING)) {
             return ProfessionConfig.FARMING;
         }
 
@@ -228,39 +240,19 @@ public final class ProfessionManager {
         return "";
     }
 
-    private static boolean isSeafoodPath(String path) {
-        return path.contains("fish") || path.contains("crab") || path.contains("shrimp")
-                || path.contains("prawn") || path.contains("crayfish") || path.contains("lobster")
-                || path.contains("turtle") || path.contains("eel") || path.contains("carp")
-                || path.contains("bass") || path.contains("tuna") || path.contains("salmon")
-                || path.contains("squid") || path.contains("clam") || path.contains("oyster")
-                || path.contains("perch") || path.contains("trout") || path.contains("abalone")
-                || path.contains("scallop") || path.contains("sea_cucumber") || path.contains("sea_urchin")
-                || path.contains("snail") || path.contains("jellyfish") || path.contains("spoon_worm")
-                || path.contains("loach") || path.contains("grouper") || path.contains("hairtail")
-                || path.contains("pomfret") || path.contains("saury") || path.contains("sardine")
-                || path.contains("redfin") || path.contains("rectum") || path.contains("tench")
-                || path.contains("tilapia") || path.contains("pleco") || path.contains("goby")
-                || path.contains("halfbeak") || path.contains("mackerel") || path.contains("pike")
-                || path.contains("croaker");
+    private static boolean isLifestyleToolOrGear(Item item) {
+        return item instanceof TieredItem || item instanceof ArmorItem
+                || item instanceof ShearsItem || item instanceof FishingRodItem;
     }
 
-    private static boolean isFidaCookedDishPath(String path) {
-        return path.startsWith("roast_") || path.startsWith("roasted_") || path.startsWith("steamed_")
-                || path.startsWith("braised_") || path.startsWith("boiled_") || path.startsWith("fried_")
-                || path.startsWith("spicy_") || path.startsWith("garlic_vermicelli_")
-                || path.startsWith("sea_urchin_") || path.endsWith("_soup") || path.endsWith("_jam")
-                || path.endsWith("_juice") || path.endsWith("_icecream") || path.endsWith("_popsicle")
-                || path.equals("peking_roast_duck") || path.equals("pot_stew_goose")
-                || path.equals("eel_rice") || path.equals("tuna_sushi")
-                || path.equals("donkey_meat_burger") || path.equals("typhoon_shelter_prawn")
-                || path.equals("scalded_prawns") || path.equals("scallion_sea_cucumber")
-                || path.equals("salt_pepper_mantis_shrimp") || path.equals("spoon_worm_rice")
-                || path.equals("razor_clam_scrambled_eggs") || path.equals("vinegar_jellyfish_head")
-                || path.equals("oil_soaked_snail_slices") || path.equals("cold_fish_skin")
-                || path.equals("sugar_roasted_chestnut") || path.equals("chestnut_cake")
-                || path.equals("oozing_salted_duck_egg") || path.equals("foie_gras")
-                || path.equals("peixian_dog_meat");
+    private static boolean isLifestyleNamespace(String ns) {
+        return "flavor_immersed_daily".equals(ns) || "flavor_immersed_daily_argo".equals(ns)
+                || "fidworkblock".equals(ns) || "bakeries".equals(ns) || "bountifulfares".equals(ns)
+                || "orients_hotpot_chronicles".equals(ns) || "kaleidoscope_cookery".equals(ns)
+                || "kaleidoscope_chinesefood".equals(ns) || "kaleidoscope_nether".equals(ns)
+                || "kaleidoscope_end".equals(ns) || "kaleidoscope_tavern".equals(ns)
+                || "farmersdelight".equals(ns) || "guaniao".equals(ns)
+                || "kaleidoscope_flora".equals(ns) || "wilderflowers".equals(ns);
     }
 
     private static boolean isTwilightCookedFoodPath(String path) {
@@ -271,7 +263,10 @@ public final class ProfessionManager {
                 || path.endsWith("_jerky");
     }
 
-    private static boolean isRawCropOrSeed(ItemStack stack, String path) {
+    private static boolean isRawCropOrSeed(ItemStack stack, String ns, String path) {
+        if ("flavor_immersed_daily".equals(ns) && path.startsWith("raw")) {
+            return true;
+        }
         if (path.contains("seed") || path.equals("tomato") || path.equals("chili") || path.equals("red_chili")
                 || path.equals("green_chili") || path.equals("chili_pepper") || path.equals("lettuce")
                 || path.equals("rice") || path.equals("paddy") || path.equals("cabbage")
@@ -296,10 +291,12 @@ public final class ProfessionManager {
                 || path.equals("boarkchop") || path.equals("blackberry") || path.equals("blueberry")) {
             return true;
         }
-        ResourceLocation cropsTag = ResourceLocation.fromNamespaceAndPath("c", "crops");
-        ResourceLocation seedsTag = ResourceLocation.fromNamespaceAndPath("c", "seeds");
-        return stack.is(TagKey.create(Registries.ITEM, cropsTag))
-                || stack.is(TagKey.create(Registries.ITEM, seedsTag));
+        return stack.is(TagKey.create(Registries.ITEM, ResourceLocation.fromNamespaceAndPath("c", "crops")))
+                || stack.is(TagKey.create(Registries.ITEM, ResourceLocation.fromNamespaceAndPath("c", "seeds")))
+                || stack.is(TagKey.create(Registries.ITEM, ResourceLocation.fromNamespaceAndPath("c", "fruit")))
+                || stack.is(TagKey.create(Registries.ITEM, ResourceLocation.fromNamespaceAndPath("c", "fruits")))
+                || stack.is(TagKey.create(Registries.ITEM, ResourceLocation.fromNamespaceAndPath("c", "raw_meats")))
+                || stack.is(TagKey.create(Registries.ITEM, ResourceLocation.fromNamespaceAndPath("c", "eggs")));
     }
 
     /**
@@ -389,7 +386,7 @@ public final class ProfessionManager {
 
         long curXp = account.career.getXp(professionId);
         long nextReq = PlayerProfessionProfile.xpRequiredForNextLevel(newLevel);
-        String progressText = newLevel >= PlayerProfessionProfile.MAX_LEVEL
+        String progressText = newLevel >= PlayerProfessionProfile.effectiveMaxLevel()
                 ? "MAX"
                 : (curXp + "/" + nextReq);
 
