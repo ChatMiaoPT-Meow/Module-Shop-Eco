@@ -23,7 +23,7 @@ import net.minecraft.resources.ResourceLocation;
 public class JeiPluginImpl implements IModPlugin {
     @Override
     public ResourceLocation getPluginUid() {
-        return ResourceLocation.fromNamespaceAndPath(ModuleShopMod.MODID, "jei_bridge");
+        return new ResourceLocation(ModuleShopMod.MODID, "jei_bridge");
     }
 
     @Override

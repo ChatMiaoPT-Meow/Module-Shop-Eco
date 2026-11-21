@@ -1,16 +1,20 @@
 package cn.autoforged.module_shop.client;
 
 import cn.autoforged.module_shop.client.screen.ShopScreen;
+import cn.autoforged.module_shop.client.screen.shop.PageKit;
+import cn.autoforged.module_shop.data.PriceSpec;
 import cn.autoforged.module_shop.network.payload.ServerboundShopActionPayload;
 import cn.autoforged.module_shop.shop.auction.AuctionCategory;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
-import net.minecraft.core.HolderLookup;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -113,6 +117,16 @@ public final class AuctionClient {
         public int duration;
         public int bidCount;
         public String operator = "";
+        public String physTierKey = "";
+
+        public boolean isPhysCurrency() {
+            return physTierKey != null && !physTierKey.isBlank();
+        }
+
+        public PriceSpec specOf(long amount) {
+            long safe = Math.max(0L, amount);
+            return isPhysCurrency() ? PriceSpec.phys(physTierKey, safe) : PriceSpec.star(safe);
+        }
     }
 
     public static List<ClientShopData.AuctionView> mineSelling = new ArrayList<>();
@@ -189,7 +203,7 @@ public final class AuctionClient {
     // =================================================================== 接收
 
     /** @return true 表示这个包是拍卖行的 */
-    public static boolean handle(String kind, CompoundTag data, HolderLookup.Provider regs) {
+    public static boolean handle(String kind, CompoundTag data, RegistryAccess regs) {
         switch (kind) {
             case "auction_list" -> {
                 readSettings(data.getCompound("settings"));
@@ -272,7 +286,7 @@ public final class AuctionClient {
                     CompoundTag c = (CompoundTag) t;
                     History h = new History();
                     h.id = c.getLong("id");
-                    h.stack = ItemStack.parseOptional(regs, c.getCompound("item"));
+                    h.stack = ItemStack.of(c.getCompound("item"));
                     h.status = c.getString("status");
                     h.role = c.getString("role");
                     h.seller = c.getString("seller");
@@ -289,6 +303,8 @@ public final class AuctionClient {
                     h.duration = c.getInt("duration");
                     h.bidCount = c.getInt("bidCount");
                     h.operator = c.getString("operator");
+                    String pt = c.getString("physTier");
+                    h.physTierKey = pt.isEmpty() ? c.getString("physTierKey") : pt;
                     history.add(h);
                 }
                 mineHistory = history;
@@ -324,7 +340,7 @@ public final class AuctionClient {
         mineBidding = bidding;
     }
 
-    private static List<ClientShopData.AuctionView> readViews(ListTag tags, HolderLookup.Provider regs) {
+    private static List<ClientShopData.AuctionView> readViews(ListTag tags, RegistryAccess regs) {
         List<ClientShopData.AuctionView> out = new ArrayList<>();
         for (Tag t : tags) {
             out.add(readView((CompoundTag) t, regs));
@@ -361,10 +377,10 @@ public final class AuctionClient {
         settings = n;
     }
 
-    public static ClientShopData.AuctionView readView(CompoundTag c, HolderLookup.Provider regs) {
+    public static ClientShopData.AuctionView readView(CompoundTag c, RegistryAccess regs) {
         ClientShopData.AuctionView view = new ClientShopData.AuctionView();
         view.id = c.getLong("id");
-        view.stack = c.contains("item") ? ItemStack.parseOptional(regs, c.getCompound("item")) : ItemStack.EMPTY;
+        view.stack = c.contains("item") ? ItemStack.of(c.getCompound("item")) : ItemStack.EMPTY;
         view.seller = c.getString("seller");
         view.startPrice = c.getLong("startPrice");
         view.currentBid = c.getLong("currentBid");
@@ -383,6 +399,8 @@ public final class AuctionClient {
         view.bidCount = c.getInt("bidCount");
         view.extensions = c.getInt("extensions");
         view.createdAt = view.receivedAt - c.getLong("createdAgo");
+        String pt = c.getString("physTier");
+        view.physTierKey = pt.isEmpty() ? c.getString("physTierKey") : pt;
         return view;
     }
 
@@ -415,11 +433,14 @@ public final class AuctionClient {
                 sb.append(ShopScreen.mallModName(id.getNamespace())).append(' ');
                 sb.append(ModNames.rawDisplayName(id.getNamespace())).append(' ');
                 // 附魔书 / 带附魔的物品：附魔名也能搜到（例如「经验修补」「mending」）
-                v.stack.getEnchantments().keySet().forEach(h -> sb.append(
-                        net.minecraft.world.item.enchantment.Enchantment.getFullname(h, 1).getString()).append(' '));
-                v.stack.getOrDefault(net.minecraft.core.component.DataComponents.STORED_ENCHANTMENTS,
-                        net.minecraft.world.item.enchantment.ItemEnchantments.EMPTY).keySet().forEach(h -> sb.append(
-                        net.minecraft.world.item.enchantment.Enchantment.getFullname(h, 1).getString()).append(' '));
+                net.minecraft.world.item.enchantment.EnchantmentHelper.getEnchantments(v.stack)
+                        .forEach((ench, level) -> sb.append(ench.getFullname(1).getString()).append(' '));
+                if (!v.stack.is(net.minecraft.world.item.Items.ENCHANTED_BOOK)
+                        && v.stack.hasTag() && v.stack.getTag().contains("StoredEnchantments")) {
+                    net.minecraft.world.item.enchantment.EnchantmentHelper
+                            .deserializeEnchantments(net.minecraft.world.item.EnchantedBookItem.getEnchantments(v.stack))
+                            .forEach((ench, level) -> sb.append(ench.getFullname(1).getString()).append(' '));
+                }
             }
             sb.append(v.seller);
             v.searchText = sb.toString().toLowerCase(Locale.ROOT);
@@ -434,11 +455,29 @@ public final class AuctionClient {
         }
         String hay = searchText(v);
         for (String word : query.toLowerCase(Locale.ROOT).trim().split("\\s+")) {
-            if (!word.isEmpty() && !hay.contains(word)) {
+            if (word.isEmpty()) {
+                continue;
+            }
+            if (!hay.contains(word) && (v.stack.isEmpty() || !PageKit.matchesItemQuery(v.stack, word))) {
                 return false;
             }
         }
         return true;
+    }
+
+    /** 按当前搜索词统计各分类匹配条数（忽略当前分类筛选），供左侧分类栏实时收敛。 */
+    public static Map<AuctionCategory, Integer> searchCategoryCounts() {
+        Map<AuctionCategory, Integer> counts = new EnumMap<>(AuctionCategory.class);
+        int total = 0;
+        for (ClientShopData.AuctionView v : ClientShopData.auctions) {
+            if (!matches(v, search)) {
+                continue;
+            }
+            total++;
+            counts.merge(categoryOf(v), 1, Integer::sum);
+        }
+        counts.put(AuctionCategory.ALL, total);
+        return counts;
     }
 
     public static String sortKey(int sort) {

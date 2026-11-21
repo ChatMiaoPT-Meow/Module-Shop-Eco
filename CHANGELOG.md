@@ -1,6 +1,124 @@
 # 变更记录
 
-遵循 [语义化版本](https://semver.org/lang/zh-CN/)。模组版本与 API 版本独立维护（当前模组 `2.0.1`，公共 API `1.4.0`）。
+遵循 [语义化版本](https://semver.org/lang/zh-CN/)。模组版本与 API 版本独立维护（当前模组 `2.5.0`，公共 API `1.4.0`）。
+
+## [2.5.1]
+
+构建产物：`Module-Shop-Eco-2.5.1-for-Forge-1.20.1.jar` 与 `module_shop-2.5.1-forge-1.20.1-api.jar`；PATCH 修复，对齐上游 `Ar-Zhe/Module-Shop` `1.1.2`，旧存档 / 配置直接兼容，保留历史全部版本 jar。
+
+### 修复与对齐
+
+- **合入上游 `1.1.2` 物品名 PUA 图标字符清洗**：`Text.sanitize()` 统一丢弃私有使用区（PUA）/ 变体选择符 / 零宽字符，并新增 `ItemNames.display()` 覆盖每日商店、每日收购、购物城、拍卖行、玩家摊位、求购、货币兑换、交易与弹窗，解决食物 / 营养模组物品名后的「□□」方块字符。
+- **合入上游 `1.1.2` 配置管理入口收口**：移除商店设置底部按钮行重复的「配置管理」按钮，右上角「配置管理」统一经管理锁校验并走 `cfg_open` 链路（保留服务端 `cfg_open_ui` 兜底）。
+
+## [2.5.0]
+
+构建产物：`Module-Shop-Eco-2.5.0-for-Forge-1.20.1.jar` 与 `module_shop-2.5.0-forge-1.20.1-api.jar`；同步 1.21.1 `2.5.0` 全部 5 项修复与特性，向后兼容旧存档、旧模板与全部已编译附属模组（公共 `AddonPage` 仅增 `default` 方法，保持 100% 二进制兼容），保留历史全部版本 jar。
+
+### 修复与新增特性
+
+1. **宿主与附属页面键盘输入 / 数字键 `1~9` 切页冲突修复**：
+   - `AddonPage`（公共 API）与 `ShopPage` 新增 `default` 方法 `keyPressed` / `keyReleased` / `charTyped` / `isInputFocused`（与标准版 `Module-Shop-1.20.1 1.6.0` 签名 100% 对齐）；
+   - `AddonPageAdapter` 完整透传上述事件；`ShopScreen` 在 `EditBox` 聚焦、页面消费按键或 `activePage().isInputFocused()` 为真时绝不再触发数字键 `1~9` 切页，同时补齐 `charTyped` 与 `keyReleased` 转发。
+2. **购物城单品「每人永久限购（不随商城刷新补货）」**：
+   - `MallItem` 新增 `permanentLimit` 字段与持久化（同步纳入 `ShopTemplate` 导出/导入）；管理端新增/批量添加/单品编辑界面可直接开启「每人永久限购（不随刷新重置）」，默认限购 1 次或沿用设定次数；
+   - `ClearingHouse.restockMallEco` 与 `ShopManager.adminMallRefresh` 切换库存模式时绝不重置带该标记的商品；`MallPage` 表格与卡片视图清晰展示「永久限购 已购 X/N」与售罄置灰态。
+3. **货币兑换上限游戏内配置（星币兑换 + 实体货币兑换双覆盖）**：
+   - `ExchangeEntry` 新增单品每日兑换上限 `dailyLimit`（0 或负数 = 不限），持久化在存档与模板中；`ExchangePage` 管理端新增「上限设置」入口直接编辑单人日星币上限、全服日结汇上限与双向取款开关，并在界面实时展示剩余可兑额度；
+   - `PhysicalCurrencyConfig` / `PhysicalCurrencyConfigScreen` / `PhysicalCurrencyExchangeScreen` 同步新增单人每日实体货币兑换面值上限（0 = 不限）与服务端超限拦截。
+4. **职业专精可视化配置管理界面（`ProfessionConfigScreen`）**：
+   - `ProfessionConfig` 新增最大等级（2~500）、每级升级所需经验表 `levelXpTable`、每级加价限制表 `levelBonusCaps` 及专注点参数，并由 `PlayerProfessionProfile` 与 `EcoPricing` 实时读取；
+   - 管理员可在 `ProfessionPage` 与 `AdminPage` 打开「专精配置」界面直观逐级修改每级经验与加价限制（支持按公式重算全表与线性填充），保存后立即落盘 `professions.json` + `Config` 并热同步全服。
+5. **出货箱突破 3 级固定上限，完整支持 4~5+ 任意等级与每日额度**：
+   - 新增 `ShopSavedData.shippingMaxLevel()` 动态取升级表与槽位表上限；管理员在 `SystemCostsAdminScreen` 增删出货箱升级档位时，自动同步扩展 `shippingUpgradeCosts`、`shippingLevelSlots`（按 +9 格递增至 54 格）与 `shippingDailyLimits` 并落盘；
+   - 解除 `adminShippingLimits` 硬编码循环上限，并支持 `ShopInputScreen` 动态渲染 `limit1..limitN`「等级 N 每日额度」标签，修改后即时广播同步全服。
+
+## [2.4.1]
+
+构建产物：`Module-Shop-Eco-2.4.1-for-Forge-1.20.1.jar` 与 `module_shop-2.4.1-forge-1.20.1-api.jar`（同步主仓 `1.5.1`；Eco 总钱箱 / 黑市 / 职业链路未改动）；PATCH 修复，旧存档 / 配置直接兼容，保留历史全部版本 jar。
+
+### 修复
+
+- **实体货币 + 星币并行时无法用星币发布求购**：「发布求购」界面（`DemandCreateScreen`）把点击转发给悬赏编辑器 `PriceSpecEditor` 后，又调用了 `setFocused(null)`，把刚交给「星币价格」输入框的 Screen 焦点立刻清空（连带 `EditBox.setFocused(false)`），键盘 / 字符事件再也送不进输入框，星币悬赏永远停在默认 `0`；而实体币数量默认就是 `1`，所以看起来「只能用实体货币求购」。现已移除该清空，只让搜索框 / 数量框失焦，星币框可正常点击、退格、输入。
+- `PriceSpecEditor`：再次点击已选中的账本按钮（如默认的「仅星币」）时，直接把焦点交给对应输入框，便于立刻修改金额。
+- 后端 `demandCreate` / `demandFulfill` / `demandCancel` 复核：`STAR_ONLY` 悬赏在并行模式下按星币账本校验余额、托管（含手续费）、交付打款、撤单退款，全链路无需改动；新增单测 `UpgradeRegressionTest.parallelCurrencyStarOnlyDemandEscrowUsesStarLedgerOnly` 与根因回归守卫 `demandCreateScreenKeepsPriceEditorFieldFocusAfterClick`。
+
+## [2.4.0]
+
+构建产物：`Module-Shop-Eco-2.4.0-for-Forge-1.20.1.jar` 与 `module_shop_eco-2.4.0-forge-1.20.1-api.jar`；公共 API 仍为 `1.4.0`，旧存档、旧版 `physical_currency.json`、`professions.json` 与模板均可直接兼容升级，保留历史全部版本 jar。
+
+### 新功能、Eco 全量保留与安全加固
+
+* **#1 商店自定义左上角品牌图标与标题持久化**：支持上传 PNG/JPG/WebP 作为左上角商店品牌图标（`BrandSettingsScreen` + `ShopMediaStore` 纯 Java SHA-256 媒体落盘，专服零 AWT/ImageIO/Skija 依赖）或恢复默认首字方块，同步修复商店名称与图标 ID 在 `ShopSavedData`、`admin_layout_commit`、`brand_default.json` 及配置模板导出中的全链路持久化，换包重启不重置。
+* **#4 公告图片上传与图文混排**：`AnnouncementEntry` 升级 `AnnouncementBlock`（文本/图片段落混合编排、宽度比例、对齐与图注，完全向下兼容旧版 `content` 字段），支持管理端本地选图/拖入传图（`ClientImageUploader` + `ClientMediaCache` 缓存目录独立隔离至 `cache/module_shop_eco/media/`）、右侧实时滚动预览、`AnnouncementBlockRenderer` 原生展示与灯箱放大预览（`LightboxScreen`），并保持非 Skija 回退安全。
+* **#5 整合包与专服管理员密码锁（`AdminAuthService`）**：默认关闭，开启后采用加盐 `PBKDF2WithHmacSHA256`（120,000 次迭代、`MessageDigest.isEqual` 常量时间比对、5 次错密递进冷却、不落盘明文且不向客户端同步哈希）与 `OP ∧ 内存解锁会话` 门禁（`AdminAuthScreen` / `AdminSecurityScreen`），全面收口 UI、模板、拍卖、发放、出货箱、玩家聊天指令（含 `/shop eco` 管理子命令）与 `AuctionService` 写入口，同时保留服务端控制台/指令方块/FTB Quests/KubeJS 免密执行及专服控制台 `/shop auth disable` 防死锁口令。
+* **#6 大容量 `.mshop` / `.json.gz` 模板分片传输与导入导出**：新增携带嵌入式媒体（`assets/<sha256>`）的 `.mshop` 容器包及 Gzip 压缩 `.json.gz` 格式（兼容 UTF-8 BOM `.json`），`TemplateTransferManager` 与 `ClientTemplateIO` 全面切换至分块二进制上传/下载/预览协议（`ConfigExportScreen` 支持分模块勾选导出），完整保留 `module_shop_eco` 配置目录、`/shop eco apply_preset` 多格式默认模板读取与总钱箱/职业专属字段。
+* **#7 出货箱单日限额配置与今日已用联动**：`ShippingRules`（保留 `module_shop_eco-common.toml` 回写）、`ShopManager`、`ShippingBinScreen` 与 `ShippingPage`（保留专注精销开关）支持在新增/批量新增/编辑规则时配置单日出货份数上限（留空或 `0` 表示不限），并在前台联动展示与扣减「今日已出货 / 单日上限」余量。
+* **#8 TACZ / 饰品完整 NBT 全链路保留**：`ShopTemplate`（`FORMAT_VERSION = 3`，完整保留 `Offer.professionId` 与 `MallEntry.basePrice` / `supplyMode` / `floorRestockPct`）及 `TemplateService`、`ShopManager.adminMallImport` 在 1.20.1 使用 `tag_snbt` 序列化/反序列化（同时向下兼容读取 `components_snbt`）与 `ItemStack.isSameItemSameTags` 判重，完整保留 TACZ、Curios 饰品与附魔等物品 `CompoundTag`。
+
+### 修复与体验升级
+
+* **#2 修复布局隐藏「出货箱」重登/重启后自动恢复 bug**：`SidebarLayout` 新增 `hidden` 列表区分「管理员刻意隐藏」与「版本升级新增模块」，删除 `shipping` 并提交后重登及重启服务端均不会再次自动补回。
+* **#3 根治污染 `AtomChat` 全局皮肤问题**：`AtomUi` 彻底移除全局 `Design.host(...)` 注入，避免与 `AtomChat` 等同用 `AtomLib` 的模组相互覆盖界面皮肤。
+* **#9 全模组可鼠标拖动滚动条与点轨直达**：升级 `ScrollController`、`ListTable` 与 `CardGrid`，全面接通所有页面与弹窗拖拽/释放闭环，并在 `ProfessionPage` 等界面同步受益。
+* **#10 修复浮点截断与窄屏挤压**：升级 `PriceDisplay` 与 `V2.columns` 容差保护，优化 `ProfessionPage` 职业名在无紧缺标签时的显示宽度，保证 85%~135% 字号缩放与窄屏清晰不截断。
+* **#11 管理后台及全界面多词可清空搜索**：新增 `SkiaTextField.clearable(true)` 与 `PageKit.matchesQuery` / `matchesItemQuery`，接入全部页签及次级弹窗（严格保留原始下标），并保留 Eco `BuybackPage` `QualityEvaluator` 智能品质校验与 `ExchangePage` 单向结汇限额提示。
+* **#12 购物城 / 拍卖行 / 摊位左侧分类搜索智能收敛与独立滚动条**：启用搜索或附加筛选时自动收敛隐藏 `0` 命中分类，同时为左侧分类栏接入独立裁剪区域与可拖动滚动条。
+* **1.20.1 专有修复**：补齐 `AuctionEntry` 实体货币档位 `physTier` 字段持久化，并修正 `tools/check-ui.ps1` 客户端菜单检测路径至 `ClientModEvents.java`。
+
+## [2.3.0]
+
+公共 API 仍为 `1.4.0`，旧存档、旧版 `physical_currency.json`（v1）与模板均可平滑兼容迁移；`physical_currency.json` 升级至 v2 格式并在首次保存后保留各阶稳定 `id`。
+
+### 双独立并行账本（星币 ‖ 实体货币）全链路重构
+* **星币与实体货币彻底分离**：移除旧版虚实混扣、`spendableBalance` 混算与 `SettleMode`，星币账本仅读写账户星币，实体货币账本仅在阶梯货币链内部进行破整找零与发放，两者绝不相互折抵或自动互转；`EcoPricing` 与官方总钱箱严格只作用于星币部分，`PHYS_ONLY` 交易与实体通道完全旁路市场做市锚点。
+* **通用 `PriceSpec` 与全链路接入**：支持 `STAR_ONLY`（仅星币）、`PHYS_ONLY`（仅实体币）、`EITHER`（二选一双通道 `|`）与 `BOTH`（组合同付 `+`）；全面接入每日商店、购物城、每日收购、出货箱（含双账本预计收益、规则语法 `phys:<tier>*<n>` / `|` / `+` 与每日刷新/升级费）、玩家摊位（纯单账本挂单与同币种税率）、拍卖行（支持按任意阶实体货币起拍/加价/一口价/托管与同档手续费）、玩家求购、管理员发放、每日签到/补签/里程与活动日及兑换码。
+
+### OP 四态配价与玩家市场实体币直显界面
+* **OP 全场景可视化配价与系统费用台**：新增通用配价组件 `PriceSpecEditor`（OP 四态模式 + 实体币图标横条先选档位再填数量）与系统定额费用弹窗 `SystemCostsAdminScreen`（可视化配置每日商店刷新费、每日收购刷新费、出货箱升级费）；升级 `ShopInputScreen`、`GrantScreen`、`ScheduleRewardItemsScreen`、`RedeemRewardEditorScreen`、`MallImportScreen` 与 `BatchAddScreen`。
+* **自由市场与全页面实体币直显**：`ShellV2` 顶栏/个人卡与 `ProfileHomePage` 并列直显双独立账本并支持 `EITHER` 快捷默认通道切换；`PriceDisplay` 在全部内容页与摊位/拍卖/求购弹窗中以无遮挡硬币图标 + 数量渲染双账本价格并修复 `EITHER` 可买性过滤与 `AtomChat` 打开主界面 / ESC 直退问题；同步完善中英双语词条。
+
+## [2.2.1]
+
+公共 API 仍为 `1.4.0`，向后完全兼容 `2.2.0` 与历史版本存档/配置。
+
+### 架构与联机隔离修正
+
+* **服务端零客户端反向引用解耦**：`CurrencySettlement` 通过 `setClientBlockedHook(Predicate<ItemStack>)` 对外暴露客户端钩子注册接口，彻底保持服务端类对 `client.*` 包零引用；客户端改为在 `ClientEvents` 注册联机 `ClientHomeCurrencyState` 实体货币禁卖预判钩子，确保专用服务器严格物理端隔离且联机客户端出货箱槽位拦截与服务端一致。
+
+## [2.2.0]
+
+公共 API 仍为 `1.4.0`，旧存档、旧配置与 `professions.json` 可直接兼容升级；实体货币系统默认关闭，启用后全链条生效。
+
+### 新功能
+
+* **服务器个人主页（`home` 默认首屏）**：打开商店（`/shop` 或快捷键 `K`）默认进入个人主页，其余操作后保留当前上下文、退出存档自动复位；左栏展示 3D 鼠标跟随动态玩家模型、LuckPerms 称号徽章与组别、实时在线时长及核心资产（星币余额、实体货币折算与快捷兑换）；右栏展示置顶优先、支持悬停暂停与 6 秒进度轮播及长文滚动阅读的服务器公告栏，并集成紧凑签到联动按钮。
+* **公告管理与热更新（`AnnouncementAdminScreen`）**：管理页顶栏新增「公告管理」入口（个人主页管理员同步直达），支持可视化增删、上移/下移、一键置顶、富文本色码解析与多段落正文编辑，保存至 `config/module_shop_eco/announcements.json` 并立即全服热更新。
+* **可自定义分层实体货币系统与防套利引擎（`PhysicalCurrencyConfig` / `PhysicalCurrencyEngine` / `CurrencySettlement`）**：支持总开关（默认关闭）、三种结算模式（优先实体货币混付 / 纯实体货币 / 优先虚拟货币混付）及防套利开关；支持任意物品与 NBT 标签作为阶梯币种、大面值自动破整找零、背包满转邮箱及「实体货币兑换」双向凑整/拆零弹窗；全链路覆盖商店、收购、出货箱（含槽位拒收与 `msg.module_shop.phys_sell_blocked_arbitrage` 提示）、摊位、拍卖、求购、面对面交易与转账，严格同质返还杜绝刷币与洗钱漏洞。
+* **UI v2 全局字号调节**：右下角新增 85%~135% 字号缩放调节与高倍字号防溢出视口保护。
+
+## [2.1.0]
+
+公共 API 仍为 `1.4.0`，旧存档、旧版 `exports/*.json` 与 `shop_config.json` 可直接兼容升级。
+
+### 配置管理重做与体验优化
+
+* **统一 AtomLib UI（含非 Skia 兜底）**：重构「配置管理」界面（`ConfigManagerScreen`）、「导入预览」二级确认界面（`TemplatePreviewScreen`），并新增「导出配置命名弹窗」（`ConfigExportScreen`）；统一仅保留「导入 / 导出 / 返回」三个按钮（移除列表删除项），点击「返回」或按 ESC 逐级回到上一层商店界面。
+* **修复二级确认弹窗不弹出 bug**：修正 `ClientTemplateIO.showPreview` 界面类型判断失配问题，并解除 `Nav.DISMISSED` 冷却拦截，确保每次点击列表配置都能稳定弹出「替换导入 / 合并导入 / 取消」确认框。
+* **扁平化目录与中文导出命名**：导出配置与默认模板统一存放在扁平目录 `config/module_shop_eco/`（同时兼容扫描旧版 `exports/*.json`，自动跳过 `backups/` 与系统内置非模板 JSON）。导出弹窗支持中文名与实时文件名预览：留空保存为 `商店配置_<时间戳>.json`；输入 `shop_config` 直接写为默认模板 `shop_config.json` 并自动备份旧文件。
+* **单机客户端落盘 vs 联机专用服直存同步**：单人游戏下导出直接写入客户端 `config/module_shop_eco/` 并原地刷新；联机专用服下导出直接保存在服务端配置目录，列表同时融合展示【服务端】与【本地】配置，管理员上传并确认导入本地配置时会同步保存到服务端目录。
+* **一键导入打开文件夹 + 自动刷新**：点击「导入」按钮自动创建并打开本地配置文件夹，并每 20 刻轮询文件指纹变动自动刷新列表。
+
+## [2.0.2]
+
+公共 API 仍为 `1.4.0`，旧存档与旧配置可直接升级。
+
+### 职业归属与防刷修复
+
+* **容器菜单强校验**：厨师菜单追踪改为要求「5 刻内、10 格内真实右键已绑定厨具」且命中真实厨具菜单白名单，拦截冰箱、冰柜、无人机、钓鱼箱、市场、ATM、电脑、蘸料台、炉灶及熔炉族菜单，并将非玩家槽位中可手动放入的已有菜肴计入快照基线。
+* **实体击杀与繁殖护栏**：农牧宰杀与繁殖改为明确禽畜白名单，拦截东篱外卖顾客/骑手、车万女仆、法术召唤物、驯服宠物/坐骑、NPC、观赏鸟、暮色任务羊及原版狐狸/青蛙/蜜蜂/美西螈等非家畜生物；战斗 Boss 判定补齐敌对校验。
+* **方块成熟度防撞车**：排除木盆（`has_fruit`）、树苗/红树胎生苗/竹笋、甘蔗/仙人掌/竹竿、无果实属性藤蔓/海带、晒盐田与置地菜肴方块；成熟度提取优先判定果实布尔属性，右键采摘补齐 `isCropLikeBlock` 复核。
+* **职业产出归类修正**：厨师成品经验强制要求具备食物属性、`WokDish` 盛盘数据或属于可放置菜肴/蛋糕/宴席方块，剔除刀具、餐盘、模具、家具、建材与生面团；`kaleidoscope_flora:*` 从厨师迁回农牧；排除钞票、无人机、ATM、刷怪蛋、钓具等杂项，补齐东篱鱼桶水产与熟食菜肴归属。
 
 ## [2.0.1]
 
@@ -13,7 +131,7 @@
 
 ## [2.0.0] — Module-Shop Eco 独立闭环经济版
 
-公共 API 升至 `1.4.0`（对 `1.2.x / 1.3.x` 附属保持 100% 二进制向后兼容）。世界存档物理隔离为 `module_shop_eco_data`，配置文件独立为 `module_shop_eco-common.toml` 与 `config/module_shop_eco/professions.json`。
+公共 API 升至 `1.4.0`（对 `1.2.x / 1.3.x` 附属保持 100% 二进制向后兼容）。世界存档物理隔离为 `module_shop_eco_data`，配置文件独立为 `module_shop_eco-common.toml` 与 `config/module_shop_eco/professions.json`。完整说明见 [ECO_2.0.0_构建验收报告与服主手册.md](ECO_2.0.0_构建验收报告与服主手册.md)。
 
 ### 新功能
 

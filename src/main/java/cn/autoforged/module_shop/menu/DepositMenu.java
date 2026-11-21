@@ -143,11 +143,6 @@ public class DepositMenu extends AbstractContainerMenu {
         public boolean mayPickup(Player player) {
             return false;
         }
-
-        @Override
-        public boolean isFake() {
-            return true;
-        }
     }
 
     /** 需求 2：交易槽位已满时的锁定槽，服务端拒绝任何放入。 */

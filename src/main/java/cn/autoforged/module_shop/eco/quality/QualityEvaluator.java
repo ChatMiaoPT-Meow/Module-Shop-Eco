@@ -3,7 +3,6 @@ package cn.autoforged.module_shop.eco.quality;
 import cn.autoforged.module_shop.Config;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.mojang.serialization.Codec;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -12,38 +11,34 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
+import java.util.Map;
 import java.util.Set;
-import net.minecraft.core.Holder;
-import net.minecraft.core.component.DataComponentType;
-import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
-import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.NumericTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
-import net.minecraft.tags.EnchantmentTags;
 import net.minecraft.world.item.EnchantedBookItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.PotionItem;
 import net.minecraft.world.item.SuspiciousStewItem;
 import net.minecraft.world.item.TippedArrowItem;
-import net.minecraft.world.item.alchemy.PotionContents;
-import net.minecraft.world.item.component.CustomData;
+import net.minecraft.world.item.alchemy.Potion;
+import net.minecraft.world.item.alchemy.PotionUtils;
+import net.minecraft.world.item.alchemy.Potions;
 import net.minecraft.world.item.enchantment.Enchantment;
-import net.minecraft.world.item.enchantment.ItemEnchantments;
-import net.neoforged.fml.ModList;
-import net.neoforged.fml.loading.FMLPaths;
+import net.minecraft.world.item.enchantment.EnchantmentHelper;
+import net.minecraftforge.fml.ModList;
+import net.minecraftforge.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * 零硬前置的全模组原生品质溢价与废品拒收评估器。
  *
- * <p>通过 MC 1.21 原生 {@link BuiltInRegistries#DATA_COMPONENT_TYPE} + {@link NbtOps} 动态解码任意模组组件，
+ * <p>通过 MC 1.20.1 原生 {@link ItemStack#getTag()} 动态解析任意模组 NBT 数据，
  * 无需在编译期引用任何第三方玩法模组类，单装原版或混装任意整合包均 100% 安全。
  */
 public final class QualityEvaluator {
@@ -164,22 +159,21 @@ public final class QualityEvaluator {
             return false;
         }
         Item item = template.getItem();
-        if (!template.isComponentsPatchEmpty()
+        if (template.hasTag()
                 || item instanceof PotionItem
                 || item instanceof EnchantedBookItem
                 || item instanceof TippedArrowItem
                 || item instanceof SuspiciousStewItem) {
-            return ItemStack.isSameItemSameComponents(template, candidate);
+            return ItemStack.isSameItemSameTags(template, candidate);
         }
-        if (candidate.has(DataComponents.CUSTOM_NAME) || candidate.isDamaged()) {
+        if (candidate.hasCustomHoverName() || candidate.isDamaged()) {
             return false;
         }
-        ItemEnchantments ench = candidate.getOrDefault(DataComponents.ENCHANTMENTS, ItemEnchantments.EMPTY);
+        Map<Enchantment, Integer> ench = EnchantmentHelper.getEnchantments(candidate);
         if (!ench.isEmpty()) {
             return false;
         }
-        ItemEnchantments stored = candidate.getOrDefault(DataComponents.STORED_ENCHANTMENTS, ItemEnchantments.EMPTY);
-        return stored.isEmpty();
+        return EnchantmentHelper.deserializeEnchantments(EnchantedBookItem.getEnchantments(candidate)).isEmpty();
     }
 
     public static QualityResult evaluate(ItemStack stack) {
@@ -202,14 +196,15 @@ public final class QualityEvaluator {
 
         // 0. 防刷底线校验：拒收普通水瓶/无效果基底药水、空餐盘、无词条空附魔书
         if (stack.getItem() instanceof PotionItem) {
-            PotionContents pc = stack.get(DataComponents.POTION_CONTENTS);
-            if (pc == null || !pc.hasEffects()) {
+            Potion potion = PotionUtils.getPotion(stack);
+            boolean plainBase = potion == null || potion == Potions.EMPTY || potion == Potions.WATER
+                    || potion == Potions.MUNDANE || potion == Potions.THICK || potion == Potions.AWKWARD;
+            if (plainBase && PotionUtils.getMobEffects(stack).isEmpty()) {
                 return QualityResult.reject("白水/基底药水拒收");
             }
         }
         if (stack.getItem() instanceof EnchantedBookItem) {
-            ItemEnchantments bk = stack.get(DataComponents.STORED_ENCHANTMENTS);
-            if (bk == null || bk.isEmpty()) {
+            if (EnchantedBookItem.getEnchantments(stack).isEmpty()) {
                 return QualityResult.reject("空附魔书拒收");
             }
         }
@@ -219,15 +214,14 @@ public final class QualityEvaluator {
         long floorPrice = 0L;
         List<String> badges = new ArrayList<>(2);
 
-        // 1. 烟火凡人心（fidworkblock）火候与调味检测（原生存储于 minecraft:custom_data -> WokDish.StirCount & seasoning）
-        CustomData customData = stack.get(DataComponents.CUSTOM_DATA);
+        // 1. 烟火凡人心（fidworkblock）火候与调味检测（原生存储于 ItemStack tag -> WokDish.StirCount & seasoning）
+        CompoundTag root = stack.getTag();
         if (("fidworkblock:plate".equals(itemId) || "fidworkblock:long_plate".equals(itemId)
                 || "fidworkblock:small_plate".equals(itemId))
-                && (customData == null || customData.isEmpty())) {
+                && (root == null || root.isEmpty())) {
             return QualityResult.reject("空盘拒收");
         }
-        if (customData != null && !customData.isEmpty()) {
-            CompoundTag root = customData.copyTag();
+        if (root != null && !root.isEmpty()) {
             if (root.contains("WokDish", Tag.TAG_COMPOUND)) {
                 CompoundTag wok = root.getCompound("WokDish");
                 if (wok.contains("StirCount", Tag.TAG_ANY_NUMERIC)) {
@@ -297,10 +291,15 @@ public final class QualityEvaluator {
 
         // 5. 铁魔法（Iron's Spellbooks）：法术卷轴 irons_spellbooks:scroll 的法术等级与稀有度
         if ("irons_spellbooks:scroll".equals(itemId)) {
-            Tag spellContainer = encodeDynamicComponent(stack, "irons_spellbooks", "spell_container");
-            if (spellContainer instanceof CompoundTag scTag && scTag.contains("data", Tag.TAG_LIST)) {
-                ListTag list = scTag.getList("data", Tag.TAG_COMPOUND);
-                if (!list.isEmpty()) {
+            Tag spellContainer = encodeDynamicComponent(stack, "irons_spellbooks", "ISB_Spells");
+            if (spellContainer == null) {
+                spellContainer = encodeDynamicComponent(stack, "irons_spellbooks", "spell_container");
+            }
+            if (spellContainer instanceof CompoundTag scTag) {
+                ListTag list = scTag.contains("data", Tag.TAG_LIST)
+                        ? scTag.getList("data", Tag.TAG_COMPOUND)
+                        : (scTag.contains("spells", Tag.TAG_LIST) ? scTag.getList("spells", Tag.TAG_COMPOUND) : null);
+                if (list != null && !list.isEmpty()) {
                     CompoundTag slot0 = list.getCompound(0);
                     String spellId = slot0.getString("id");
                     int spellLevel = Math.max(1, slot0.getInt("level"));
@@ -314,25 +313,33 @@ public final class QualityEvaluator {
             }
         }
 
-        // 6. 原版附魔书：minecraft:stored_enchantments 词条稀有度权重与等级
-        ItemEnchantments stored = stack.get(DataComponents.STORED_ENCHANTMENTS);
-        if (stored != null && !stored.isEmpty()) {
-            double enchScore = 0.0D;
-            for (var entry : stored.entrySet()) {
-                Holder<Enchantment> holder = entry.getKey();
-                int lv = Math.max(1, entry.getIntValue());
-                int weightVal = Math.max(1, holder.value().getWeight());
-                int maxLv = Math.max(1, holder.value().getMaxLevel());
-                double rarityFactor = Math.min(5.0D, 10.0D / weightVal);
-                double lvRatio = (double) lv / (double) maxLv;
-                double treasure = holder.is(EnchantmentTags.TREASURE) ? 1.40D : 1.0D;
-                enchScore += rarityFactor * (0.55D + 0.75D * lvRatio) * treasure;
-            }
-            double bookMult = Math.min(3.50D, Math.max(1.0D, 0.85D + enchScore * 0.35D));
-            mult *= bookMult;
-            floorPrice = Math.max(floorPrice, Math.round(40L * enchScore));
-            if (bookMult > 1.08D) {
-                badges.add("高阶附魔");
+        // 6. 原版附魔书：StoredEnchantments 词条稀有度权重与等级
+        ListTag storedList = EnchantedBookItem.getEnchantments(stack);
+        if (!storedList.isEmpty()) {
+            Map<Enchantment, Integer> stored = EnchantmentHelper.deserializeEnchantments(storedList);
+            if (!stored.isEmpty()) {
+                double enchScore = 0.0D;
+                for (Map.Entry<Enchantment, Integer> entry : stored.entrySet()) {
+                    Enchantment ench = entry.getKey();
+                    if (ench == null) {
+                        continue;
+                    }
+                    int lv = Math.max(1, entry.getValue() == null ? 1 : entry.getValue());
+                    int weightVal = Math.max(1, ench.getRarity().getWeight());
+                    int maxLv = Math.max(1, ench.getMaxLevel());
+                    double rarityFactor = Math.min(5.0D, 10.0D / weightVal);
+                    double lvRatio = (double) lv / (double) maxLv;
+                    double treasure = ench.isTreasureOnly() ? 1.40D : 1.0D;
+                    enchScore += rarityFactor * (0.55D + 0.75D * lvRatio) * treasure;
+                }
+                if (enchScore > 0.0D) {
+                    double bookMult = Math.min(3.50D, Math.max(1.0D, 0.85D + enchScore * 0.35D));
+                    mult *= bookMult;
+                    floorPrice = Math.max(floorPrice, Math.round(40L * enchScore));
+                    if (bookMult > 1.08D) {
+                        badges.add("高阶附魔");
+                    }
+                }
             }
         }
 
@@ -357,27 +364,30 @@ public final class QualityEvaluator {
         return new QualityResult(false, mult, floorPrice, badgeText);
     }
 
-    @SuppressWarnings({"unchecked", "rawtypes"})
     private static Tag encodeDynamicComponent(ItemStack stack, String namespace, String path) {
-        try {
-            ResourceLocation rl = ResourceLocation.fromNamespaceAndPath(namespace, path);
-            Optional<DataComponentType<?>> opt = BuiltInRegistries.DATA_COMPONENT_TYPE.getOptional(rl);
-            if (opt.isEmpty()) {
-                return null;
-            }
-            DataComponentType type = opt.get();
-            Object val = stack.get(type);
-            if (val == null) {
-                return null;
-            }
-            Codec codec = type.codec();
-            if (codec == null) {
-                return null;
-            }
-            return (Tag) codec.encodeStart(NbtOps.INSTANCE, val).result().orElse(null);
-        } catch (Throwable ignored) {
+        if (stack == null || stack.isEmpty() || path == null || path.isEmpty()) {
             return null;
         }
+        CompoundTag tag = stack.getTag();
+        if (tag == null || tag.isEmpty()) {
+            return null;
+        }
+        if (tag.contains(path)) {
+            return tag.get(path);
+        }
+        if (namespace != null && !namespace.isEmpty()) {
+            String namespacedKey = namespace + ":" + path;
+            if (tag.contains(namespacedKey)) {
+                return tag.get(namespacedKey);
+            }
+            if (tag.contains(namespace, Tag.TAG_COMPOUND)) {
+                CompoundTag sub = tag.getCompound(namespace);
+                if (sub.contains(path)) {
+                    return sub.get(path);
+                }
+            }
+        }
+        return null;
     }
 
     private static double readDoubleComponent(ItemStack stack, String namespace, String path) {

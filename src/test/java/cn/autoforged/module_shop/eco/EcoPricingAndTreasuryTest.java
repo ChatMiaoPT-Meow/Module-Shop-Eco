@@ -228,8 +228,8 @@ class EcoPricingAndTreasuryTest {
     }
 
     @Test
-    @DisplayName("7. 方案 1 零初库做市曲线校验")
-    void optionOneZeroInitialStockAndPresetSanity() {
+    @DisplayName("7. 方案 1 零初库做市曲线与开服预设包核心防套利红线校验")
+    void optionOneZeroInitialStockAndPresetSanity() throws Exception {
         // 方案 1：进度物资开服 0 库存时卖价处于断货高位，随着先驱玩家供货逐步回落至锚定价
         long diamondZeroStockAsk = EcoPricing.computeAskUnitPure(490L, 0, 32, 0.75D, 1.85D);
         long diamondHalfStockAsk = EcoPricing.computeAskUnitPure(490L, 16, 32, 0.75D, 1.85D);

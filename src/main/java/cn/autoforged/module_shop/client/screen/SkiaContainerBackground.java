@@ -2,11 +2,11 @@ package cn.autoforged.module_shop.client.screen;
 
 import cn.autoforged.module_shop.ModuleShopMod;
 import net.minecraft.client.gui.GuiGraphics;
-import net.neoforged.api.distmarker.Dist;
-import net.neoforged.bus.api.EventPriority;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.client.event.ContainerScreenEvent;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.client.event.ContainerScreenEvent;
+import net.minecraftforge.eventbus.api.EventPriority;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
 
 /**
  * 容器界面（出货箱、物品发放、存入……）的 Skija 底板改在
@@ -17,7 +17,7 @@ import net.neoforged.neoforge.client.event.ContainerScreenEvent;
  * 这个事件在 {@code renderBackground} 之后、槽位与物品之前触发；用最低优先级，排在其它模组的处理之后，
  * 底板就总在暗色背景上面、物品下面。
  */
-@EventBusSubscriber(modid = ModuleShopMod.MODID, value = Dist.CLIENT)
+@Mod.EventBusSubscriber(modid = ModuleShopMod.MODID, value = Dist.CLIENT)
 public final class SkiaContainerBackground {
     /** 由使用 Skija 底板的容器界面实现；只在 AtomLib 可用时被调用。 */
     public interface Painter {

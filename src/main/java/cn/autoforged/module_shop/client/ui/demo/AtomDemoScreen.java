@@ -233,7 +233,7 @@ public final class AtomDemoScreen extends Screen implements JeiHoverSource {
 
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
-        renderBackground(graphics, mouseX, mouseY, partialTick);
+        renderBackground(graphics);
         float dt = clock.tick();
         frameMs = frameMs == 0 ? dt : frameMs + (dt - frameMs) * 0.05F;
 
@@ -412,7 +412,7 @@ public final class AtomDemoScreen extends Screen implements JeiHoverSource {
             if (!modalShown.isEmpty()) {
                 Draw.fill(canvas, x + 12.0F, y + 28.0F, 22.0F, 22.0F, 2.0F, IOStyle.SLOT_INNER);
                 Draw.stroke(canvas, x + 12.0F, y + 28.0F, 22.0F, 22.0F, 2.0F, 1.0F, IOStyle.SLOT_BORDER);
-                Text.drawLine(canvas, modalShown.getHoverName().getString() + " × " + modalShown.getCount(),
+                Text.drawLine(canvas, cn.autoforged.module_shop.client.ui.ItemNames.display(modalShown) + " × " + modalShown.getCount(),
                         AtomUi.REGULAR, Text.BODY, IOStyle.TEXT, x + 40.0F, y + 39.0F, MODAL_W - 52.0F,
                         Text.Align.LEFT);
                 // 原版物品无法跟随 Skija 图层半透明，只在弹窗基本完全显示时出现，避免“物品先出现/后消失”
@@ -439,7 +439,7 @@ public final class AtomDemoScreen extends Screen implements JeiHoverSource {
         float x = contentX();
         float y = contentY();
         float w = contentW();
-        String para = "模块商店是面向 NeoForge 1.21.1 的服务端经济系统：每日商店、每日收购、拍卖行、玩家摊位、"
+        String para = "模块商店是面向 Forge 1.20.1 的服务端经济系统：每日商店、每日收购、拍卖行、玩家摊位、"
                 + "交易与转账、邮箱、签到。这一段用来检查中文自动换行、标点处理和行距；超过三行的部分会以省略号结尾，"
                 + "而不是溢出到面板外面。Mixed English text should wrap together with 中文 correctly.";
         TextLayout wrapped = Text.wrapped(para, AtomUi.REGULAR, Text.BODY, IOStyle.TEXT, w, 3);
@@ -591,7 +591,7 @@ public final class AtomDemoScreen extends Screen implements JeiHoverSource {
     }
 
     @Override
-    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollY) {
         if (!modalStack.isEmpty()) {
             return true;
         }
@@ -606,7 +606,7 @@ public final class AtomDemoScreen extends Screen implements JeiHoverSource {
                 return true;
             }
         }
-        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        return super.mouseScrolled(mouseX, mouseY, scrollY);
     }
 
     @Override

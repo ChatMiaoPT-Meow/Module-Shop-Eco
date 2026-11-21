@@ -19,8 +19,8 @@ import net.minecraft.locale.Language;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.server.packs.resources.ResourceManager;
-import net.neoforged.fml.ModList;
-import net.neoforged.fml.loading.FMLPaths;
+import net.minecraftforge.fml.ModList;
+import net.minecraftforge.fml.loading.FMLPaths;
 
 /**
  * 客户端模组显示名自动翻译与中文名包加载器。
@@ -291,7 +291,7 @@ public final class ModNames {
     }
 
     private static void readNamespacePack(ResourceManager manager, String namespace, Map<String, String> out) {
-        ResourceLocation loc = ResourceLocation.fromNamespaceAndPath(namespace, "mod_names_zh_cn.json");
+        ResourceLocation loc = new ResourceLocation(namespace, "mod_names_zh_cn.json");
         List<Resource> stack = manager.getResourceStack(loc);
         if (!stack.isEmpty()) {
             readResourceStack(stack, out, loc.toString());

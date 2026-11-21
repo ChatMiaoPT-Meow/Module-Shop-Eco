@@ -2,7 +2,7 @@ package cn.autoforged.module_shop.api.event;
 
 import java.util.List;
 import java.util.UUID;
-import net.neoforged.bus.api.Event;
+import net.minecraftforge.eventbus.api.Event;
 
 /**
  * 出货箱结算完成通知事件（API 1.4.0 新增，挂载于 {@link cn.autoforged.module_shop.api.ModuleShopApi#events()}）。

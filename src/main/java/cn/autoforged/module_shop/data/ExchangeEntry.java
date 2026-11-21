@@ -19,13 +19,20 @@ public final class ExchangeEntry {
     public ItemStack stack = ItemStack.EMPTY;
     /** 单个物品可兑换的星币数。 */
     public long value;
+    /** 单人每日可兑换该货币的最大件数（<=0 表示不限；仍受星币日上限约束）。 */
+    public int dailyLimit = 0;
 
     public ExchangeEntry() {
     }
 
     public ExchangeEntry(ItemStack stack, long value) {
+        this(stack, value, 0);
+    }
+
+    public ExchangeEntry(ItemStack stack, long value, int dailyLimit) {
         this.stack = stack == null ? ItemStack.EMPTY : stack;
         this.value = value;
+        this.dailyLimit = Math.max(0, dailyLimit);
     }
 
     /** 归一化：模板恒为 1 个，避免把数量当成价格的一部分。 */
@@ -36,15 +43,32 @@ public final class ExchangeEntry {
         if (!stack.isEmpty()) {
             stack.setCount(1);
         }
+        if (dailyLimit < 0) {
+            dailyLimit = 0;
+        }
     }
 
     public boolean valid() {
         return !stack.isEmpty() && value > 0L;
     }
 
+    /** 稳定的单品限额追踪键（物品 ID + NBT SNBT），不因列表增删改序漂移。 */
+    public String limitKey(HolderLookup.Provider registries) {
+        if (stack == null || stack.isEmpty()) {
+            return "";
+        }
+        var rl = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem());
+        String id = rl == null ? "" : rl.toString();
+        String snbt = cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig.extractComponentsSnbt(stack, registries);
+        return snbt.isEmpty() ? id : (id + "|" + snbt);
+    }
+
     public CompoundTag save(HolderLookup.Provider registries) {
         CompoundTag tag = ShopNbt.saveStack(stack, registries);
         tag.putLong("value", value);
+        if (dailyLimit > 0) {
+            tag.putInt("dailyLimit", dailyLimit);
+        }
         return tag;
     }
 
@@ -52,6 +76,7 @@ public final class ExchangeEntry {
         ExchangeEntry entry = new ExchangeEntry();
         entry.stack = ShopNbt.loadStack(tag, registries);
         entry.value = tag.getLong("value");
+        entry.dailyLimit = Math.max(0, tag.getInt("dailyLimit"));
         entry.normalize();
         return entry;
     }

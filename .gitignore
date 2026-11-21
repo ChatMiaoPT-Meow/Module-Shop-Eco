@@ -1,43 +1,31 @@
-### Gradle ###
-.gradle
+# Gradle
+.gradle/
 build/
 !gradle/wrapper/gradle-wrapper.jar
-!**/src/**/build/
 
-### IntelliJ IDEA ###
+# ForgeGradle 运行目录（世界、配置、mods、日志）
+run/
+run-data/
+logs/
+
+# IDE
 .idea/
 *.iws
 *.iml
 *.ipr
-out/
-!**/src/**/out/
-
-.run/
-
-### Eclipse ###
-.apt_generated
-.classpath
-.eclipse/
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
-bin/
-!**/src/**/bin/
-
-### VS Code ###
 .vscode/
+eclipse/
+bin/
+out/
 
-### Mac OS ###
-.DS_Store
-
-### Minecraft Modding ###
-run/
-!**/src/**/run/
+# Minecraft Modding
 **/src/generated/**/.cache/
-repo/
-!**/src/**/repo/
 
-### AtomLib 本地 Maven 输入（gradle/atomlib.gradle 自动下载） ###
+# 系统
+.DS_Store
+Thumbs.db
+
+# 本地库与临时 jar（AtomLib 离线包不入库，由构建验证 SHA-256）
+*.jar.tmp
+libs/*.jar
 .atomlib/

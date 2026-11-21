@@ -98,7 +98,7 @@ public final class MailEntry {
         }
         ItemStack rest = add.copy();
         for (ItemStack exist : stacks) {
-            if (exist.isEmpty() || !ItemStack.isSameItemSameComponents(exist, rest)) {
+            if (exist.isEmpty() || !ItemStack.isSameItemSameTags(exist, rest)) {
                 continue;
             }
             int room = exist.getMaxStackSize() - exist.getCount();

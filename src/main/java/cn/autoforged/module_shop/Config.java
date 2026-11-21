@@ -1,6 +1,7 @@
 package cn.autoforged.module_shop;
 
-import net.neoforged.neoforge.common.ModConfigSpec;
+import net.minecraftforge.common.ForgeConfigSpec;
+import java.util.ArrayList;
 import java.util.List;
 import org.apache.commons.lang3.tuple.Pair;
 
@@ -10,203 +11,203 @@ import org.apache.commons.lang3.tuple.Pair;
  */
 public final class Config {
     public static final Config INSTANCE;
-    public static final ModConfigSpec SPEC;
+    public static final ForgeConfigSpec SPEC;
 
     static {
-        Pair<Config, ModConfigSpec> pair = new ModConfigSpec.Builder().configure(Config::new);
+        Pair<Config, ForgeConfigSpec> pair = new ForgeConfigSpec.Builder().configure(Config::new);
         INSTANCE = pair.getLeft();
         SPEC = pair.getRight();
     }
 
     // ---- 钱包 ----
-    public final ModConfigSpec.ConfigValue<String> currencyName;
-    public final ModConfigSpec.ConfigValue<String> currencySymbol;
-    public final ModConfigSpec.LongValue initialBalance;
-    public final ModConfigSpec.LongValue maxBalance;
-    public final ModConfigSpec.IntValue transferCooldownTicks;
-    public final ModConfigSpec.BooleanValue allowPlayerTransfer;
+    public final ForgeConfigSpec.ConfigValue<String> currencyName;
+    public final ForgeConfigSpec.ConfigValue<String> currencySymbol;
+    public final ForgeConfigSpec.LongValue initialBalance;
+    public final ForgeConfigSpec.LongValue maxBalance;
+    public final ForgeConfigSpec.IntValue transferCooldownTicks;
+    public final ForgeConfigSpec.BooleanValue allowPlayerTransfer;
     /** 新世界是否用客户端 / 服务器默认模板初始化商店。 */
-    public final ModConfigSpec.BooleanValue templateInitEnabled;
+    public final ForgeConfigSpec.BooleanValue templateInitEnabled;
 
     // ---- 每日商店 ----
-    public final ModConfigSpec.IntValue dailyShopSlots;
+    public final ForgeConfigSpec.IntValue dailyShopSlots;
     /** 每日商店里“普通”档位最多出现几个（0=不限制）。 */
-    public final ModConfigSpec.IntValue dailyShopCommonLimit;
+    public final ForgeConfigSpec.IntValue dailyShopCommonLimit;
     /** 付费刷新每日商店的价格表（按次数顺序取用：第 1 次、第 2 次…），用完即不可再刷新。 */
-    public final ModConfigSpec.ConfigValue<List<? extends String>> dailyRefreshCosts;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> dailyRefreshCosts;
     /** 每日收购的付费刷新价格表（与每日商店**完全分开**：价格、次数各自独立）。 */
-    public final ModConfigSpec.ConfigValue<List<? extends String>> buybackRefreshCosts;
-    public final ModConfigSpec.IntValue weightLegendary;
-    public final ModConfigSpec.IntValue weightEpic;
-    public final ModConfigSpec.IntValue weightRare;
-    public final ModConfigSpec.IntValue weightCommon;
-    public final ModConfigSpec.IntValue limitLegendary;
-    public final ModConfigSpec.IntValue limitEpic;
-    public final ModConfigSpec.IntValue limitRare;
-    public final ModConfigSpec.IntValue limitCommon;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> buybackRefreshCosts;
+    public final ForgeConfigSpec.IntValue weightLegendary;
+    public final ForgeConfigSpec.IntValue weightEpic;
+    public final ForgeConfigSpec.IntValue weightRare;
+    public final ForgeConfigSpec.IntValue weightCommon;
+    public final ForgeConfigSpec.IntValue limitLegendary;
+    public final ForgeConfigSpec.IntValue limitEpic;
+    public final ForgeConfigSpec.IntValue limitRare;
+    public final ForgeConfigSpec.IntValue limitCommon;
 
     // ---- 每日收购 ----
-    public final ModConfigSpec.IntValue buybackSlots;
-    public final ModConfigSpec.IntValue buybackCapacity;
+    public final ForgeConfigSpec.IntValue buybackSlots;
+    public final ForgeConfigSpec.IntValue buybackCapacity;
     /** 当日把收购清单全部卖完的一次性奖励（0=关闭，默认 1000）。 */
-    public final ModConfigSpec.LongValue buybackAllBonus;
+    public final ForgeConfigSpec.LongValue buybackAllBonus;
 
     // ---- 拍卖（时长全部按现实时间，单位秒）----
-    public final ModConfigSpec.IntValue auctionDurationSeconds;
-    public final ModConfigSpec.LongValue auctionMinIncrement;
-    public final ModConfigSpec.IntValue maxConcurrentAuctions;
+    public final ForgeConfigSpec.IntValue auctionDurationSeconds;
+    public final ForgeConfigSpec.LongValue auctionMinIncrement;
+    public final ForgeConfigSpec.IntValue maxConcurrentAuctions;
     /** 需求 2：拍卖成交后从卖家所得中扣除的手续费百分比（默认 5%）。 */
-    public final ModConfigSpec.DoubleValue auctionFeePercent;
-    public final ModConfigSpec.BooleanValue antiSnipe;
-    public final ModConfigSpec.IntValue antiSnipeSeconds;
-    public final ModConfigSpec.IntValue antiSnipeExtensionSeconds;
+    public final ForgeConfigSpec.DoubleValue auctionFeePercent;
+    public final ForgeConfigSpec.BooleanValue antiSnipe;
+    public final ForgeConfigSpec.IntValue antiSnipeSeconds;
+    public final ForgeConfigSpec.IntValue antiSnipeExtensionSeconds;
     // ---- 拍卖行升级（新增，全部有安全默认值）----
-    public final ModConfigSpec.BooleanValue auctionEnabled;
-    public final ModConfigSpec.IntValue maxAuctionsGlobal;
-    public final ModConfigSpec.IntValue antiSnipeMaxExtensions;
-    public final ModConfigSpec.ConfigValue<List<? extends String>> auctionDurationOptions;
-    public final ModConfigSpec.LongValue auctionListingFeeFixed;
-    public final ModConfigSpec.DoubleValue auctionListingFeePercent;
-    public final ModConfigSpec.LongValue auctionMinStartPrice;
-    public final ModConfigSpec.LongValue auctionMaxStartPrice;
-    public final ModConfigSpec.BooleanValue auctionAllowBuyout;
-    public final ModConfigSpec.IntValue auctionMaxItemCount;
-    public final ModConfigSpec.ConfigValue<List<? extends String>> auctionBlacklist;
-    public final ModConfigSpec.BooleanValue auctionAllowBound;
-    public final ModConfigSpec.ConfigValue<List<? extends String>> auctionBoundMarkers;
-    public final ModConfigSpec.BooleanValue auctionAllowCustomData;
-    public final ModConfigSpec.IntValue auctionMaxItemNbtBytes;
-    public final ModConfigSpec.BooleanValue auctionBlockCreative;
-    public final ModConfigSpec.IntValue auctionEndingSoonSeconds;
-    public final ModConfigSpec.IntValue auctionHistoryLimit;
+    public final ForgeConfigSpec.BooleanValue auctionEnabled;
+    public final ForgeConfigSpec.IntValue maxAuctionsGlobal;
+    public final ForgeConfigSpec.IntValue antiSnipeMaxExtensions;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> auctionDurationOptions;
+    public final ForgeConfigSpec.LongValue auctionListingFeeFixed;
+    public final ForgeConfigSpec.DoubleValue auctionListingFeePercent;
+    public final ForgeConfigSpec.LongValue auctionMinStartPrice;
+    public final ForgeConfigSpec.LongValue auctionMaxStartPrice;
+    public final ForgeConfigSpec.BooleanValue auctionAllowBuyout;
+    public final ForgeConfigSpec.IntValue auctionMaxItemCount;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> auctionBlacklist;
+    public final ForgeConfigSpec.BooleanValue auctionAllowBound;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> auctionBoundMarkers;
+    public final ForgeConfigSpec.BooleanValue auctionAllowCustomData;
+    public final ForgeConfigSpec.IntValue auctionMaxItemNbtBytes;
+    public final ForgeConfigSpec.BooleanValue auctionBlockCreative;
+    public final ForgeConfigSpec.IntValue auctionEndingSoonSeconds;
+    public final ForgeConfigSpec.IntValue auctionHistoryLimit;
 
     // ---- 邮箱 ----
     /** 邮箱上限（默认 100；界面每页 45 封，可翻页）。达到上限时系统资产返还优先改为掉落入包，防止溢出刷物品。 */
-    public final ModConfigSpec.IntValue maxMailboxSize;
-    public final ModConfigSpec.IntValue mailExpireDays;
+    public final ForgeConfigSpec.IntValue maxMailboxSize;
+    public final ForgeConfigSpec.IntValue mailExpireDays;
     /** 每名玩家保留的交易流水条数（管理员用 /shop admin history 查看）。 */
-    public final ModConfigSpec.IntValue transactionHistorySize;
+    public final ForgeConfigSpec.IntValue transactionHistorySize;
 
     // ---- 摊位 ----
-    public final ModConfigSpec.IntValue stallSlots;
-    public final ModConfigSpec.DoubleValue stallListingFeePercent;
+    public final ForgeConfigSpec.IntValue stallSlots;
+    public final ForgeConfigSpec.DoubleValue stallListingFeePercent;
     /** 玩家摊位成交税百分比（默认 5%，从卖家实收扣除并注入官方总钱箱）。 */
-    public final ModConfigSpec.DoubleValue stallSaleFeePercent;
+    public final ForgeConfigSpec.DoubleValue stallSaleFeePercent;
     /** 单件商品的库存上限（上架与补货共用）。 */
-    public final ModConfigSpec.IntValue stallMaxStock;
+    public final ForgeConfigSpec.IntValue stallMaxStock;
     /** 玩家摊位自动下架方式：permanent=永久 / game=按游戏时间 / real=按现实时间。 */
     /** 购物城：库存刷新方式（off / real / game）与周期（real=小时、game=天）。 */
-    public final ModConfigSpec.ConfigValue<String> mallRefreshMode;
-    public final ModConfigSpec.IntValue mallRefreshAmount;
+    public final ForgeConfigSpec.ConfigValue<String> mallRefreshMode;
+    public final ForgeConfigSpec.IntValue mallRefreshAmount;
     /** 购物城库存模式：global = 全服共用一份库存 / personal = 每个玩家各自一份库存。 */
-    public final ModConfigSpec.ConfigValue<String> mallStockMode;
-    public final ModConfigSpec.ConfigValue<String> stallExpireMode;
+    public final ForgeConfigSpec.ConfigValue<String> mallStockMode;
+    public final ForgeConfigSpec.ConfigValue<String> stallExpireMode;
     /** 限时时长：game 按游戏天数，real 按现实小时（0 = 永不自动下架）。 */
-    public final ModConfigSpec.IntValue stallExpireAmount;
+    public final ForgeConfigSpec.IntValue stallExpireAmount;
 
     // ---- 玩家求购（悬赏）----
     /** 是否开启玩家求购模块。 */
-    public final ModConfigSpec.BooleanValue demandEnabled;
+    public final ForgeConfigSpec.BooleanValue demandEnabled;
     /** 每名玩家最多同时发布几条求购。 */
-    public final ModConfigSpec.IntValue demandSlots;
+    public final ForgeConfigSpec.IntValue demandSlots;
     /** 发布手续费百分比（按悬赏金币算，0 = 免费）。 */
-    public final ModConfigSpec.DoubleValue demandFeePercent;
+    public final ForgeConfigSpec.DoubleValue demandFeePercent;
     /** 单笔悬赏金币上限（0 = 不限）。 */
-    public final ModConfigSpec.IntValue demandMaxReward;
+    public final ForgeConfigSpec.IntValue demandMaxReward;
     /** 全服最多保留多少条求购（超出时最老的自动下架并退款）。 */
-    public final ModConfigSpec.IntValue demandMaxListed;
+    public final ForgeConfigSpec.IntValue demandMaxListed;
     /** 求购自动下架方式：permanent=永久 / game=按游戏时间 / real=按现实时间。 */
-    public final ModConfigSpec.ConfigValue<String> demandExpireMode;
+    public final ForgeConfigSpec.ConfigValue<String> demandExpireMode;
     /** 限时时长：game 按游戏天数，real 按现实小时（0 = 永不自动下架）。 */
-    public final ModConfigSpec.IntValue demandExpireAmount;
+    public final ForgeConfigSpec.IntValue demandExpireAmount;
 
     // ---- 玩家交易（现实时间，单位秒）----
-    public final ModConfigSpec.IntValue tradeCountdownSeconds;
+    public final ForgeConfigSpec.IntValue tradeCountdownSeconds;
     /** 需求 1：交易请求失效时间（现实秒），超时自动清理。 */
-    public final ModConfigSpec.IntValue tradeRequestExpireSeconds;
+    public final ForgeConfigSpec.IntValue tradeRequestExpireSeconds;
     /** 已接受的交易多久没有任何操作就自动结束并退回物品（现实秒，默认 10 分钟）。 */
-    public final ModConfigSpec.IntValue tradeSessionTimeoutSeconds;
+    public final ForgeConfigSpec.IntValue tradeSessionTimeoutSeconds;
 
     // ---- 出货箱（新增模块，参考星露谷售货箱）----
-    public final ModConfigSpec.BooleanValue shippingEnabled;
+    public final ForgeConfigSpec.BooleanValue shippingEnabled;
     /** 兑换规则（每行一条：物品ID=价格 / #标签=价格 / 命名空间:*=价格，价格后可加 x数量 限定每日份数）。 */
-    public final ModConfigSpec.ConfigValue<List<? extends String>> shippingRules;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> shippingRules;
     /** 每个等级的槽位数（列表长度 = 等级数）。 */
-    public final ModConfigSpec.ConfigValue<List<? extends String>> shippingLevelSlots;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> shippingLevelSlots;
     /** 升级花费（第 1 项 = 1→2 级）。 */
-    public final ModConfigSpec.ConfigValue<List<? extends String>> shippingUpgradeCosts;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> shippingUpgradeCosts;
     /** 每个等级的每日结算上限（现实 0 点刷新）。 */
-    public final ModConfigSpec.ConfigValue<List<? extends String>> shippingDailyLimits;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> shippingDailyLimits;
     /** 每天结算的游戏刻（0 = 早上 06:00）。 */
-    public final ModConfigSpec.IntValue shippingSettleTick;
+    public final ForgeConfigSpec.IntValue shippingSettleTick;
     /** 结算窗口长度（刻）。 */
-    public final ModConfigSpec.IntValue shippingSettleWindow;
+    public final ForgeConfigSpec.IntValue shippingSettleWindow;
     /** 每日额度按**现实时间**在几点重置（HH:mm，默认 00:00）。 */
-    public final ModConfigSpec.ConfigValue<String> shippingResetTime;
+    public final ForgeConfigSpec.ConfigValue<String> shippingResetTime;
 
     // ---- 购物城（新增模块）----
     /** 购物城是否定时补货（默认关；管理员可在游戏内「补货设置」里打开）。 */
-    public final ModConfigSpec.BooleanValue mallRestockEnabled;
+    public final ForgeConfigSpec.BooleanValue mallRestockEnabled;
     /** 补货时刻的时间口径：{@code real} = 现实时间，{@code game} = 游戏时间。 */
-    public final ModConfigSpec.ConfigValue<String> mallRestockMode;
+    public final ForgeConfigSpec.ConfigValue<String> mallRestockMode;
     /** 补货时刻（HH:mm）。 */
-    public final ModConfigSpec.ConfigValue<String> mallRestockTime;
+    public final ForgeConfigSpec.ConfigValue<String> mallRestockTime;
     /** 补货数量：0 = 每件商品补回各自原量；>0 = 所有商品统一补到该数量。 */
-    public final ModConfigSpec.IntValue mallRestockAmount;
+    public final ForgeConfigSpec.IntValue mallRestockAmount;
 
     // ---------------------------------------------------------------- HTTP / REST API（默认关闭）
     /** 是否启用 HTTP API（默认关闭；启用前请务必设置 token 并保持只监听 127.0.0.1）。 */
-    public final ModConfigSpec.BooleanValue httpApiEnabled;
+    public final ForgeConfigSpec.BooleanValue httpApiEnabled;
     /** 监听地址（默认 127.0.0.1；填 0.0.0.0 会把经济接口暴露到网络，除非你很清楚在做什么）。 */
-    public final ModConfigSpec.ConfigValue<String> httpApiBind;
+    public final ForgeConfigSpec.ConfigValue<String> httpApiBind;
     /** 监听端口。 */
-    public final ModConfigSpec.IntValue httpApiPort;
+    public final ForgeConfigSpec.IntValue httpApiPort;
     /** 访问令牌（Bearer）。为空时 HTTP API 拒绝启动。 */
-    public final ModConfigSpec.ConfigValue<String> httpApiToken;
+    public final ForgeConfigSpec.ConfigValue<String> httpApiToken;
     /** 是否允许写操作（加钱/扣钱/发奖/发邮件）。默认 false = 只读。 */
-    public final ModConfigSpec.BooleanValue httpApiAllowWrite;
+    public final ForgeConfigSpec.BooleanValue httpApiAllowWrite;
     /** 每个 IP 每分钟最多请求数（0 = 不限，不建议）。 */
-    public final ModConfigSpec.IntValue httpApiRateLimit;
+    public final ForgeConfigSpec.IntValue httpApiRateLimit;
 
     // ---------------------------------------------------------------- Eco 做市商与闭环总钱箱
-    public final ModConfigSpec.BooleanValue ecoEnabled;
-    public final ModConfigSpec.LongValue treasuryInitialReserve;
-    public final ModConfigSpec.LongValue treasuryTargetReserve;
-    public final ModConfigSpec.LongValue treasuryMinFloor;
-    public final ModConfigSpec.DoubleValue treasuryMinFactor;
-    public final ModConfigSpec.DoubleValue treasuryMaxFactor;
-    public final ModConfigSpec.DoubleValue ecoAskFloor;
-    public final ModConfigSpec.DoubleValue ecoAskCeiling;
-    public final ModConfigSpec.DoubleValue ecoBidFloor;
-    public final ModConfigSpec.DoubleValue ecoBidCeiling;
-    public final ModConfigSpec.DoubleValue ecoMaxBidToAskRatio;
-    public final ModConfigSpec.DoubleValue ecoShippingToMallRatio;
-    public final ModConfigSpec.DoubleValue ecoBuybackToMallRatio;
-    public final ModConfigSpec.IntValue blackMarketDefaultCap;
-    public final ModConfigSpec.DoubleValue blackMarketWarehouseFullRatio;
-    public final ModConfigSpec.DoubleValue blackMarketDailyDecayRatio;
-    public final ModConfigSpec.DoubleValue blackMarketScarcityDailyStep;
-    public final ModConfigSpec.DoubleValue blackMarketScarcityMaxBonus;
-    public final ModConfigSpec.ConfigValue<List<? extends String>> ecoTreasurySinkReasonPrefixes;
-    public final ModConfigSpec.ConfigValue<List<? extends String>> ecoTreasuryRefundReasonPrefixes;
+    public final ForgeConfigSpec.BooleanValue ecoEnabled;
+    public final ForgeConfigSpec.LongValue treasuryInitialReserve;
+    public final ForgeConfigSpec.LongValue treasuryTargetReserve;
+    public final ForgeConfigSpec.LongValue treasuryMinFloor;
+    public final ForgeConfigSpec.DoubleValue treasuryMinFactor;
+    public final ForgeConfigSpec.DoubleValue treasuryMaxFactor;
+    public final ForgeConfigSpec.DoubleValue ecoAskFloor;
+    public final ForgeConfigSpec.DoubleValue ecoAskCeiling;
+    public final ForgeConfigSpec.DoubleValue ecoBidFloor;
+    public final ForgeConfigSpec.DoubleValue ecoBidCeiling;
+    public final ForgeConfigSpec.DoubleValue ecoMaxBidToAskRatio;
+    public final ForgeConfigSpec.DoubleValue ecoShippingToMallRatio;
+    public final ForgeConfigSpec.DoubleValue ecoBuybackToMallRatio;
+    public final ForgeConfigSpec.IntValue blackMarketDefaultCap;
+    public final ForgeConfigSpec.DoubleValue blackMarketWarehouseFullRatio;
+    public final ForgeConfigSpec.DoubleValue blackMarketDailyDecayRatio;
+    public final ForgeConfigSpec.DoubleValue blackMarketScarcityDailyStep;
+    public final ForgeConfigSpec.DoubleValue blackMarketScarcityMaxBonus;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> ecoTreasurySinkReasonPrefixes;
+    public final ForgeConfigSpec.ConfigValue<List<? extends String>> ecoTreasuryRefundReasonPrefixes;
 
     // ---------------------------------------------------------------- Eco 单向/限额货币结汇阀门
-    public final ModConfigSpec.BooleanValue exchangeAllowWithdraw;
-    public final ModConfigSpec.LongValue playerDailyExchangeCap;
-    public final ModConfigSpec.LongValue globalDailyFxCap;
-    public final ModConfigSpec.DoubleValue treasuryDailyFxShare;
+    public final ForgeConfigSpec.BooleanValue exchangeAllowWithdraw;
+    public final ForgeConfigSpec.LongValue playerDailyExchangeCap;
+    public final ForgeConfigSpec.LongValue globalDailyFxCap;
+    public final ForgeConfigSpec.DoubleValue treasuryDailyFxShare;
 
     // ---------------------------------------------------------------- Eco 八大职业、专注点与品质溢价
-    public final ModConfigSpec.BooleanValue professionsEnabled;
-    public final ModConfigSpec.IntValue dailyFocusRestore;
-    public final ModConfigSpec.IntValue maxFocusCap;
-    public final ModConfigSpec.DoubleValue baseFocusCostPerItem;
-    public final ModConfigSpec.DoubleValue maxProfessionPriceBonus;
-    public final ModConfigSpec.DoubleValue scarcityBonusMax;
-    public final ModConfigSpec.BooleanValue qualityBonusEnabled;
-    public final ModConfigSpec.IntValue combatGrinderKillThreshold;
+    public final ForgeConfigSpec.BooleanValue professionsEnabled;
+    public final ForgeConfigSpec.IntValue dailyFocusRestore;
+    public final ForgeConfigSpec.IntValue maxFocusCap;
+    public final ForgeConfigSpec.DoubleValue baseFocusCostPerItem;
+    public final ForgeConfigSpec.DoubleValue maxProfessionPriceBonus;
+    public final ForgeConfigSpec.DoubleValue scarcityBonusMax;
+    public final ForgeConfigSpec.BooleanValue qualityBonusEnabled;
+    public final ForgeConfigSpec.IntValue combatGrinderKillThreshold;
 
-    private Config(ModConfigSpec.Builder builder) {
+    private Config(ForgeConfigSpec.Builder builder) {
         builder.push("wallet");
         currencyName = builder.comment("货币名称（需求：币种统一为星币，所有金额显示统一追加该后缀）").define("currencyName", "星币");
         currencySymbol = builder.comment("货币符号，留空则只显示数字").define("currencySymbol", "");
@@ -228,9 +229,9 @@ public final class Config {
         dailyShopCommonLimit = builder.comment("每日商店“普通”档位最多出现数量（0=不限制，默认 3）")
                 .defineInRange("dailyShopCommonLimit", 3, 0, 6);
         dailyRefreshCosts = builder.comment("付费刷新【每日商店】的价格表（按次数顺序：默认第 1 次 200、第 2 次 500；列表长度=每天可刷新次数）")
-                .defineList("dailyRefreshCosts", List.of("200", "500"), () -> "200", o -> o instanceof String);
+                .defineList("dailyRefreshCosts", List.of("200", "500"), o -> o instanceof String);
         buybackRefreshCosts = builder.comment("付费刷新【每日收购】的价格表（与每日商店相互独立：可分别设置价格与每天次数）")
-                .defineList("buybackRefreshCosts", List.of("200", "500"), () -> "200", o -> o instanceof String);
+                .defineList("buybackRefreshCosts", List.of("200", "500"), o -> o instanceof String);
         weightLegendary = builder.comment("传说权重").defineInRange("weightLegendary", 5, 0, 100000);
         weightEpic = builder.comment("史诗权重").defineInRange("weightEpic", 15, 0, 100000);
         weightRare = builder.comment("稀有权重").defineInRange("weightRare", 30, 0, 100000);
@@ -265,22 +266,22 @@ public final class Config {
         maxAuctionsGlobal = builder.comment("全服同时进行的拍卖上限").defineInRange("maxAuctionsGlobal", 500, 1, 5000);
         antiSnipeMaxExtensions = builder.comment("同一场拍卖防截拍最多延长几次（0=不限，仍受总时长 2 倍封顶）").defineInRange("antiSnipeMaxExtensions", 10, 0, 1000);
         auctionDurationOptions = builder.comment("上架时可选的拍卖时长（现实分钟），第一个为默认值；最长时长即其中的最大值")
-                .defineList("auctionDurationOptions", List.of("30", "60", "180", "360", "720", "1440", "2880"), () -> "60", o -> o instanceof String);
+                .defineList("auctionDurationOptions", List.of("30", "60", "180", "360", "720", "1440", "2880"), o -> o instanceof String);
         auctionListingFeeFixed = builder.comment("上架手续费：固定部分（星币，0=不收）").defineInRange("auctionListingFeeFixed", 0L, 0L, 1_000_000_000L);
         auctionListingFeePercent = builder.comment("上架手续费：按起拍价百分比（0=不收）").defineInRange("auctionListingFeePercent", 0.0D, 0.0D, 100.0D);
         auctionMinStartPrice = builder.comment("最低起拍价").defineInRange("auctionMinStartPrice", 1L, 1L, Long.MAX_VALUE);
         auctionMaxStartPrice = builder.comment("最高起拍价（0=只受余额上限约束）").defineInRange("auctionMaxStartPrice", 0L, 0L, Long.MAX_VALUE);
         auctionAllowBuyout = builder.comment("是否允许卖家设置一口价").define("auctionAllowBuyout", true);
         auctionMaxItemCount = builder.comment("单场拍卖最多上架几件（不超过该物品的堆叠上限）").defineInRange("auctionMaxItemCount", 64, 1, 64);
-        auctionBlacklist = builder.comment("禁止拍卖的物品：物品 id（minecraft:bedrock）、标签（#c:ores）或整个模组（somemod:*）。容器里装的物品同样检查")
+        auctionBlacklist = builder.comment("禁止拍卖的物品：物品 id（minecraft:bedrock）、标签（#forge:ores）或整个模组（somemod:*）。容器里装的物品同样检查")
                 .defineList("auctionBlacklist", List.of("minecraft:bedrock", "minecraft:barrier", "minecraft:command_block",
                         "minecraft:chain_command_block", "minecraft:repeating_command_block", "minecraft:command_block_minecart",
                         "minecraft:structure_block", "minecraft:structure_void", "minecraft:jigsaw", "minecraft:light",
                         "minecraft:debug_stick", "minecraft:knowledge_book", "minecraft:spawner", "minecraft:trial_spawner"),
-                        () -> "minecraft:bedrock", o -> o instanceof String);
+                        o -> o instanceof String);
         auctionAllowBound = builder.comment("是否允许拍卖绑定物品（带绑定诅咒，或自定义数据里含下方标记的物品）").define("auctionAllowBound", false);
         auctionBoundMarkers = builder.comment("自定义数据（custom_data）里出现这些键名即视为绑定物品")
-                .defineList("auctionBoundMarkers", List.of("Soulbound", "soulbound", "Bound", "bound", "BoundTo", "Owner"), () -> "Soulbound", o -> o instanceof String);
+                .defineList("auctionBoundMarkers", List.of("Soulbound", "soulbound", "Bound", "bound", "BoundTo", "Owner"), o -> o instanceof String);
         auctionAllowCustomData = builder.comment("是否允许拍卖带自定义数据（custom_data，即特殊 NBT）的物品").define("auctionAllowCustomData", true);
         auctionMaxItemNbtBytes = builder.comment("拍品序列化后的最大字节数（防止超大 NBT 物品拖垮网络与存档）").defineInRange("auctionMaxItemNbtBytes", 32768, 1024, 1_048_576);
         auctionBlockCreative = builder.comment("创造模式玩家不能上架拍卖（创造模式可凭空生成物品）").define("auctionBlockCreative", true);
@@ -470,7 +471,7 @@ public final class Config {
                         "guaniao:feather_yellow=10 x96",
                         "wilderflowers:clovers=7 x128",
                         "#minecraft:wool=5 x128",
-                        "#c:crops=4 x256",
+                        "#forge:crops=4 x256",
                         "// ===== 2. 厨师 (cooking)：原版与全模组中餐、药膳、烘焙、火锅、维度料理（严格锚定配方原料成本 1.3x~1.8x） =====",
                         "minecraft:bread=15 x96",
                         "minecraft:baked_potato=6 x128",
@@ -1196,13 +1197,13 @@ public final class Config {
                         "minecraft:emerald=20 x32",
                         "minecraft:diamond=70 x16",
                         "minecraft:netherite_scrap=100 x10"),
-                        () -> "minecraft:wheat=4 x256", o -> o instanceof String);
+                        o -> o instanceof String);
         shippingLevelSlots = builder.comment("每个等级的槽位数（列表长度 = 等级数；默认 4 档：9/18/27/36 格）")
-                .defineList("shippingLevelSlots", List.of("9", "18", "27", "36"), () -> "9", o -> o instanceof String);
+                .defineList("shippingLevelSlots", List.of("9", "18", "27", "36"), o -> o instanceof String);
         shippingUpgradeCosts = builder.comment("升级花费（第 1 项 = 1→2 级，依此类推，费用自动回流官方总钱箱）")
-                .defineList("shippingUpgradeCosts", List.of("8000", "28000", "75000"), () -> "8000", o -> o instanceof String);
+                .defineList("shippingUpgradeCosts", List.of("8000", "28000", "75000"), o -> o instanceof String);
         shippingDailyLimits = builder.comment("每个等级的每日结算金额上限（现实时间 0 点刷新；0 = 不限）")
-                .defineList("shippingDailyLimits", List.of("1000", "2200", "4500", "8000"), () -> "1000", o -> o instanceof String);
+                .defineList("shippingDailyLimits", List.of("1000", "2200", "4500", "8000"), o -> o instanceof String);
         shippingSettleTick = builder.comment("每天结算的游戏刻（0 = 早上 06:00；结算窗口见下一项）")
                 .defineInRange("shippingSettleTick", 0, 0, 23999);
         shippingSettleWindow = builder.comment("（已不再限制结算：现在到点后第一次 tick 就结算，错过时间也会补结算；保留此项只为兼容旧配置）")
@@ -1268,11 +1269,11 @@ public final class Config {
         ecoTreasurySinkReasonPrefixes = builder.comment("外部附属调用 EconomyApi.take 时视为系统净消耗并自动回流总钱箱的 reason 关键字（不匹配玩家炒股本金和发红包）")
                 .defineList("treasurySinkReasonPrefixes",
                         List.of("lottery", "抽卡", "祈愿", "blind_tax", "遗迹盲仓门票", "印花税", "stock_fee", "星途纪行"),
-                        () -> "lottery", o -> o instanceof String);
+                        o -> o instanceof String);
         ecoTreasuryRefundReasonPrefixes = builder.comment("外部附属调用 EconomyApi.add 时需从总钱箱冲正退回的 reason 关键字（如盲仓人数不足退票）")
                 .defineList("treasuryRefundReasonPrefixes",
                         List.of("退回门票", "blind_refund"),
-                        () -> "退回门票", o -> o instanceof String);
+                        o -> o instanceof String);
         builder.pop();
 
         builder.push("eco_exchange");
@@ -1315,23 +1316,65 @@ public final class Config {
         return Math.max(1, INSTANCE.shippingLevelSlots.get().size());
     }
 
-    /** 第 level 级（1 起）的槽位数。 */
+    /** 第 level 级（1 起）的槽位数（超出列表长度时每升 1 级平滑递增 9 格直至 54 格上限）。 */
     public static int shippingSlotsFor(int level) {
         List<? extends String> list = INSTANCE.shippingLevelSlots.get();
-        int index = Math.max(0, Math.min(list.size() - 1, level - 1));
-        return Math.max(1, Math.min(54, parseIntSafe(list.get(index), 9)));
+        if (list.isEmpty()) {
+            return Math.max(9, Math.min(54, Math.max(1, level) * 9));
+        }
+        int lv = Math.max(1, level);
+        if (lv <= list.size()) {
+            return Math.max(1, Math.min(54, parseIntSafe(list.get(lv - 1), 9)));
+        }
+        int lastSlots = Math.max(1, parseIntSafe(list.get(list.size() - 1), 27));
+        int extraLevels = lv - list.size();
+        return Math.max(1, Math.min(54, lastSlots + extraLevels * 9));
     }
 
-    /** 从 level 升到 level+1 的花费；已满级返回 -1。 */
+    /** 从 level 升到 level+1 的花费（仅星币视角兼容）；已满级返回 -1。 */
     public static long shippingUpgradeCost(int level) {
-        List<? extends String> costs = INSTANCE.shippingUpgradeCosts.get();
-        // 第 1 项对应「1 → 2 级」，第 2 项对应「2 → 3 级」，所以下标是 level-1
-        // （以前写成 level，于是 1→2 级读的是第 2 项、2→3 级直接读不到 → 界面显示"已满级"）。
-        int index = level - 1;
-        if (index < 0 || index >= costs.size()) {
+        cn.autoforged.module_shop.data.PriceSpec spec = shippingUpgradeSpec(level);
+        if (spec == null) {
             return -1L;
         }
-        return Math.max(0L, parseLongSafe(costs.get(index), 0L));
+        return spec.supportsStar() ? spec.starPrice : 0L;
+    }
+
+    public static cn.autoforged.module_shop.data.PriceSpec shippingUpgradeSpec(int level) {
+        List<cn.autoforged.module_shop.data.PriceSpec> list = shippingUpgradeSpecList();
+        int index = level - 1;
+        if (index < 0 || index >= list.size()) {
+            return null;
+        }
+        return list.get(index);
+    }
+
+    public static List<cn.autoforged.module_shop.data.PriceSpec> dailyRefreshSpecList() {
+        return parseSpecList(INSTANCE.dailyRefreshCosts.get());
+    }
+
+    public static List<cn.autoforged.module_shop.data.PriceSpec> buybackRefreshSpecList() {
+        return parseSpecList(INSTANCE.buybackRefreshCosts.get());
+    }
+
+    public static List<cn.autoforged.module_shop.data.PriceSpec> shippingUpgradeSpecList() {
+        return parseSpecList(INSTANCE.shippingUpgradeCosts.get());
+    }
+
+    public static List<cn.autoforged.module_shop.data.PriceSpec> parseSpecList(List<? extends String> raw) {
+        List<cn.autoforged.module_shop.data.PriceSpec> out = new ArrayList<>();
+        if (raw == null) {
+            return out;
+        }
+        for (String entry : raw) {
+            cn.autoforged.module_shop.data.PriceSpec parsed = cn.autoforged.module_shop.data.PriceSpec.parseRuleText(entry);
+            out.add(parsed == null ? cn.autoforged.module_shop.data.PriceSpec.ZERO : parsed);
+        }
+        return out;
+    }
+
+    public static long buybackAllBonus() {
+        return Math.max(0L, INSTANCE.buybackAllBonus.get());
     }
 
     /** 第 level 级的每日结算上限（0 = 不限 → 返回 Long.MAX_VALUE）。 */

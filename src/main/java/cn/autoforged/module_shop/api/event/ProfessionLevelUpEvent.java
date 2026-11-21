@@ -1,7 +1,7 @@
 package cn.autoforged.module_shop.api.event;
 
 import java.util.UUID;
-import net.neoforged.bus.api.Event;
+import net.minecraftforge.eventbus.api.Event;
 
 /**
  * 玩家职业等级提升通知事件（API 1.4.0 新增，挂载于 {@link cn.autoforged.module_shop.api.ModuleShopApi#events()}）。

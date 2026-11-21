@@ -1,24 +1,27 @@
 package cn.autoforged.module_shop.shop.auction;
 
 import cn.autoforged.module_shop.Config;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.TreeSet;
 import javax.annotation.Nullable;
 import net.minecraft.core.HolderLookup;
-import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.tags.TagKey;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.BundleItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.component.BundleContents;
-import net.minecraft.world.item.component.CustomData;
-import net.minecraft.world.item.component.ItemContainerContents;
-import net.minecraft.world.item.enchantment.EnchantmentEffectComponents;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 
 /**
@@ -30,6 +33,17 @@ import net.minecraft.world.item.enchantment.EnchantmentHelper;
 public final class AuctionRules {
     /** 容器套容器的最大递归深度（原版潜影盒不能装潜影盒，模组物品可能可以）。 */
     private static final int MAX_DEPTH = 4;
+    /** 1.20.1 原版物品常用标准 NBT 键：判定 {@code auctionAllowCustomData=false} 时不误伤原版附魔/耐久/改名物品。 */
+    private static final Set<String> VANILLA_TAG_KEYS = Set.of(
+            "Damage", "Enchantments", "StoredEnchantments", "RepairCost", "display",
+            "CustomModelData", "Potion", "CustomPotionEffects", "CustomPotionColor",
+            "AttributeModifiers", "HideFlags", "Unbreakable", "CanDestroy", "CanPlaceOn",
+            "BlockEntityTag", "Items", "Pages", "author", "title", "filtered_title",
+            "generation", "resolved", "Fireworks", "Explosion", "BucketVariantTag",
+            "EntityTag", "SkullOwner", "Trim", "Decorations", "map", "map_scale_direction",
+            "LodestonePos", "LodestoneDimension", "LodestoneTracked", "Charged",
+            "ChargedProjectiles", "Instrument", "Recipes"
+    );
 
     private AuctionRules() {
     }
@@ -46,11 +60,13 @@ public final class AuctionRules {
         }
         int limit = Config.INSTANCE.auctionMaxItemNbtBytes.get();
         try {
-            Tag encoded = stack.save(registries);
-            if (encoded.sizeInBytes() > limit) {
+            CompoundTag encoded = stack.save(new CompoundTag());
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            NbtIo.write(encoded, new DataOutputStream(baos));
+            if (baos.size() > limit) {
                 return "msg.module_shop.auction.err_nbt_size";
             }
-        } catch (RuntimeException broken) {
+        } catch (RuntimeException | IOException broken) {
             // 连序列化都失败的物品（数据异常）一律拒绝，避免存进存档后读不出来。
             return "msg.module_shop.auction.err_nbt_broken";
         }
@@ -65,7 +81,7 @@ public final class AuctionRules {
         if (!Config.INSTANCE.auctionAllowBound.get() && isBound(stack)) {
             return "msg.module_shop.auction.err_bound";
         }
-        if (!Config.INSTANCE.auctionAllowCustomData.get() && stack.has(DataComponents.CUSTOM_DATA)) {
+        if (!Config.INSTANCE.auctionAllowCustomData.get() && hasCustomData(stack)) {
             return "msg.module_shop.auction.err_custom_data";
         }
         if (depth >= MAX_DEPTH) {
@@ -82,15 +98,38 @@ public final class AuctionRules {
 
     private static List<ItemStack> innerItems(ItemStack stack) {
         List<ItemStack> out = new ArrayList<>();
-        ItemContainerContents container = stack.get(DataComponents.CONTAINER);
-        if (container != null) {
-            container.nonEmptyItems().forEach(out::add);
+        CompoundTag blockEntity = BlockItem.getBlockEntityData(stack);
+        if (blockEntity != null && blockEntity.contains("Items", Tag.TAG_LIST)) {
+            collectItems(blockEntity.getList("Items", Tag.TAG_COMPOUND), out);
         }
-        BundleContents bundle = stack.get(DataComponents.BUNDLE_CONTENTS);
-        if (bundle != null) {
-            bundle.items().forEach(out::add);
+        CompoundTag root = stack.getTag();
+        if (root != null && (stack.getItem() instanceof BundleItem || root.contains("Items", Tag.TAG_LIST))
+                && root.contains("Items", Tag.TAG_LIST)) {
+            collectItems(root.getList("Items", Tag.TAG_COMPOUND), out);
         }
         return out;
+    }
+
+    private static void collectItems(ListTag list, List<ItemStack> out) {
+        for (int i = 0; i < list.size(); i++) {
+            ItemStack inner = ItemStack.of(list.getCompound(i));
+            if (!inner.isEmpty()) {
+                out.add(inner);
+            }
+        }
+    }
+
+    private static boolean hasCustomData(ItemStack stack) {
+        CompoundTag tag = stack.getTag();
+        if (tag == null || tag.isEmpty()) {
+            return false;
+        }
+        for (String key : tag.getAllKeys()) {
+            if (!VANILLA_TAG_KEYS.contains(key)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static boolean isBlacklisted(ItemStack stack) {
@@ -118,16 +157,15 @@ public final class AuctionRules {
         return false;
     }
 
-    /** 绑定物品：带「绑定诅咒」类效果，或自定义数据顶层含有配置的绑定标记键。 */
+    /** 绑定物品：带「绑定诅咒」附魔，或物品 NBT 顶层含有配置的绑定标记键。 */
     public static boolean isBound(ItemStack stack) {
-        if (EnchantmentHelper.has(stack, EnchantmentEffectComponents.PREVENT_ARMOR_CHANGE)) {
+        if (EnchantmentHelper.hasBindingCurse(stack)) {
             return true;
         }
-        CustomData custom = stack.get(DataComponents.CUSTOM_DATA);
-        if (custom == null || custom.isEmpty()) {
+        CompoundTag tag = stack.getTag();
+        if (tag == null || tag.isEmpty()) {
             return false;
         }
-        CompoundTag tag = custom.copyTag();
         for (String marker : Config.INSTANCE.auctionBoundMarkers.get()) {
             if (marker != null && !marker.isBlank() && tag.contains(marker.trim())) {
                 return true;

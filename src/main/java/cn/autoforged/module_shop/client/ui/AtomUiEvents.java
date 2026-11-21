@@ -4,14 +4,15 @@ import cn.autoforged.module_shop.ModuleShopMod;
 import cn.autoforged.module_shop.client.ui.demo.AtomDemoScreen;
 import net.minecraft.client.Minecraft;
 import net.minecraft.commands.Commands;
-import net.neoforged.api.distmarker.Dist;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
-import net.neoforged.neoforge.event.GameShuttingDownEvent;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.client.event.RegisterClientCommandsEvent;
+import net.minecraftforge.event.GameShuttingDownEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
 
 /** AtomLib UI 的客户端事件：演示命令与退出时释放资源。 */
-@EventBusSubscriber(modid = ModuleShopMod.MODID, value = Dist.CLIENT)
+// Forge 1.20.1：两个事件都在游戏（FORGE）总线上。
+@Mod.EventBusSubscriber(modid = ModuleShopMod.MODID, value = Dist.CLIENT)
 public final class AtomUiEvents {
     private AtomUiEvents() {
     }

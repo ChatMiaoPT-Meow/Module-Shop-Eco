@@ -10,16 +10,17 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.NonNullList;
-import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
@@ -28,19 +29,26 @@ import net.minecraft.tags.EntityTypeTags;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.OwnableEntity;
+import net.minecraft.world.entity.TamableAnimal;
+import net.minecraft.world.entity.animal.AbstractGolem;
 import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.animal.Cow;
 import net.minecraft.world.entity.animal.MushroomCow;
 import net.minecraft.world.entity.animal.Sheep;
 import net.minecraft.world.entity.animal.SnowGolem;
 import net.minecraft.world.entity.animal.goat.Goat;
+import net.minecraft.world.entity.animal.horse.AbstractHorse;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.npc.Npc;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.AbstractFurnaceMenu;
 import net.minecraft.world.inventory.BrewingStandMenu;
 import net.minecraft.world.inventory.EnchantmentMenu;
 import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.EnchantedBookItem;
 import net.minecraft.world.item.HoeItem;
 import net.minecraft.world.item.Item;
@@ -48,10 +56,11 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.PotionItem;
 import net.minecraft.world.item.ShearsItem;
-import net.minecraft.world.item.alchemy.PotionContents;
+import net.minecraft.world.item.alchemy.Potion;
+import net.minecraft.world.item.alchemy.PotionUtils;
 import net.minecraft.world.item.alchemy.Potions;
-import net.minecraft.world.item.component.CustomData;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.BambooSaplingBlock;
 import net.minecraft.world.level.block.BambooStalkBlock;
 import net.minecraft.world.level.block.BeehiveBlock;
 import net.minecraft.world.level.block.Block;
@@ -59,11 +68,15 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.BonemealableBlock;
 import net.minecraft.world.level.block.BushBlock;
 import net.minecraft.world.level.block.CactusBlock;
+import net.minecraft.world.level.block.CakeBlock;
 import net.minecraft.world.level.block.CocoaBlock;
 import net.minecraft.world.level.block.CropBlock;
+import net.minecraft.world.level.block.GrowingPlantBlock;
 import net.minecraft.world.level.block.LeavesBlock;
+import net.minecraft.world.level.block.MangrovePropaguleBlock;
 import net.minecraft.world.level.block.NetherWartBlock;
 import net.minecraft.world.level.block.PumpkinBlock;
+import net.minecraft.world.level.block.SaplingBlock;
 import net.minecraft.world.level.block.StemBlock;
 import net.minecraft.world.level.block.SugarCaneBlock;
 import net.minecraft.world.level.block.SweetBerryBushBlock;
@@ -74,33 +87,32 @@ import net.minecraft.world.level.block.state.properties.BooleanProperty;
 import net.minecraft.world.level.block.state.properties.IntegerProperty;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.phys.AABB;
-import net.neoforged.bus.api.Event;
-import net.neoforged.bus.api.EventPriority;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.ModList;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.common.NeoForge;
-import net.neoforged.neoforge.event.PlayLevelSoundEvent;
-import net.neoforged.neoforge.event.brewing.PlayerBrewedPotionEvent;
-import net.neoforged.neoforge.event.brewing.PotionBrewEvent;
-import net.neoforged.neoforge.event.entity.EntityLeaveLevelEvent;
-import net.neoforged.neoforge.event.entity.living.BabyEntitySpawnEvent;
-import net.neoforged.neoforge.event.entity.living.LivingDeathEvent;
-import net.neoforged.neoforge.event.entity.player.ItemFishedEvent;
-import net.neoforged.neoforge.event.entity.player.PlayerContainerEvent;
-import net.neoforged.neoforge.event.entity.player.PlayerEvent;
-import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
-import net.neoforged.neoforge.event.entity.player.PlayerXpEvent;
-import net.neoforged.neoforge.event.level.BlockDropsEvent;
-import net.neoforged.neoforge.event.level.BlockEvent;
-import net.neoforged.neoforge.event.tick.ServerTickEvent;
+import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.event.PlayLevelSoundEvent;
+import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.event.brewing.PlayerBrewedPotionEvent;
+import net.minecraftforge.event.brewing.PotionBrewEvent;
+import net.minecraftforge.event.entity.EntityLeaveLevelEvent;
+import net.minecraftforge.event.entity.living.BabyEntitySpawnEvent;
+import net.minecraftforge.event.entity.living.LivingDeathEvent;
+import net.minecraftforge.event.entity.player.ItemFishedEvent;
+import net.minecraftforge.event.entity.player.PlayerContainerEvent;
+import net.minecraftforge.event.entity.player.PlayerEvent;
+import net.minecraftforge.event.entity.player.PlayerInteractEvent;
+import net.minecraftforge.event.entity.player.PlayerXpEvent;
+import net.minecraftforge.event.level.BlockEvent;
+import net.minecraftforge.eventbus.api.Event;
+import net.minecraftforge.eventbus.api.EventPriority;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.ModList;
+import net.minecraftforge.fml.common.Mod;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * 八大职业真人行为检测与防刷过滤监听器（100% 软联动，零第三方模组编译期依赖）。
  */
-@EventBusSubscriber(modid = ModuleShopMod.MODID)
+@Mod.EventBusSubscriber(modid = ModuleShopMod.MODID)
 public final class ProfessionBehaviorListeners {
     private static final Logger LOG = LoggerFactory.getLogger("module_shop_eco/listeners");
     private static final String FRESH_BREW_MARKER = "ms_eco_fresh_brew";
@@ -113,9 +125,13 @@ public final class ProfessionBehaviorListeners {
     private static final Map<UUID, Long> MILK_COOLDOWN = new ConcurrentHashMap<>();
     // ④/⑤/⑦/⑧ 右键方块前后状态微快照（同一服务端 Tick 末尾比对结算）
     private static final List<PendingRightClickCheck> PENDING_RIGHT_CLICKS = new ArrayList<>();
+    // ④ 破坏草类方块后的同 Tick 掉落物快照（1.20.1 替代方案）
+    private static final List<PendingBreakDropCheck> PENDING_BREAK_DROPS = new ArrayList<>();
 
-    // ⑤ 厨师 & ⑧ 魔导师：有界面方块打开期间的容器快照追踪
+    // ⑤ 厨师 & ⑧ 魔导师：有界面方块打开期间的容器快照追踪（且强校验最近右键了已绑定厨具）
     private static final Map<UUID, TrackedMenuSession> OPEN_MENUS = new ConcurrentHashMap<>();
+    private static final Map<UUID, RecentCookingBlockClick> RECENT_COOKING_BLOCK_CLICKS = new ConcurrentHashMap<>();
+    private static final Map<Class<?>, List<String>> CLASS_HIERARCHY_CACHE = new ConcurrentHashMap<>();
 
     // ⑥ 钓鱼：三通道防重与东篱/捕星者钩子追踪
     private static final Map<UUID, Long> LAST_FISH_AWARD_TICK = new ConcurrentHashMap<>();
@@ -129,12 +145,48 @@ public final class ProfessionBehaviorListeners {
     private ProfessionBehaviorListeners() {
     }
 
+    private record RecentCookingBlockClick(String blockId, BlockPos pos, long gameTime) {}
+
+    private static List<String> collectHierarchyNames(Class<?> cls) {
+        return CLASS_HIERARCHY_CACHE.computeIfAbsent(cls, c -> {
+            List<String> names = new ArrayList<>();
+            for (Class<?> cur = c; cur != null && cur != Object.class; cur = cur.getSuperclass()) {
+                names.add(cur.getName().toLowerCase(Locale.ROOT));
+                for (Class<?> iface : cur.getInterfaces()) {
+                    addInterfaceHierarchy(iface, names);
+                }
+            }
+            return List.copyOf(names);
+        });
+    }
+
+    private static void addInterfaceHierarchy(Class<?> iface, List<String> out) {
+        String name = iface.getName().toLowerCase(Locale.ROOT);
+        if (!out.contains(name)) {
+            out.add(name);
+        }
+        for (Class<?> parent : iface.getInterfaces()) {
+            addInterfaceHierarchy(parent, out);
+        }
+    }
+
+    private static final TagKey<Item> TAG_FORGE_SEEDS = TagKey.create(
+            Registries.ITEM, new ResourceLocation("forge", "seeds"));
     private static final TagKey<Item> TAG_C_SEEDS = TagKey.create(
-            Registries.ITEM, ResourceLocation.fromNamespaceAndPath("c", "seeds"));
+            Registries.ITEM, new ResourceLocation("c", "seeds"));
     private static final TagKey<Item> TAG_FID_SEEDS = TagKey.create(
-            Registries.ITEM, ResourceLocation.fromNamespaceAndPath("fid", "seeds"));
+            Registries.ITEM, new ResourceLocation("fid", "seeds"));
+    private static final TagKey<Item> TAG_FORGE_CROPS = TagKey.create(
+            Registries.ITEM, new ResourceLocation("forge", "crops"));
     private static final TagKey<Item> TAG_C_CROPS = TagKey.create(
-            Registries.ITEM, ResourceLocation.fromNamespaceAndPath("c", "crops"));
+            Registries.ITEM, new ResourceLocation("c", "crops"));
+
+    private record PendingBreakDropCheck(
+            UUID playerId,
+            ServerLevel level,
+            BlockPos pos,
+            List<UUID> dropsBefore
+    ) {}
 
     private record PendingRightClickCheck(
             UUID playerId,
@@ -201,9 +253,9 @@ public final class ProfessionBehaviorListeners {
                         "io.redspace.ironsspellbooks.api.events.InscribeSpellEvent");
                 Method getEntity = inscribeCls.getMethod("getEntity");
                 Method getSpellData = inscribeCls.getMethod("getSpellData");
-                NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST, false, (Class) inscribeCls, event -> {
+                MinecraftForge.EVENT_BUS.addListener(EventPriority.LOWEST, false, (Class) inscribeCls, event -> {
                     try {
-                        if (event instanceof net.neoforged.bus.api.ICancellableEvent c && c.isCanceled()) {
+                        if (event.isCancelable() && event.isCanceled()) {
                             return;
                         }
                         Object playerObj = getEntity.invoke(event);
@@ -266,12 +318,24 @@ public final class ProfessionBehaviorListeners {
         if (killer == null) {
             return;
         }
+        if (victim == killer || isSummonOrPetOrNpc(victim)) {
+            return;
+        }
+        ResourceLocation victimKey = BuiltInRegistries.ENTITY_TYPE.getKey(victim.getType());
+        String ns = victimKey != null ? victimKey.getNamespace() : "";
+        String path = victimKey != null ? victimKey.getPath() : "";
 
         // A. 敌对怪物或 Boss -> 【战斗】职业
-        boolean isBoss = victim.getMaxHealth() >= 150.0F
-                || victim.getType().is(EntityTypeTags.RAIDERS) && victim.getMaxHealth() >= 80.0F
-                || BuiltInRegistries.ENTITY_TYPE.getKey(victim.getType()).getPath().contains("boss");
-        if (victim instanceof Enemy || isBoss) {
+        boolean isEnemy = victim instanceof Enemy;
+        boolean isBoss = ProfessionOutputFilter.isHostileBossCandidate(
+                ns, path, victim.getMaxHealth(),
+                victim.getType().is(EntityTypeTags.RAIDERS),
+                isEnemy,
+                victim.getType().getCategory().isFriendly(),
+                victim instanceof Animal,
+                victim instanceof AbstractGolem && !isEnemy,
+                false);
+        if (isEnemy || isBoss) {
             float maxHp = Math.max(1.0F, victim.getMaxHealth());
             long baseXp;
             if (maxHp >= 200.0F) {
@@ -332,18 +396,45 @@ public final class ProfessionBehaviorListeners {
         return (double) (threshold * 2 - count) / (double) threshold;
     }
 
-    private static boolean isAdultLivestock(LivingEntity entity) {
-        if (entity instanceof Animal animal) {
-            return !animal.isBaby();
+    private static boolean isSummonOrPetOrNpc(LivingEntity entity) {
+        if (entity == null) {
+            return false;
         }
         ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
-        if (id != null && "flavor_immersed_daily_argo".equals(id.getNamespace())) {
-            String p = id.getPath();
-            return (p.contains("duck") || p.contains("goose") || p.contains("turkey")
-                    || p.contains("pigeon") || p.contains("quail") || p.contains("bullfrog")
-                    || p.contains("bamboo_rat") || p.contains("bamboorat")) && !entity.isBaby();
+        String ns = id != null ? id.getNamespace() : "";
+        String path = id != null ? id.getPath() : "";
+        boolean isTamable = entity instanceof TamableAnimal;
+        boolean isOwnedNonHorse = !(entity instanceof AbstractHorse)
+                && entity instanceof OwnableEntity ownable
+                && ownable.getOwnerUUID() != null;
+        boolean isTamedHorse = entity instanceof AbstractHorse horse && horse.isTamed();
+        boolean isNpc = entity instanceof Npc;
+        return ProfessionOutputFilter.isSummonOrPetOrNpc(
+                ns, path, isTamable, isOwnedNonHorse, isTamedHorse, isNpc,
+                collectHierarchyNames(entity.getClass()));
+    }
+
+    private static boolean isAdultLivestock(LivingEntity entity) {
+        if (entity == null || entity.isBaby() || isSummonOrPetOrNpc(entity)) {
+            return false;
         }
-        return false;
+        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
+        String ns = id != null ? id.getNamespace() : "";
+        String path = id != null ? id.getPath() : "";
+        boolean fidaLoaded = ModList.get().isLoaded("flavor_immersed_daily_argo");
+        return ProfessionOutputFilter.isAdultButcherLivestockId(
+                ns, path, entity instanceof Animal, fidaLoaded);
+    }
+
+    private static boolean isBreedableLivestock(LivingEntity entity) {
+        if (entity == null || isSummonOrPetOrNpc(entity)) {
+            return false;
+        }
+        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
+        String ns = id != null ? id.getNamespace() : "";
+        String path = id != null ? id.getPath() : "";
+        return ProfessionOutputFilter.isBreedableLivestockId(
+                ns, path, entity instanceof Animal);
     }
 
     // =========================================================================
@@ -403,34 +494,25 @@ public final class ProfessionBehaviorListeners {
     }
 
     private static boolean isPlainWaterBottle(ItemStack stack) {
-        PotionContents contents = stack.get(DataComponents.POTION_CONTENTS);
-        if (contents == null) {
+        Potion potion = PotionUtils.getPotion(stack);
+        if (potion == null || potion == Potions.EMPTY) {
             return true;
         }
-        return contents.is(Potions.WATER) || contents.is(Potions.MUNDANE) || contents.is(Potions.THICK);
+        return potion == Potions.WATER || potion == Potions.MUNDANE || potion == Potions.THICK;
     }
 
     private static void markFreshBrewedPotion(ItemStack stack) {
-        CustomData cd = stack.getOrDefault(DataComponents.CUSTOM_DATA, CustomData.EMPTY);
-        CompoundTag tag = cd.copyTag();
-        tag.putBoolean(FRESH_BREW_MARKER, true);
-        stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
+        stack.getOrCreateTag().putBoolean(FRESH_BREW_MARKER, true);
     }
 
     private static boolean consumeFreshBrewedMarker(ItemStack stack) {
-        CustomData cd = stack.get(DataComponents.CUSTOM_DATA);
-        if (cd == null || cd.isEmpty()) {
+        CompoundTag tag = stack.getTag();
+        if (tag == null || !tag.getBoolean(FRESH_BREW_MARKER)) {
             return false;
         }
-        CompoundTag tag = cd.copyTag();
-        if (!tag.getBoolean(FRESH_BREW_MARKER)) {
-            return false;
-        }
-        tag.remove(FRESH_BREW_MARKER);
-        if (tag.isEmpty()) {
-            stack.remove(DataComponents.CUSTOM_DATA);
-        } else {
-            stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
+        stack.removeTagKey(FRESH_BREW_MARKER);
+        if (stack.getTag() != null && stack.getTag().isEmpty()) {
+            stack.setTag(null);
         }
         return true;
     }
@@ -464,7 +546,7 @@ public final class ProfessionBehaviorListeners {
 
     /** 识别可通过工具/捕虫网采集野生种子的草本方块 */
     private static boolean isForageableGrassBlock(Block block) {
-        return block == Blocks.SHORT_GRASS || block == Blocks.TALL_GRASS
+        return block == Blocks.GRASS || block == Blocks.TALL_GRASS
                 || block == Blocks.FERN || block == Blocks.LARGE_FERN;
     }
 
@@ -472,7 +554,8 @@ public final class ProfessionBehaviorListeners {
         if (stack == null || stack.isEmpty()) {
             return false;
         }
-        if (stack.is(TAG_C_SEEDS) || stack.is(TAG_FID_SEEDS) || stack.is(TAG_C_CROPS)) {
+        if (stack.is(TAG_FORGE_SEEDS) || stack.is(TAG_C_SEEDS) || stack.is(TAG_FID_SEEDS)
+                || stack.is(TAG_FORGE_CROPS) || stack.is(TAG_C_CROPS)) {
             return true;
         }
         ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
@@ -528,31 +611,15 @@ public final class ProfessionBehaviorListeners {
         } else if (isCropLikeBlock(block, state) && extractMaturityScore(state) >= 100) {
             // 兼容任意模组自定义满熟作物方块（age == maxAge）
             ProfessionManager.grantXp(sp, ProfessionConfig.FARMING, 4L, "harvest_mod_crop");
-        }
-    }
-
-    /** 兼容南山捕虫网打草掉野生种子等 BlockDropsEvent 场景（排除玩家自放草方块刷经验） */
-    @SubscribeEvent(priority = EventPriority.LOWEST)
-    public static void onBlockDrops(BlockDropsEvent event) {
-        if (event.isCanceled() || !ProfessionManager.isEnabled() || !(event.getLevel() instanceof ServerLevel level)) {
-            return;
-        }
-        BlockState state = event.getState();
-        if (!isForageableGrassBlock(state.getBlock())) {
-            return;
-        }
-        if (PlacedBlockTracker.consumeIfPlayerPlaced(level, event.getPos())) {
-            return;
-        }
-        ServerPlayer sp = RealPlayerGuard.asRealSurvivalPlayer(event.getBreaker());
-        if (sp == null) {
-            return;
-        }
-        boolean hasSeedOrCrop = event.getDrops().stream()
-                .map(ItemEntity::getItem)
-                .anyMatch(ProfessionBehaviorListeners::isForageableSeedOrCropDrop);
-        if (hasSeedOrCrop) {
-            ProfessionManager.grantXp(sp, ProfessionConfig.FARMING, 2L, "forage_seeds");
+        } else if (isForageableGrassBlock(block)) {
+            // 1.20.1 在 BreakEvent 记录周边既有掉落物，于同 Tick 末尾比对新生成的野生种子掉落
+            if (!PlacedBlockTracker.consumeIfPlayerPlaced(level, pos)) {
+                List<UUID> dropsBefore = snapshotNearbyItemEntities(level, pos);
+                synchronized (PENDING_BREAK_DROPS) {
+                    PENDING_BREAK_DROPS.add(new PendingBreakDropCheck(
+                            sp.getUUID(), level, pos.immutable(), dropsBefore));
+                }
+            }
         }
     }
 
@@ -562,7 +629,7 @@ public final class ProfessionBehaviorListeners {
             return;
         }
         ServerPlayer sp = RealPlayerGuard.asRealSurvivalPlayer(event.getCausedByPlayer());
-        if (sp != null) {
+        if (sp != null && isBreedableLivestock(event.getParentA())) {
             ProfessionManager.grantXp(sp, ProfessionConfig.FARMING, 12L, "breed_animal");
         }
     }
@@ -625,6 +692,9 @@ public final class ProfessionBehaviorListeners {
 
         ProfessionConfig cfg = ProfessionConfig.get();
         boolean isCooking = cfg.isCookingBlockBound(blockId);
+        if (isCooking) {
+            RECENT_COOKING_BLOCK_CLICKS.put(sp.getUUID(), new RecentCookingBlockClick(blockId, pos, level.getGameTime()));
+        }
         boolean isBartending = cfg.isBartendingBlockBound(blockId);
         boolean isAlchCauldron = "irons_spellbooks:alchemist_cauldron".equals(blockId);
 
@@ -664,7 +734,39 @@ public final class ProfessionBehaviorListeners {
         }
     }
 
+    private static boolean hasFruitingBooleanProperty(BlockState state) {
+        for (Property<?> prop : state.getProperties()) {
+            if (prop instanceof BooleanProperty) {
+                String name = prop.getName().toLowerCase(Locale.ROOT);
+                if (name.equals("berries") || name.equals("has_fruit") || name.equals("ripe")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isNonCropStageOrFruitBlock(Block block, BlockState state) {
+        if (block instanceof SaplingBlock
+                || block instanceof MangrovePropaguleBlock
+                || block instanceof BambooSaplingBlock
+                || block instanceof CactusBlock
+                || block instanceof SugarCaneBlock
+                || block instanceof BambooStalkBlock) {
+            return true;
+        }
+        if (block instanceof GrowingPlantBlock && !hasFruitingBooleanProperty(state)) {
+            return true;
+        }
+        ResourceLocation id = BuiltInRegistries.BLOCK.getKey(block);
+        String blockId = id != null ? id.toString() : "";
+        return ProfessionOutputFilter.isNonCropStageOrFruitBlockName(blockId, block.getClass().getName());
+    }
+
     private static boolean isCropLikeBlock(Block block, BlockState state) {
+        if (isNonCropStageOrFruitBlock(block, state)) {
+            return false;
+        }
         return block instanceof CropBlock
                 || block instanceof BushBlock
                 || block instanceof StemBlock
@@ -727,9 +829,14 @@ public final class ProfessionBehaviorListeners {
         if (id == null || !"kaleidoscope_tavern:shaker".equals(id.toString())) {
             return false;
         }
-        ResourceLocation compId = ResourceLocation.fromNamespaceAndPath("kaleidoscope_tavern", "shaker_result");
-        var opt = BuiltInRegistries.DATA_COMPONENT_TYPE.getOptional(compId);
-        return opt.isPresent() && stack.has(opt.get());
+        CompoundTag tag = stack.getTag();
+        if (tag == null || tag.isEmpty()) {
+            return false;
+        }
+        return tag.contains("shaker_result")
+                || tag.contains("ShakerResult")
+                || tag.contains("kaleidoscope_tavern:shaker_result")
+                || tag.size() > (tag.contains("Damage") ? 1 : 0);
     }
 
     private static void registerTapWatchIfAttachedToBarrel(ServerPlayer sp, ServerLevel level, BlockPos tapPos, BlockState tapState) {
@@ -739,7 +846,7 @@ public final class ProfessionBehaviorListeners {
             if (be == null) continue;
             ResourceLocation beBlockId = BuiltInRegistries.BLOCK.getKey(be.getBlockState().getBlock());
             if (beBlockId != null && "kaleidoscope_tavern:barrel".equals(beBlockId.toString())) {
-                CompoundTag nbt = be.saveWithoutMetadata(level.registryAccess());
+                CompoundTag nbt = be.saveWithoutMetadata();
                 if ("kaleidoscope_tavern:empty".equals(nbt.getString("recipe_id"))) {
                     return; // 错配方出的是醋，不给调酒师经验
                 }
@@ -764,7 +871,9 @@ public final class ProfessionBehaviorListeners {
         if (out.contains("Items", 9)) {
             var list = out.getList("Items", 10);
             if (!list.isEmpty()) {
-                return Math.max(1, list.getCompound(0).getInt("count"));
+                CompoundTag itemTag = list.getCompound(0);
+                int count = itemTag.contains("Count") ? itemTag.getInt("Count") : itemTag.getInt("count");
+                return Math.max(1, count);
             }
         }
         return 0;
@@ -775,10 +884,20 @@ public final class ProfessionBehaviorListeners {
      * 通吃原版 + harvest_with_ease + 森罗架子作物 + 丰饶果树/茶树 + 东篱果树菌木 + 农夫乐事！
      */
     private static int extractMaturityScore(BlockState state) {
+        if (isNonCropStageOrFruitBlock(state.getBlock(), state)) {
+            return -1;
+        }
         // 先调用 CropBlock.isMaxAge，兼容如南山作物复用原版 AGE(0..7) 但覆写 getMaxAge()=3/4 的方块
         if (state.getBlock() instanceof CropBlock crop) {
             int max = Math.max(1, crop.getMaxAge());
             return crop.isMaxAge(state) ? 100 : (crop.getAge(state) * 90 / max);
+        }
+        for (Property<?> prop : state.getProperties()) {
+            String name = prop.getName().toLowerCase(Locale.ROOT);
+            if (prop instanceof BooleanProperty boolProp
+                    && (name.equals("berries") || name.equals("has_fruit") || name.equals("ripe"))) {
+                return Boolean.TRUE.equals(state.getValue(boolProp)) ? 100 : 0;
+            }
         }
         for (Property<?> prop : state.getProperties()) {
             String name = prop.getName().toLowerCase(Locale.ROOT);
@@ -789,9 +908,6 @@ public final class ProfessionBehaviorListeners {
                 if (max > 0) {
                     return cur >= max ? 100 : (cur * 90 / max);
                 }
-            } else if (prop instanceof BooleanProperty boolProp
-                    && (name.equals("berries") || name.equals("has_fruit") || name.equals("ripe"))) {
-                return Boolean.TRUE.equals(state.getValue(boolProp)) ? 100 : 0;
             }
         }
         return -1;
@@ -834,6 +950,9 @@ public final class ProfessionBehaviorListeners {
             }
             return;
         }
+        if (menu instanceof AbstractFurnaceMenu) {
+            return;
+        }
         String menuCls = menu.getClass().getName();
         if ("io.redspace.ironsspellbooks.gui.arcane_anvil.ArcaneAnvilMenu".equals(menuCls)) {
             TrackedMenuSession sess = new TrackedMenuSession(menu.containerId, "arcane_anvil", "irons_spellbooks:arcane_anvil", Map.of());
@@ -844,11 +963,28 @@ public final class ProfessionBehaviorListeners {
             OPEN_MENUS.put(sp.getUUID(), sess);
             return;
         }
-        // 若是刚通过右键绑定做饭方块打开的非原版熔炉自定义厨具菜单（如 fidworkblock CookingMenu、bakeries、hotpot）
-        if (isLikelyModCookingMenu(menuCls)) {
-            OPEN_MENUS.put(sp.getUUID(), new TrackedMenuSession(
-                    menu.containerId, "cooking", menuCls, snapshotPlayerItems(sp)));
+        RecentCookingBlockClick recentClick = RECENT_COOKING_BLOCK_CLICKS.remove(sp.getUUID());
+        if (recentClick == null
+                || !ProfessionOutputFilter.isAllowedModCookingMenu(menuCls)
+                || !(sp.level() instanceof ServerLevel serverLevel)) {
+            return;
         }
+        long ageTicks = Math.abs(serverLevel.getGameTime() - recentClick.gameTime());
+        if (ageTicks > 5L || sp.blockPosition().distSqr(recentClick.pos()) > 100.0D) {
+            return;
+        }
+        // 仅当玩家 5 tick 内亲自右键过已绑定厨具，且菜单属于白名单厨具类时才追踪
+        Map<String, Integer> baseline = snapshotPlayerItems(sp);
+        for (Slot slot : menu.slots) {
+            if (slot.container != sp.getInventory() && slot.hasItem()) {
+                ItemStack slotStack = slot.getItem();
+                if (slot.mayPlace(slotStack)) {
+                    accumulateForSnapshot(baseline, slotStack);
+                }
+            }
+        }
+        OPEN_MENUS.put(sp.getUUID(), new TrackedMenuSession(
+                menu.containerId, "cooking", recentClick.blockId(), baseline));
     }
 
     @SubscribeEvent
@@ -859,20 +995,6 @@ public final class ProfessionBehaviorListeners {
                 settleMenuCookingDelta(sp, sess);
             }
         }
-    }
-
-    private static boolean isLikelyModCookingMenu(String menuClassName) {
-        String lower = menuClassName.toLowerCase(Locale.ROOT);
-        return lower.startsWith("com.fidtest.")
-                || lower.contains("bakeries")
-                || lower.contains("hotpot")
-                || lower.contains("bountifulfares")
-                || lower.contains("baishi")
-                || lower.contains("kaleidoscope")
-                || lower.contains("flavor_immersed")
-                || lower.contains("farmersdelight")
-                || lower.contains("cooking")
-                || lower.contains("brewinandchewin");
     }
 
     private static void settleMenuCookingDelta(ServerPlayer sp, TrackedMenuSession sess) {
@@ -971,18 +1093,42 @@ public final class ProfessionBehaviorListeners {
     // =========================================================================
 
     @SubscribeEvent
-    public static void onServerTickPost(ServerTickEvent.Post event) {
-        if (!ProfessionManager.isEnabled()) {
+    public static void onServerTickPost(TickEvent.ServerTickEvent event) {
+        if (event.phase != TickEvent.Phase.END || !ProfessionManager.isEnabled()) {
             return;
         }
-        processPendingRightClicks(event);
-        processPendingTapWatches(event);
-        if (event.getServer().getTickCount() % 10 == 0) {
-            processOpenMenus(event);
+        MinecraftServer server = event.getServer();
+        processPendingRightClicks(server);
+        processPendingBreakDrops(server);
+        processPendingTapWatches(server);
+        if (server.getTickCount() % 10 == 0) {
+            processOpenMenus(server);
         }
     }
 
-    private static void processPendingRightClicks(ServerTickEvent.Post event) {
+    private static void processPendingBreakDrops(MinecraftServer server) {
+        List<PendingBreakDropCheck> batch;
+        synchronized (PENDING_BREAK_DROPS) {
+            if (PENDING_BREAK_DROPS.isEmpty()) {
+                return;
+            }
+            batch = new ArrayList<>(PENDING_BREAK_DROPS);
+            PENDING_BREAK_DROPS.clear();
+        }
+
+        for (PendingBreakDropCheck check : batch) {
+            ServerPlayer sp = server.getPlayerList().getPlayer(check.playerId());
+            if (sp == null) {
+                continue;
+            }
+            List<ItemStack> newDrops = collectNewNearbyDrops(check.level(), check.pos(), check.dropsBefore());
+            if (newDrops.stream().anyMatch(ProfessionBehaviorListeners::isForageableSeedOrCropDrop)) {
+                ProfessionManager.grantXp(sp, ProfessionConfig.FARMING, 2L, "forage_seeds");
+            }
+        }
+    }
+
+    private static void processPendingRightClicks(MinecraftServer server) {
         List<PendingRightClickCheck> batch;
         synchronized (PENDING_RIGHT_CLICKS) {
             if (PENDING_RIGHT_CLICKS.isEmpty()) {
@@ -993,7 +1139,7 @@ public final class ProfessionBehaviorListeners {
         }
 
         for (PendingRightClickCheck check : batch) {
-            ServerPlayer sp = event.getServer().getPlayerList().getPlayer(check.playerId());
+            ServerPlayer sp = server.getPlayerList().getPlayer(check.playerId());
             if (sp == null) {
                 continue;
             }
@@ -1013,7 +1159,8 @@ public final class ProfessionBehaviorListeners {
             // A. 右键采摘成熟农作物 / 果树 / 茶树 / 葡萄架（同方块生长阶段从满熟回落）
             if (!check.areaHarvestTargets().containsKey(check.pos())
                     && check.beforeMaturityScore() >= 100
-                    && afterBlockId.equals(check.blockId())) {
+                    && afterBlockId.equals(check.blockId())
+                    && isCropLikeBlock(afterState.getBlock(), afterState)) {
                 int afterMaturity = extractMaturityScore(afterState);
                 if (afterMaturity >= 0 && afterMaturity < check.beforeMaturityScore()) {
                     ProfessionManager.grantXp(sp, ProfessionConfig.FARMING, 4L, "right_click_harvest");
@@ -1111,7 +1258,7 @@ public final class ProfessionBehaviorListeners {
         }
     }
 
-    private static void processPendingTapWatches(ServerTickEvent.Post event) {
+    private static void processPendingTapWatches(MinecraftServer server) {
         synchronized (PENDING_TAP_WATCHES) {
             if (PENDING_TAP_WATCHES.isEmpty()) {
                 return;
@@ -1125,10 +1272,10 @@ public final class ProfessionBehaviorListeners {
                     it.remove();
                     continue;
                 }
-                CompoundTag nbt = be.saveWithoutMetadata(watch.level.registryAccess());
+                CompoundTag nbt = be.saveWithoutMetadata();
                 int curOut = countBarrelOutputFromNbt(nbt);
                 if (curOut < watch.lastOutputCount) {
-                    ServerPlayer sp = event.getServer().getPlayerList().getPlayer(watch.playerId);
+                    ServerPlayer sp = server.getPlayerList().getPlayer(watch.playerId);
                     if (sp != null) {
                         long xp = 10L + (long) Math.max(1, watch.brewLevel) * 5L;
                         ProfessionManager.grantXp(sp, ProfessionConfig.BARTENDING, xp, "barrel_tap");
@@ -1143,14 +1290,14 @@ public final class ProfessionBehaviorListeners {
         }
     }
 
-    private static void processOpenMenus(ServerTickEvent.Post event) {
+    private static void processOpenMenus(MinecraftServer server) {
         if (OPEN_MENUS.isEmpty()) {
             return;
         }
         Iterator<Map.Entry<UUID, TrackedMenuSession>> it = OPEN_MENUS.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<UUID, TrackedMenuSession> entry = it.next();
-            ServerPlayer sp = event.getServer().getPlayerList().getPlayer(entry.getKey());
+            ServerPlayer sp = server.getPlayerList().getPlayer(entry.getKey());
             TrackedMenuSession sess = entry.getValue();
             if (sp == null || sp.containerMenu == null || sp.containerMenu.containerId != sess.containerId) {
                 it.remove();
@@ -1219,7 +1366,43 @@ public final class ProfessionBehaviorListeners {
         }
         ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
         return id != null && ProfessionOutputFilter.isEligibleCookedDishForXp(
-                id.getNamespace(), id.getPath(), stack.has(DataComponents.FOOD));
+                id.getNamespace(), id.getPath(), hasFoodOrPlaceableDishFeature(stack));
+    }
+
+    private static boolean hasFoodOrPlaceableDishFeature(ItemStack stack) {
+        if (stack.isEdible()) {
+            return true;
+        }
+        CompoundTag tag = stack.getTag();
+        if (tag != null && !tag.isEmpty() && tag.contains("WokDish", CompoundTag.TAG_COMPOUND)) {
+            return true;
+        }
+        return isPlaceableFoodBlockItem(stack.getItem());
+    }
+
+    private static boolean isPlaceableFoodBlockItem(Item item) {
+        if (!(item instanceof BlockItem blockItem)) {
+            return false;
+        }
+        Block block = blockItem.getBlock();
+        if (block instanceof CakeBlock) {
+            return true;
+        }
+        for (String clsName : collectHierarchyNames(block.getClass())) {
+            int dot = clsName.lastIndexOf('.');
+            String simple = dot >= 0 ? clsName.substring(dot + 1) : clsName;
+            if (simple.contains("feast")
+                    || simple.contains("cake")
+                    || simple.equals("pieblock")
+                    || simple.endsWith("pieblock")
+                    || simple.contains("foodblock")
+                    || simple.contains("dish")
+                    || simple.contains("dessert")
+                    || simple.contains("edible")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isEligibleBartendingOutputForXp(ItemStack stack) {

@@ -7,24 +7,28 @@ import cn.autoforged.module_shop.shop.ShopManager;
 import cn.autoforged.module_shop.shop.TradeManager;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.event.RegisterCommandsEvent;
-import net.neoforged.neoforge.event.entity.player.PlayerEvent;
-import net.neoforged.neoforge.event.server.ServerStoppingEvent;
-import net.neoforged.neoforge.event.tick.ServerTickEvent;
+import net.minecraftforge.event.RegisterCommandsEvent;
+import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.event.entity.player.PlayerEvent;
+import net.minecraftforge.event.server.ServerStartedEvent;
+import net.minecraftforge.event.server.ServerStoppingEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
 
-@EventBusSubscriber(modid = ModuleShopMod.MODID)
+@Mod.EventBusSubscriber(modid = ModuleShopMod.MODID)
 public final class ShopServerEvents {
     private static int tickCounter;
-    /** 模板初始化只尝试一次（放在 tick 里做，比依赖 ServerStartedEvent 更稳）。 */
-    private static boolean templateInitChecked;
+    /** 记录已完成一次模板初始化检查的当前服务端实例（单人切换存档时自然重查）。 */
+    @javax.annotation.Nullable
+    private static MinecraftServer checkedServer;
 
     private ShopServerEvents() {
     }
 
     @SubscribeEvent
-    public static void onServerStarted(net.neoforged.neoforge.event.server.ServerStartedEvent event) {
+    public static void onServerStarted(ServerStartedEvent event) {
+        checkedServer = null;
+        tickCounter = 0;
         cn.autoforged.module_shop.shop.http.ShopHttpApi.start(event.getServer());
         // 新世界首次启动：用客户端 / 服务器的默认模板初始化商店。
         // 老世界、已初始化过的世界、商品被改过的世界都不会被覆盖（判定见 TemplateService）。
@@ -32,8 +36,10 @@ public final class ShopServerEvents {
             if (cn.autoforged.module_shop.Config.INSTANCE.templateInitEnabled.get()) {
                 cn.autoforged.module_shop.shop.TemplateService.initNewWorldIfNeeded(event.getServer());
             }
-        } catch (Throwable ignored) {
-            // 初始化失败绝不阻断服务器启动
+        } catch (Throwable error) {
+            // 初始化失败绝不阻断服务器启动，但保留警告日志方便排查
+            org.slf4j.LoggerFactory.getLogger("module_shop")
+                    .warn("模板初始化失败（ServerStarted）：{}", error.toString(), error);
         }
         cn.autoforged.module_shop.shop.auction.AuctionService.reset();
         cn.autoforged.module_shop.shop.stall.StallService.reset();
@@ -42,13 +48,19 @@ public final class ShopServerEvents {
         cn.autoforged.module_shop.eco.quality.QualityEvaluator.reloadConfig();
         cn.autoforged.module_shop.eco.profession.ProfessionBehaviorListeners.registerOptionalModHooks();
         cn.autoforged.module_shop.eco.profession.PlacedBlockTracker.clearAll();
+        cn.autoforged.module_shop.shop.home.AnnouncementConfig.reload();
+        cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig.reload();
+        cn.autoforged.module_shop.shop.auth.AdminAuthService.reload();
     }
 
     @SubscribeEvent
-    public static void onServerTick(ServerTickEvent.Post event) {
+    public static void onServerTick(TickEvent.ServerTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) {
+            return;
+        }
         MinecraftServer server = event.getServer();
-        if (!templateInitChecked) {
-            templateInitChecked = true;
+        if (checkedServer != server) {
+            checkedServer = server;
             try {
                 if (cn.autoforged.module_shop.Config.INSTANCE.templateInitEnabled.get()) {
                     cn.autoforged.module_shop.shop.TemplateService.initNewWorldIfNeeded(server);
@@ -107,6 +119,8 @@ public final class ShopServerEvents {
 
     @SubscribeEvent
     public static void onServerStopping(ServerStoppingEvent event) {
+        checkedServer = null;
+        tickCounter = 0;
         // 可选 HTTP API：关服时停掉监听
         cn.autoforged.module_shop.shop.http.ShopHttpApi.stop();
         TradeManager.shutdown(event.getServer());

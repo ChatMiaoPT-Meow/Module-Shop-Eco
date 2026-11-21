@@ -132,10 +132,5 @@ public class BatchAddMenu extends AbstractContainerMenu {
         public boolean mayPickup(Player player) {
             return false;
         }
-
-        @Override
-        public boolean isFake() {
-            return true;
-        }
     }
 }

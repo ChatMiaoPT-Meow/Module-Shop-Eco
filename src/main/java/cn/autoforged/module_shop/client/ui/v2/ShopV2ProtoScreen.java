@@ -680,7 +680,7 @@ public final class ShopV2ProtoScreen extends Screen {
     }
 
     @Override
-    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollY) {
         int step = hasShiftDown() ? visibleRows() : 3;
         this.scroll = Math.max(0, Math.min(maxScroll(), this.scroll - (int) Math.signum(scrollY) * step));
         return true;

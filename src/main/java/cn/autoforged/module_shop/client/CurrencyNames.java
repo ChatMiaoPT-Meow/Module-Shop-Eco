@@ -114,10 +114,5 @@ public final class CurrencyNames {
         public Map<String, String> getLanguageData() {
             return this.delegate.getLanguageData();
         }
-
-        @Override
-        public net.minecraft.network.chat.Component getComponent(String key) {
-            return this.delegate.getComponent(key);
-        }
     }
 }

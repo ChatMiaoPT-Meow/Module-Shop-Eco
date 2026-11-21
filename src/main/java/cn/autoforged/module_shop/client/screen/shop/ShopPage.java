@@ -50,6 +50,26 @@ public interface ShopPage {
         return false;
     }
 
+    /** 键盘按下事件（返回 true 表示已消费）。 */
+    default boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        return false;
+    }
+
+    /** 键盘松开事件。 */
+    default boolean keyReleased(int keyCode, int scanCode, int modifiers) {
+        return false;
+    }
+
+    /** 字符输入事件。 */
+    default boolean charTyped(char codePoint, int modifiers) {
+        return false;
+    }
+
+    /** 页面当前是否有输入框聚焦（为 true 时屏蔽宿主数字键 1~9 切页）。 */
+    default boolean isInputFocused() {
+        return false;
+    }
+
     /** 界面关闭 / 切走时调用：取消按下中的按钮、拖拽等未完成的操作。 */
     default void cancelInput() {
     }

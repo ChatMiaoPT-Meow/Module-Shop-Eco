@@ -6,8 +6,10 @@ import net.minecraft.nbt.NbtIo;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.zip.GZIPInputStream;
 
 /**
  * 大体积 NBT 的传输工具：**先 gzip 压缩，再按 {@link #CHUNK} 分片**（分片重组见 {@link ChunkAssembler}）。
@@ -19,7 +21,7 @@ import java.util.Arrays;
  * {@code shop_sync} 快照（mall + adminMall + mail + 商店/收购池…）很容易超 2 MiB，
  * 于是玩家一开商店就掉线。
  *
- * <p>这里不再使用 {@code ByteBufCodecs.COMPOUND_TAG}（它走的就是 2 MiB 的 readNbt），
+ * <p>这里不再使用原版 2 MiB 的 {@code readNbt}，
  * 而是自己压缩成字节数组下发/上报，客户端用**自定义上限**的 {@link NbtAccounter} 解压，
  * 体积再大也不会触发原版上限；同时压缩率很高（商店数据里有大量重复物品 id），
  * 实际带宽比原来更省。
@@ -58,8 +60,10 @@ public final class NbtTransport {
 
     /** 同上，但指定解压后 NBT 的内存上限（服务端收玩家上报时用 {@link #SERVERBOUND_MAX_BYTES}）。 */
     public static CompoundTag decompress(byte[] raw, long maxTagBytes) throws IOException {
-        try (ByteArrayInputStream in = new ByteArrayInputStream(raw)) {
-            return NbtIo.readCompressed(in, NbtAccounter.create(maxTagBytes));
+        // 1.20.1 的 readCompressed(InputStream) 不接受 NbtAccounter 上限；
+        // 这里自己包 GZIPInputStream + NbtIo.read(DataInput, NbtAccounter)，保留自定义的防炸上限。
+        try (DataInputStream in = new DataInputStream(new GZIPInputStream(new ByteArrayInputStream(raw)))) {
+            return NbtIo.read(in, new NbtAccounter(maxTagBytes));
         }
     }
 

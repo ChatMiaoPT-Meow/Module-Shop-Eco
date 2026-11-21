@@ -2,9 +2,9 @@ package cn.autoforged.module_shop.api;
 
 import cn.autoforged.module_shop.api.internal.ApiImpl;
 import net.minecraft.server.MinecraftServer;
-import net.neoforged.bus.api.BusBuilder;
-import net.neoforged.bus.api.IEventBus;
-import net.neoforged.neoforge.server.ServerLifecycleHooks;
+import net.minecraftforge.eventbus.api.BusBuilder;
+import net.minecraftforge.eventbus.api.IEventBus;
+import net.minecraftforge.server.ServerLifecycleHooks;
 import org.jetbrains.annotations.Nullable;
 
 /**

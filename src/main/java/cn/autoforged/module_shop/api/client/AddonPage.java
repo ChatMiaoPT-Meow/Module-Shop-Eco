@@ -46,6 +46,26 @@ public interface AddonPage {
         return false;
     }
 
+    /** 键盘按下事件（返回 true 表示已消费，宿主将不再触发数字键 1~9 切页等快捷键）。 */
+    default boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        return false;
+    }
+
+    /** 键盘松开事件。 */
+    default boolean keyReleased(int keyCode, int scanCode, int modifiers) {
+        return false;
+    }
+
+    /** 字符输入事件（支持中文输入法与数字/字母输入）。 */
+    default boolean charTyped(char codePoint, int modifiers) {
+        return false;
+    }
+
+    /** 页面内当前是否有输入框正处于聚焦输入状态（为 true 时宿主屏蔽数字键 1~9 切页等全局快捷键）。 */
+    default boolean isInputFocused() {
+        return false;
+    }
+
     /** 切走 / 关闭界面时调用：取消按下中的按钮、让输入框失焦并隐藏。 */
     default void cancelInput() {
     }

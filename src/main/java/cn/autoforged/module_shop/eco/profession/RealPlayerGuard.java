@@ -4,7 +4,7 @@ import java.util.Locale;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
-import net.neoforged.neoforge.common.util.FakePlayer;
+import net.minecraftforge.common.util.FakePlayer;
 
 /**
  * 真人玩家行为校验守卫：严格排除全自动机器假人、车万女仆、东篱无人机/收割机与旁观模式刷经验。

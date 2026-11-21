@@ -12,7 +12,6 @@ import net.minecraft.client.multiplayer.PlayerInfo;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
-import net.neoforged.neoforge.network.PacketDistributor;
 
 /**
  * 需求 1：交易请求列表。打开后可以看到别人发来的交易请求，点击即可进入交易界面；
@@ -50,8 +49,8 @@ public class TradeRequestScreen extends SkiaDialog {
     }
 
     @Override
-    public void renderBackground(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
-        super.renderBackground(g, mouseX, mouseY, partialTick);
+    public void renderBackground(GuiGraphics g) {
+        super.renderBackground(g);
         if (skia()) {
             return;
         }
@@ -63,6 +62,7 @@ public class TradeRequestScreen extends SkiaDialog {
         if (skiaRender(g, mouseX, mouseY, partialTick)) {
             return;
         }
+        this.renderBackground(g);
         super.render(g, mouseX, mouseY, partialTick);
         int x = this.left;
         int y = this.top;
@@ -84,7 +84,7 @@ public class TradeRequestScreen extends SkiaDialog {
                 PlayerInfo info = Minecraft.getInstance().getConnection() == null ? null
                         : Minecraft.getInstance().getConnection().getPlayerInfo(request.from);
                 if (info != null) {
-                    PlayerFaceRenderer.draw(g, info.getSkin(), x + 14, rowY + 3, 16);
+                    PlayerFaceRenderer.draw(g, info.getSkinLocation(), x + 14, rowY + 3, 16);
                 }
             }
             // 需求二：整行展示“请求来自谁 + 剩余时间”，进入交易改由独立绿色【接受】按钮触发。
@@ -126,9 +126,9 @@ public class TradeRequestScreen extends SkiaDialog {
 
     /** 鼠标滚轮翻页。 */
     @Override
-    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollY) {
         if (skia()) {
-            return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+            return super.mouseScrolled(mouseX, mouseY, scrollY);
         }
         if (scrollY != 0.0D) {
             int pages = Math.max(1, (ClientShopData.tradeRequests.size() + PAGE_SIZE - 1) / PAGE_SIZE);
@@ -138,7 +138,7 @@ public class TradeRequestScreen extends SkiaDialog {
                 return true;
             }
         }
-        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+        return super.mouseScrolled(mouseX, mouseY, scrollY);
     }
 
     @Override
@@ -236,7 +236,7 @@ public class TradeRequestScreen extends SkiaDialog {
                         final int hx = (int) (innerX + 5);
                         final int hy = (int) (ry + (rh - 16) / 2);
                         this.items.addCustom(hx, hy, 16, 16,
-                                (g, font) -> PlayerFaceRenderer.draw(g, info.getSkin(), hx, hy, 16));
+                                (g, font) -> PlayerFaceRenderer.draw(g, info.getSkinLocation(), hx, hy, 16));
                     }
                 }
                 float bw = 44;

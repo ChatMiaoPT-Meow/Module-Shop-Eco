@@ -4,6 +4,7 @@ import cn.autoforged.module_shop.Config;
 import cn.autoforged.module_shop.data.BlackMarketBucket;
 import cn.autoforged.module_shop.data.ConfiguredOffer;
 import cn.autoforged.module_shop.data.MallItem;
+import cn.autoforged.module_shop.data.PriceSpec;
 import cn.autoforged.module_shop.data.ShopSavedData;
 import cn.autoforged.module_shop.data.SupplyMode;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -95,22 +96,41 @@ public final class EcoPricing {
 
     /**
      * 单件物品消耗的专注点（阿尔比恩专精省点曲线）：
-     * Lv.1 消耗 baseCost（默认 24），Lv.50 约 9.7，Lv.100 约 6.0（同样 1000 专注可多精销近 4 倍货量）。
+     * Lv.1 消耗 baseCost（默认 24），满级约省 75% 专注（同样 1000 专注可多精销近 4 倍货量）。
      */
     public static double computeFocusCostPerItem(int level, double baseCost) {
-        int lv = Math.max(1, Math.min(100, level));
-        return Math.max(0.5D, baseCost) / (1.0D + 0.03D * (lv - 1));
+        return computeFocusCostPerItem(level, baseCost,
+                cn.autoforged.module_shop.eco.profession.ProfessionConfig.getIfLoaded());
+    }
+
+    public static double computeFocusCostPerItem(int level, double baseCost,
+                                                 cn.autoforged.module_shop.eco.profession.ProfessionConfig cfg) {
+        int maxLv = cfg != null ? cfg.resolvedMaxLevel() : 100;
+        int lv = Math.max(1, Math.min(maxLv, level));
+        double progress = (lv - 1) / (double) Math.max(1, maxLv - 1);
+        return Math.max(0.5D, baseCost) / (1.0D + 2.97D * progress);
     }
 
     /**
-     * 开启专注精销时的职业加成倍率（含 Lv.1 保底 +5% 起步爽感，线性升至 Lv.100 的 1 + maxBonus，再乘冷门紧缺倍率）。
+     * 开启专注精销时的职业加成倍率（优先读管理员配置的每级加价限制，未配置则线性插值，再乘冷门紧缺倍率）。
      */
     public static double computeProfessionFocusMultiplier(int level, double maxBonus, double scarcityMult) {
-        int lv = Math.max(1, Math.min(100, level));
-        double top = Math.max(0.0D, maxBonus);
-        double minStarter = Math.min(0.05D, top);
-        double bonus = minStarter + (top - minStarter) * ((lv - 1) / 99.0D);
-        return (1.0D + bonus) * Math.max(1.0D, scarcityMult);
+        return computeProfessionFocusMultiplier(level, maxBonus, scarcityMult,
+                cn.autoforged.module_shop.eco.profession.ProfessionConfig.getIfLoaded());
+    }
+
+    public static double computeProfessionFocusMultiplier(int level, double maxBonus, double scarcityMult,
+                                                          cn.autoforged.module_shop.eco.profession.ProfessionConfig cfg) {
+        double bonus;
+        if (cfg != null) {
+            bonus = cfg.bonusRatioForLevel(level, maxBonus);
+        } else {
+            int lv = Math.max(1, Math.min(100, level));
+            double top = Math.max(0.0D, maxBonus);
+            double minStarter = Math.min(0.05D, top);
+            bonus = minStarter + (top - minStarter) * ((lv - 1) / 99.0D);
+        }
+        return (1.0D + Math.max(0.0D, bonus)) * Math.max(1.0D, scarcityMult);
     }
 
     /**
@@ -144,16 +164,20 @@ public final class EcoPricing {
         }
     }
 
-    /** 计算购物城某商品在指定虚拟库存下的实时单件售价。 */
+    /** 计算购物城某商品在指定虚拟库存下的实时单件星币售价（纯实体商品返回 0）。 */
     public static long computeMallAskAtStock(MallItem item, int virtualStock) {
         if (item == null) {
-            return 1L;
+            return 0L;
         }
-        long fallback = Math.max(1L, item.price);
-        if (!isEcoActive() || item.supplyMode != SupplyMode.PLAYER_POOL || item.stockMax <= 0 || item.unlimited()) {
+        PriceSpec spec = item.resolvePriceSpec();
+        if (!spec.supportsStar()) {
+            return 0L;
+        }
+        long fallback = Math.max(1L, spec.starPrice);
+        if (!isEcoActive() || item.permanentLimit || item.supplyMode != SupplyMode.PLAYER_POOL || item.stockMax <= 0 || item.unlimited()) {
             return fallback;
         }
-        long anchor = Math.max(1L, item.basePrice > 0L ? item.basePrice : item.price);
+        long anchor = Math.max(1L, item.basePrice > 0L ? item.basePrice : spec.starPrice);
         return computeAskUnitPure(
                 anchor,
                 virtualStock,
@@ -163,18 +187,22 @@ public final class EcoPricing {
         );
     }
 
-    /** 购物城批量购买逐件积分总价。 */
+    /** 购物城批量购买逐件积分总星币价（纯实体商品返回 0）。 */
     public static long quoteMallBatchAsk(MallItem item, int count) {
         if (item == null || count <= 0) {
             return 0L;
         }
-        if (!isEcoActive() || item.supplyMode != SupplyMode.PLAYER_POOL || item.stockMax <= 0 || item.unlimited()
+        PriceSpec spec = item.resolvePriceSpec();
+        if (!spec.supportsStar()) {
+            return 0L;
+        }
+        if (!isEcoActive() || item.permanentLimit || item.supplyMode != SupplyMode.PLAYER_POOL || item.stockMax <= 0 || item.unlimited()
                 || Config.mallStockPersonal()) {
-            long unit = Math.max(1L, item.price);
+            long unit = Math.max(1L, spec.starPrice);
             long room = Long.MAX_VALUE / count;
             return unit > room ? Long.MAX_VALUE : unit * count;
         }
-        long anchor = Math.max(1L, item.basePrice > 0L ? item.basePrice : item.price);
+        long anchor = Math.max(1L, item.basePrice > 0L ? item.basePrice : spec.starPrice);
         return quoteBatchAskPure(
                 anchor,
                 Math.max(0, item.stock),
@@ -185,14 +213,28 @@ public final class EcoPricing {
         );
     }
 
+    /** 购物城批量购买总价规格（星币走积分动态定价，实体货币按单价线性乘以购买数量）。 */
+    public static PriceSpec quoteMallBatchSpec(MallItem item, int count) {
+        if (item == null || count <= 0) {
+            return PriceSpec.ZERO;
+        }
+        PriceSpec base = item.resolvePriceSpec();
+        PriceSpec linear = base.scale(count);
+        if (!base.supportsStar()) {
+            return linear;
+        }
+        long starTotal = quoteMallBatchAsk(item, count);
+        return PriceSpec.of(base.mode, starTotal, linear.physTierKey, linear.physCount);
+    }
+
     /** 查找购物城里关联的做市货架商品（匹配同物品 ID 的白板货架或精确组件匹配）。 */
     public static MallItem findPlayerPoolItem(ShopSavedData data, ItemStack stack) {
         if (data == null || stack == null || stack.isEmpty()) {
             return null;
         }
         for (MallItem item : data.mallPool) {
-            if (item.supplyMode == SupplyMode.PLAYER_POOL && !item.stack.isEmpty()
-                    && ItemStack.isSameItemSameComponents(item.stack, stack)) {
+            if (!item.permanentLimit && item.supplyMode == SupplyMode.PLAYER_POOL && !item.stack.isEmpty()
+                    && ItemStack.isSameItemSameTags(item.stack, stack)) {
                 return item;
             }
         }
@@ -200,8 +242,8 @@ public final class EcoPricing {
     }
 
     /**
-     * 查找官方商店（购物城任意模式 + 每日商店池）中同物品 ID 的最低可能售价（用于 0.82 防倒卖硬钳位）。
-     * 按物品 Item 本身查：防止玩家在商城低价买白板物品、附点低成本属性或直接倒手卖回出货箱套利！
+     * 查找官方商店（购物城任意模式 + 每日商店池）中同物品 ID 的最低可能星币售价（用于 0.82 防倒卖硬钳位）。
+     * 严格只计入支持星币购买的条目（{@code supportsStar()}），纯实体定价（starPrice==0）绝不污染星币 Ask 锚点！
      */
     public static long findCheapestOfficialAskForItem(ShopSavedData data, ItemStack stack, int virtualStockOffset) {
         if (data == null || stack == null || stack.isEmpty()) {
@@ -212,18 +254,27 @@ public final class EcoPricing {
             if (item.stack.isEmpty() || item.stack.getItem() != stack.getItem()) {
                 continue;
             }
+            PriceSpec spec = item.resolvePriceSpec();
+            if (!spec.supportsStar()) {
+                continue;
+            }
             long ask;
             if (item.supplyMode == SupplyMode.PLAYER_POOL && item.stockMax > 0 && !item.unlimited()) {
-                // 玩家从商城买走 1 件再卖回 1 件时，商城那一步收的是 stock + offset + 1 处的 Ask 价
                 ask = computeMallAskAtStock(item, Math.max(0, item.stock + virtualStockOffset + 1));
             } else {
-                ask = Math.max(1L, item.price);
+                ask = Math.max(1L, spec.starPrice);
             }
-            cheapest = Math.min(cheapest, ask);
+            if (ask > 0L) {
+                cheapest = Math.min(cheapest, ask);
+            }
         }
         for (ConfiguredOffer offer : data.shopPool) {
-            if (!offer.stack.isEmpty() && offer.stack.getItem() == stack.getItem() && offer.price > 0L) {
-                cheapest = Math.min(cheapest, offer.price);
+            if (offer.stack.isEmpty() || offer.stack.getItem() != stack.getItem()) {
+                continue;
+            }
+            PriceSpec spec = offer.resolvePriceSpec();
+            if (spec.supportsStar() && spec.starPrice > 0L) {
+                cheapest = Math.min(cheapest, spec.starPrice);
             }
         }
         return cheapest == Long.MAX_VALUE ? -1L : cheapest;
@@ -301,11 +352,12 @@ public final class EcoPricing {
         // 0.82 硬钳位防套利：如果该物品在官方购物城或每日商店有售，绝不允许收购价高于商城卖价的 82%
         // 注意：若是带高年份/黄金鱼等无法从商城白板直接买到的极品（qualityMult > 1.05 且商城卖的是白板），
         // 仅当与商城货架完全同组件（白板）时锁死在白板卖价 82% 以内；若商城卖的是同组件物品也严格锁死！
-        MallItem exactMall = findExactAnyMallItem(data, stack);
+        MallItem exactMall = findExactStarMallItem(data, stack);
         if (exactMall != null) {
+            PriceSpec exactSpec = exactMall.resolvePriceSpec();
             long exactAsk = (exactMall.supplyMode == SupplyMode.PLAYER_POOL && exactMall.stockMax > 0 && !exactMall.unlimited())
                     ? computeMallAskAtStock(exactMall, Math.max(0, exactMall.stock + virtualStockOffset + 1))
-                    : Math.max(1L, exactMall.price);
+                    : Math.max(1L, exactSpec.starPrice);
             rawBid = clampBidAgainstAsk(rawBid, exactAsk, Config.INSTANCE.ecoMaxBidToAskRatio.get());
         } else {
             // 即便物品带了简单组件（例如铁砧改名），也不能用白板进货刷钱：只有真实模组品质溢价才允许按品质比例放大硬上限，普通改名 qualityMult == 1.0 仍严格受白板卖价 82% 限制！
@@ -320,9 +372,11 @@ public final class EcoPricing {
         return rawBid;
     }
 
-    private static MallItem findExactAnyMallItem(ShopSavedData data, ItemStack stack) {
+    private static MallItem findExactStarMallItem(ShopSavedData data, ItemStack stack) {
         for (MallItem item : data.mallPool) {
-            if (!item.stack.isEmpty() && ItemStack.isSameItemSameComponents(item.stack, stack)) {
+            if (!item.stack.isEmpty()
+                    && item.resolvePriceSpec().supportsStar()
+                    && ItemStack.isSameItemSameTags(item.stack, stack)) {
                 return item;
             }
         }
@@ -361,12 +415,13 @@ public final class EcoPricing {
             return 0L;
         }
         double maxRatio = Config.INSTANCE.ecoMaxBidToAskRatio.get();
-        MallItem exactMall = findExactAnyMallItem(data, stack);
+        MallItem exactMall = findExactStarMallItem(data, stack);
         if (exactMall != null) {
+            PriceSpec exactSpec = exactMall.resolvePriceSpec();
             long exactAsk = (exactMall.supplyMode == SupplyMode.PLAYER_POOL
                     && exactMall.stockMax > 0 && !exactMall.unlimited())
                     ? computeMallAskAtStock(exactMall, Math.max(0, exactMall.stock + virtualStockOffset + 1))
-                    : Math.max(1L, exactMall.price);
+                    : Math.max(1L, exactSpec.starPrice);
             return clampBidAgainstAsk(lockedUnitPrice, exactAsk, maxRatio);
         }
         long baseOfficialAsk = findCheapestOfficialAskForItem(data, stack, virtualStockOffset);

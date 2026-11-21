@@ -21,6 +21,7 @@ public final class ProfessionPage implements ShopPage {
     private static final float OVERVIEW_H = 40.0F;
     private static final ListTable TABLE = new ListTable();
     private float[] focusBtnRect;
+    private float[] configBtnRect;
 
     @Override
     public String id() {
@@ -61,6 +62,16 @@ public final class ProfessionPage implements ShopPage {
         V2.bold(c, tr("tab.module_shop.profession"), V2.FS_T, IOStyle.TEXT, x + 8, cy, 110, Text.Align.LEFT);
 
         float right = x + f.w() - 8;
+        configBtnRect = null;
+        if (ClientShopData.canAdmin) {
+            String cfgText = cn.autoforged.module_shop.client.ClientHomeCurrencyState.tr(
+                    "gui.module_shop.profession.config_btn", "专精配置");
+            float cw = V2.buttonWidth(cfgText);
+            right -= cw;
+            V2.button(c, cfgText, V2.Btn.NORMAL, right, by, cw, V2.CTRL, over(f, right, by, cw, V2.CTRL) ? 1 : 0);
+            configBtnRect = new float[]{right, by, cw, V2.CTRL};
+            right -= 5;
+        }
         String toggleText = tr(ClientShopData.focusSellEnabled
                 ? "gui.module_shop.v2.profession.focus_on"
                 : "gui.module_shop.v2.profession.focus_off");
@@ -149,7 +160,8 @@ public final class ProfessionPage implements ShopPage {
             float cy = ry + V2.ROW / 2;
             f.host().items().add(pv.icon, cols[0][0], ry + (V2.ROW - V2.ICON) / 2, V2.ICON, false);
 
-            float nw = V2.bold(cv, pv.localizedName(), V2.FS, IOStyle.TEXT, cols[1][0], cy, cols[1][1] - 36, Text.Align.LEFT);
+            float nameMax = pv.scarcityPct >= 2.0D ? Math.max(24.0F, cols[1][1] - 36.0F) : cols[1][1];
+            float nw = V2.bold(cv, pv.localizedName(), V2.FS, IOStyle.TEXT, cols[1][0], cy, nameMax, Text.Align.LEFT);
             if (pv.scarcityPct >= 2.0D) {
                 V2.tag(cv, tr("gui.module_shop.v2.profession.scarce", Math.round(pv.scarcityPct)),
                         IOStyle.ORANGE, cols[1][0] + nw + 4, cy);
@@ -161,7 +173,7 @@ public final class ProfessionPage implements ShopPage {
             float barX = cols[2][0] + lvw + 4;
             float barW = Math.max(24, cols[2][1] - lvw - 8);
             float ratio = pv.nextXp <= 0 ? 1.0F : Math.min(1.0F, pv.xp / (float) pv.nextXp);
-            V2.bar(cv, barX, cy + 3.5F, barW, ratio, pv.level >= 100 ? IOStyle.ORANGE : IOStyle.BLUE);
+            V2.bar(cv, barX, cy + 3.5F, barW, ratio, pv.level >= ClientShopData.profMaxLevel ? IOStyle.ORANGE : IOStyle.BLUE);
             String xpStr = pv.nextXp <= 0 ? "MAX" : (pv.xp + "/" + pv.nextXp);
             V2.text(cv, xpStr, V2.FS_XS, IOStyle.TEXT_3, barX, cy - 3.5F, barW, Text.Align.RIGHT);
 
@@ -191,6 +203,12 @@ public final class ProfessionPage implements ShopPage {
     public boolean mouseClicked(PageFrame f, double mx, double my, int button) {
         if (button != 0) {
             return false;
+        }
+        if (configBtnRect != null && mx >= configBtnRect[0] && mx < configBtnRect[0] + configBtnRect[2]
+                && my >= configBtnRect[1] && my < configBtnRect[1] + configBtnRect[3]) {
+            ClickSound.play();
+            f.host().action("profession_config", null);
+            return true;
         }
         if (focusBtnRect != null && mx >= focusBtnRect[0] && mx < focusBtnRect[0] + focusBtnRect[2]
                 && my >= focusBtnRect[1] && my < focusBtnRect[1] + focusBtnRect[3]) {
