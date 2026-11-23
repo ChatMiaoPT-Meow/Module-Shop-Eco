@@ -151,6 +151,48 @@ public final class PhysicalCurrencyEngine {
     }
 
     /**
+     * 计算指定实体货币档位 {@code targetTierIdx} 在当前阶梯链与背包持有量下最多可精确支付的枚数。
+     * 通过 {@link #planPhysicalTierPay} 二分求解，确保展示余额与服务端实际扣款严格一致。
+     */
+    public static long maxPayableTierCount(int targetTierIdx, long[] values, int[] owned) {
+        return maxPayableTierCount(targetTierIdx, values, owned, DEFAULT_MAX_CHANGE_ITEMS);
+    }
+
+    public static long maxPayableTierCount(int targetTierIdx, long[] values, int[] owned, int maxChangeItems) {
+        int n = values == null ? 0 : values.length;
+        if (n == 0 || owned == null || owned.length < n || targetTierIdx < 0 || targetTierIdx >= n) {
+            return 0L;
+        }
+        long unitVal = values[targetTierIdx];
+        if (unitVal <= 0L) {
+            return 0L;
+        }
+        long totalVal = totalPhysicalValue(values, owned);
+        long hi = totalVal / unitVal;
+        if (hi <= 0L) {
+            return 0L;
+        }
+        if (planPhysicalTierPay(targetTierIdx, hi, values, owned, maxChangeItems).ok()) {
+            return hi;
+        }
+        long lo = Math.min(hi, Math.max(0L, owned[targetTierIdx]));
+        if (lo > 0L && !planPhysicalTierPay(targetTierIdx, lo, values, owned, maxChangeItems).ok()) {
+            lo = 0L;
+        }
+        long left = lo;
+        long right = hi - 1L;
+        while (left < right) {
+            long mid = left + ((right - left + 1L) >>> 1);
+            if (planPhysicalTierPay(targetTierIdx, mid, values, owned, maxChangeItems).ok()) {
+                left = mid;
+            } else {
+                right = mid - 1L;
+            }
+        }
+        return left;
+    }
+
+    /**
      * 按指定目标档位规划实体货币发放：
      * 优先按标定档位 {@code targetTierIdx × tierCount} 直接发放；若超过最大物品件数上限则自动向高阶压缩。
      */

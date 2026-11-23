@@ -608,9 +608,17 @@ public final class CurrencySettlement {
             }
         }
 
+        long[] tierVals = new long[displayTiers.size()];
+        for (int i = 0; i < displayTiers.size(); i++) {
+            tierVals[i] = displayTiers.get(i).spec.value;
+        }
+        long totalUnits = PhysicalCurrencyEngine.totalPhysicalValue(tierVals, owned);
+
         tag.putBoolean("physEnabled", cfg.isActive());
         tag.putBoolean("physBlockBuyback", cfg.blockBuybackAndShipping);
         tag.putLong("physDailyConvertLimit", Math.max(0L, cfg.dailyConvertLimit));
+        tag.putString("physAddonDefaultTier", cfg.addonDefaultTierKey == null ? "" : cfg.addonDefaultTierKey);
+        tag.putLong("physPlayerValue", Math.max(0L, totalUnits));
         if (player != null) {
             PlayerAccount acct = ShopManager.account(player);
             long qDay = cn.autoforged.module_shop.Config.shippingQuotaDay();

@@ -55,6 +55,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -494,6 +495,8 @@ public final class ShopManager {
             generateDailyShop(player, account, data);
             dirty = true;
             shopRefreshed = true;
+        } else if (syncDailyShopWithPool(player, account, data)) {
+            dirty = true;
         }
         if (account.dailyBuybackDay != day) {
             account.dailyBuybackDay = day;
@@ -504,6 +507,8 @@ public final class ShopManager {
             generateDailyBuyback(player, account, data);
             dirty = true;
             buybackRefreshed = true;
+        } else if (syncDailyBuybackWithPool(player, account, data)) {
+            dirty = true;
         }
         if (dirty) {
             data.setDirty();
@@ -674,6 +679,234 @@ public final class ShopManager {
         }
     }
 
+    private static DailyBuybackEntry buybackEntryOf(ConfiguredOffer picked) {
+        DailyBuybackEntry entry = new DailyBuybackEntry(picked.stack.copy(), picked.resolvePriceSpec());
+        entry.rarity = picked.rarity;
+        entry.limit = Math.max(1, picked.amountOr(Config.INSTANCE.buybackCapacity.get()));
+        return entry;
+    }
+
+    static void applyBuybackGuarantee(RandomSource random, List<DailyBuybackEntry> entries,
+            List<ConfiguredOffer> pool, int[] guarantee) {
+        Rarity[] order = {Rarity.RARE, Rarity.EPIC, Rarity.LEGENDARY};
+        for (int i = 0; i < order.length && i < guarantee.length; i++) {
+            int need = Math.max(0, guarantee[i]);
+            if (need <= 0) {
+                continue;
+            }
+            Rarity rarity = order[i];
+            long have = 0L;
+            for (DailyBuybackEntry entry : entries) {
+                if (entry.rarity == rarity) {
+                    have++;
+                }
+            }
+            while (have < need) {
+                List<ConfiguredOffer> candidates = new ArrayList<>();
+                for (ConfiguredOffer offer : pool) {
+                    if (offer.rarity == rarity && !offer.stack.isEmpty()
+                            && !containsBuybackStack(entries, offer.stack)) {
+                        candidates.add(offer);
+                    }
+                }
+                if (candidates.isEmpty()) {
+                    break;
+                }
+                ConfiguredOffer picked = pick(random, candidates);
+                if (picked == null) {
+                    break;
+                }
+                boolean replaced = false;
+                for (int k = entries.size() - 1; k >= 0; k--) {
+                    if (entries.get(k).rarity == Rarity.COMMON) {
+                        entries.set(k, buybackEntryOf(picked));
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced && entries.size() < MAX_DAILY_SLOTS) {
+                    entries.add(buybackEntryOf(picked));
+                }
+                have++;
+            }
+        }
+    }
+
+    private static boolean containsShopStack(List<DailyShopEntry> entries, ItemStack stack) {
+        for (DailyShopEntry entry : entries) {
+            if (!entry.stack.isEmpty() && ItemStack.isSameItemSameTags(entry.stack, stack)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsBuybackStack(List<DailyBuybackEntry> entries, ItemStack stack) {
+        for (DailyBuybackEntry entry : entries) {
+            if (!entry.stack.isEmpty() && ItemStack.isSameItemSameTags(entry.stack, stack)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 同日增量同步（每日商店）：移除已被管理员从池中删除的条目（保留其余卡牌翻面下标），
+     * 并在玩家当日槽位未满（如管理员先清空池再上架、或池内新增条目且未达上限）时自动补齐。
+     */
+    private static boolean syncDailyShopWithPool(ServerPlayer player, PlayerAccount account, ShopSavedData data) {
+        boolean changed = false;
+        int targetSlots = Math.max(0, Math.min(MAX_DAILY_SLOTS, data.shopSlotCount));
+        if (targetSlots == 0) {
+            if (!account.dailyShop.isEmpty() || !account.dailyFlipped.isEmpty()) {
+                account.dailyShop.clear();
+                account.dailyFlipped.clear();
+                return true;
+            }
+            return false;
+        }
+        if (!account.dailyShop.isEmpty()) {
+            List<DailyShopEntry> kept = new ArrayList<>(account.dailyShop.size());
+            Set<Integer> newFlipped = new HashSet<>();
+            for (int i = 0; i < account.dailyShop.size(); i++) {
+                DailyShopEntry entry = account.dailyShop.get(i);
+                if (findOffer(data.shopPool, entry.stack) != null) {
+                    if (account.dailyFlipped.contains(i)) {
+                        newFlipped.add(kept.size());
+                    }
+                    kept.add(entry);
+                } else {
+                    changed = true;
+                }
+            }
+            if (changed) {
+                account.dailyShop.clear();
+                account.dailyShop.addAll(kept);
+                account.dailyFlipped.clear();
+                account.dailyFlipped.addAll(newFlipped);
+            }
+        }
+        if (account.dailyShop.isEmpty()) {
+            if (!data.shopPool.isEmpty()) {
+                generateDailyShop(player, account, data);
+                if (!account.dailyShop.isEmpty()) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        if (account.dailyShop.size() < targetSlots && !data.shopPool.isEmpty()) {
+            List<ConfiguredOffer> freshPool = new ArrayList<>();
+            for (ConfiguredOffer offer : data.shopPool) {
+                if (!offer.stack.isEmpty() && offer.resolvePriceSpec().isValid()
+                        && !containsShopStack(account.dailyShop, offer.stack)) {
+                    freshPool.add(offer);
+                }
+            }
+            RandomSource random = player.getRandom();
+            while (account.dailyShop.size() < targetSlots && !freshPool.isEmpty()) {
+                List<Rarity> avail = raritiesOf(freshPool);
+                Rarity want = rollRarity(random, avail.isEmpty() ? List.of(Rarity.COMMON) : avail, data.shopWeights);
+                List<ConfiguredOffer> ofRarity = new ArrayList<>();
+                for (ConfiguredOffer offer : freshPool) {
+                    if (offer.rarity == want) {
+                        ofRarity.add(offer);
+                    }
+                }
+                ConfiguredOffer picked = pick(random, ofRarity.isEmpty() ? freshPool : ofRarity);
+                if (picked == null) {
+                    break;
+                }
+                freshPool.removeIf(o -> ItemStack.isSameItemSameTags(o.stack, picked.stack));
+                account.dailyShop.add(shopEntryOf(picked));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * 同日增量同步（每日收购）：移除已从收购池删除或触发防套利拦截的条目，
+     * 并在玩家当日收购清单未满（如空池先登后摆、或池子条目数 <= 槽位上限时新增收购品）时实时补齐给所有玩家。
+     */
+    private static boolean syncDailyBuybackWithPool(ServerPlayer player, PlayerAccount account, ShopSavedData data) {
+        boolean changed = false;
+        int maxSlots = Math.max(0, Math.min(MAX_DAILY_SLOTS, data.buybackSlotCount));
+        if (maxSlots == 0) {
+            if (!account.dailyBuyback.isEmpty()) {
+                account.dailyBuyback.clear();
+                return true;
+            }
+            return false;
+        }
+        HolderLookup.Provider regs = player.level().registryAccess();
+        if (!account.dailyBuyback.isEmpty()) {
+            boolean removed = account.dailyBuyback.removeIf(entry -> {
+                ConfiguredOffer match = findOffer(data.buybackPool, entry.stack);
+                if (match == null) {
+                    return true;
+                }
+                PriceSpec spec = match.resolvePriceSpec();
+                return !spec.isValid()
+                        || CurrencySettlement.isBlockingBuybackAndShippingForSpec(entry.stack, spec, regs, true);
+            });
+            if (removed) {
+                changed = true;
+            }
+        }
+        if (account.dailyBuyback.isEmpty()) {
+            if (!data.buybackPool.isEmpty()) {
+                generateDailyBuyback(player, account, data);
+                if (!account.dailyBuyback.isEmpty()) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        if (account.dailyBuyback.size() < maxSlots && !data.buybackPool.isEmpty()) {
+            if (cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
+                if (cn.autoforged.module_shop.eco.ClearingHouse.topUpDailyBuybackEco(
+                        player, account, data, maxSlots)) {
+                    changed = true;
+                }
+            } else {
+                List<ConfiguredOffer> freshPool = new ArrayList<>();
+                for (ConfiguredOffer offer : data.buybackPool) {
+                    PriceSpec offerSpec = offer.resolvePriceSpec();
+                    if (offer.stack.isEmpty() || !offerSpec.isValid()) {
+                        continue;
+                    }
+                    if (CurrencySettlement.isBlockingBuybackAndShippingForSpec(offer.stack, offerSpec, regs, true)) {
+                        continue;
+                    }
+                    if (!containsBuybackStack(account.dailyBuyback, offer.stack)) {
+                        freshPool.add(offer);
+                    }
+                }
+                RandomSource random = player.getRandom();
+                while (account.dailyBuyback.size() < maxSlots && !freshPool.isEmpty()) {
+                    List<Rarity> avail = raritiesOf(freshPool);
+                    Rarity want = rollRarity(random, avail.isEmpty() ? List.of(Rarity.COMMON) : avail,
+                            data.buybackWeights);
+                    List<ConfiguredOffer> ofRarity = new ArrayList<>();
+                    for (ConfiguredOffer offer : freshPool) {
+                        if (offer.rarity == want) {
+                            ofRarity.add(offer);
+                        }
+                    }
+                    ConfiguredOffer picked = pick(random, ofRarity.isEmpty() ? freshPool : ofRarity);
+                    if (picked == null) {
+                        break;
+                    }
+                    freshPool.removeIf(o -> ItemStack.isSameItemSameTags(o.stack, picked.stack));
+                    account.dailyBuyback.add(buybackEntryOf(picked));
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
     private static void generateDailyBuyback(ServerPlayer player, PlayerAccount account, ShopSavedData data) {
         if (cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
             cn.autoforged.module_shop.eco.ClearingHouse.generateDailyBuybackEco(player, account, data, MAX_DAILY_SLOTS);
@@ -694,6 +927,7 @@ public final class ShopManager {
             }
             pool.add(offer);
         }
+        List<ConfiguredOffer> eligiblePool = new ArrayList<>(pool);
         RandomSource random = player.getRandom();
         // 上下限由管理员设置（0 ~ 64）：0 = 今天不生成收购需求。
         int slots = Math.min(MAX_DAILY_SLOTS, Math.min(Math.max(0, data.buybackSlotCount), pool.size()));
@@ -712,12 +946,11 @@ public final class ShopManager {
             if (picked == null) {
                 break;
             }
-            pool.remove(picked);
-            DailyBuybackEntry entry = new DailyBuybackEntry(picked.stack.copy(), picked.resolvePriceSpec());
-            // 需求 6/9：收购品质与可收购数量来自管理员配置。
-            entry.rarity = picked.rarity;
-            entry.limit = Math.max(1, picked.amountOr(Config.INSTANCE.buybackCapacity.get()));
-            account.dailyBuyback.add(entry);
+            pool.removeIf(o -> ItemStack.isSameItemSameTags(o.stack, picked.stack));
+            account.dailyBuyback.add(buybackEntryOf(picked));
+        }
+        if (slots > 0) {
+            applyBuybackGuarantee(random, account.dailyBuyback, eligiblePool, data.buybackGuarantee);
         }
     }
 
@@ -799,7 +1032,7 @@ public final class ShopManager {
             return;
         }
         HolderLookup.Provider regs = server.registryAccess();
-        long receivedDay = System.currentTimeMillis() / 86_400_000L;
+        long receivedDay = currentDay(server.overworld());
         // 第八轮：一次发放只发**一封**邮件（所有物品装在同一封里），并在 storeMail 里与同渠道未领取的邮件继续合并，
         // 避免"一件物品一封邮件"把邮箱塞满。
         List<ItemStack> draftItems = draft.items();
@@ -981,48 +1214,39 @@ public final class ShopManager {
         return true;
     }
 
-    /** 第七轮：按单封邮件的到期时间清理（占位注释，保留方法顺序便于阅读）。 */
+    /** 每日例行清理：按单封邮件到期时间 + 跨日清理已读/已领过期邮件（玩家摊位到期统一由 {@link #tickStallExpire} 按配置执行）。 */
     public static void tickDaily(MinecraftServer server) {
+        if (server == null) {
+            return;
+        }
         purgeExpiredMails(server);
-        ShopSavedData data = data(server);
-        long day = currentDay(server.overworld());
-        if (data.lastStallClearDay == Long.MIN_VALUE) {
+        synchronized (LOCK) {
+            ShopSavedData data = data(server);
+            long day = currentDay(server.overworld());
+            if (data.lastStallClearDay == Long.MIN_VALUE) {
+                data.lastStallClearDay = day;
+                data.setDirty();
+                return;
+            }
+            if (!ShopExpireSupport.shouldAdvanceDailyDay(day, data.lastStallClearDay)) {
+                return;
+            }
             data.lastStallClearDay = day;
-            return;
-        }
-        if (day == data.lastStallClearDay) {
-            return;
-        }
-        data.lastStallClearDay = day;
-        int expireDays = Config.INSTANCE.mailExpireDays.get();
-        for (Map.Entry<UUID, PlayerAccount> entry : new ArrayList<>(data.accounts().entrySet())) {
-            PlayerAccount account = entry.getValue();
-            if (!account.stall.isEmpty()) {
-                for (StallEntry stall : account.stall) {
-                    // 需求 6：到期清摊时退还全部剩余库存，而不是 1 件。
-                    if (stall.stock > 0) {
-                        ItemStack refund = stall.stack.copy();
-                        refund.setCount(stall.stock);
-                        addMailDraft(server, entry.getKey(), MailTemplates.build(MailTemplates.Template.STALL_EXPIRED,
-                        MailTemplates.map("player", nameOf(server, entry.getKey()),
-                                "item", MailTemplates.itemText(refund, false)))
-                .source(SOURCE_STALL_UNSOLD)
-                .addItem(refund));
-                    }
-                }
-                account.stall.clear();
-            }
+            int expireDays = Config.INSTANCE.mailExpireDays.get();
             if (expireDays > 0) {
-                // 只清理“已经领取/查看过”的邮件：未领取的物品、未查看的货款不能因为过期直接蒸发。
-                // receivedDay<=0 表示旧存档缺这个字段，按“刚收到”处理，避免一开过期功能就清空历史邮件。
-                // 标星的邮件永不自动过期（和「一键清理」「邮箱满了自动删」保持同一规则）。
-                account.mailbox.removeIf(mail -> !mail.pending()
-                        && !mail.starred
-                        && mail.receivedDay > 0
-                        && day - mail.receivedDay >= expireDays);
+                for (Map.Entry<UUID, PlayerAccount> entry : new ArrayList<>(data.accounts().entrySet())) {
+                    PlayerAccount account = entry.getValue();
+                    // 只清理“已经领取/查看过”的邮件：未领取的物品、未查看的货款不能因为过期直接蒸发。
+                    // receivedDay<=0 表示旧存档缺这个字段，按“刚收到”处理，避免一开过期功能就清空历史邮件。
+                    // 标星的邮件永不自动过期（和「一键清理」「邮箱满了自动删」保持同一规则）。
+                    account.mailbox.removeIf(mail -> !mail.pending()
+                            && !mail.starred
+                            && mail.receivedDay > 0
+                            && day - mail.receivedDay >= expireDays);
+                }
             }
+            data.setDirty();
         }
-        data.setDirty();
     }
 
     /** 拍卖结算。 */
@@ -1051,6 +1275,41 @@ public final class ShopManager {
         sendSnapshot(player, tab, silent, false);
     }
 
+    /** 已发给各在线玩家的购物城货架指纹：未变化时快照直接带 mallUnchanged=true，避免每次开商店/动钱重传上万件商品。 */
+    private static final Map<UUID, Long> LAST_SENT_MALL_HASH = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static long mallViewHash(ShopSavedData data, UUID viewer, boolean personalStock) {
+        long h = 1125899906842597L;
+        boolean eco = EcoPricing.isEcoActive();
+        h = 31L * h + (personalStock ? 1L : 0L);
+        h = 31L * h + (eco ? 1L : 0L);
+        h = 31L * h + data.mallPool.size();
+        for (MallItem item : data.mallPool) {
+            h = 31L * h + System.identityHashCode(item);
+            h = 31L * h + System.identityHashCode(item.stack);
+            h = 31L * h + item.stack.getCount();
+            h = 31L * h + item.stock;
+            h = 31L * h + item.stockMax;
+            h = 31L * h + item.sort;
+            h = 31L * h + item.rarity.ordinal();
+            h = 31L * h + item.supplyMode.ordinal();
+            h = 31L * h + item.basePrice;
+            h = 31L * h + item.floorRestockPercent;
+            h = 31L * h + (item.permanentLimit ? 1L : 0L);
+            PriceSpec spec = item.resolvePriceSpec();
+            h = 31L * h + spec.hashCode();
+            if (item.permanentLimit) {
+                h = 31L * h + item.permanentCap();
+                h = 31L * h + item.permanentUsedFor(viewer);
+            } else if (personalStock) {
+                h = 31L * h + item.remainingFor(viewer);
+            } else if (eco && spec.supportsStar() && item.supplyMode == SupplyMode.PLAYER_POOL && !item.unlimited()) {
+                h = 31L * h + EcoPricing.computeMallAskAtStock(item, Math.max(0, item.stock));
+            }
+        }
+        return h == 0L ? 1L : h;
+    }
+
     private static void sendSnapshot(ServerPlayer player, @Nullable String tab, boolean silent, boolean open) {
         ConfigMigration.runOnce();
         logBalanceCapOnce();
@@ -1060,8 +1319,10 @@ public final class ShopManager {
         // 需求 3：价格始终以服务端商品池为权威，下发前用最新池数据刷新每日报价。
         refreshDailyPrices(account, data);
         HolderLookup.Provider regs = player.level().registryAccess();
-
-        CompoundTag tag = new CompoundTag();
+        boolean ownedBatch = ShopNbt.beginBatchIfAbsent(regs);
+        CompoundTag tag;
+        try {
+        tag = new CompoundTag();
         tag.putString("kind", "snapshot");
         tag.putBoolean("silent", silent);
         // open=true 才允许客户端"自动弹出商店界面"（默认 false：只更新数据，绝不再抢夺玩家的界面）
@@ -1177,6 +1438,8 @@ public final class ShopManager {
             c.putInt("sold", entry.sold);
             // 商品 id（改价 / 补货 / 下架都按它定位，不受下标变化影响）
             c.putLong("order", entry.order);
+            c.putLong("listedGame", entry.listedGame);
+            c.putLong("listedReal", entry.listedReal);
             stall.add(c);
         }
         tag.put("stall", stall);
@@ -1245,31 +1508,24 @@ public final class ShopManager {
             tag.put("adminBuyback", offerList(data.buybackPool, regs));
         }
 
-        // ---- 购物城（新增模块）：常驻货架 + 管理端同结构列表 + 最近购买记录 ----
-        // 「个人库存」模式下每件商品的 stock 字段按**这个玩家自己的剩余量**下发，
-        // 所以客户端不用区分两种模式，只认 stock 就是对的。
+        // ---- 购物城（新增模块）：按指纹增量下发 + 复用单份列表，彻底消除上万件商品开商店/动钱卡顿 ----
         boolean personalStock = Config.mallStockPersonal();
-        ListTag mallList = new ListTag();
-        for (int i = 0; i < data.mallPool.size(); i++) {
-            MallItem item = data.mallPool.get(i);
-            CompoundTag c = item.saveForView(regs, player.getUUID(), personalStock);
-            c.putInt("index", i);
-            mallList.add(c);
-        }
-        tag.put("mall", mallList);
+        long mallHash = mallViewHash(data, player.getUUID(), personalStock);
+        Long prevMallHash = LAST_SENT_MALL_HASH.get(player.getUUID());
         tag.putBoolean("mallStockPersonal", personalStock);
-        // 管理页复用 ConfiguredOffer 的结构（amount 当库存用，-1 = 无限），前端一套行渲染即可。
-        if (snapshotAdmin) {
-            ListTag adminMallList = new ListTag();
-            for (MallItem item : data.mallPool) {
-                CompoundTag c = ShopNbt.saveStack(item.stack, regs);
-                item.resolvePriceSpec().writeToParent(c, "priceSpec", "price");
-                c.putString("rarity", item.rarity.id());
-                c.putInt("amount", item.permanentLimit ? item.permanentCap() : item.stock);
-                c.putBoolean("permanentLimit", item.permanentLimit);
-                adminMallList.add(c);
+        if (prevMallHash != null && prevMallHash == mallHash) {
+            tag.putBoolean("mallUnchanged", true);
+        } else {
+            ListTag mallList = new ListTag();
+            for (int i = 0; i < data.mallPool.size(); i++) {
+                MallItem item = data.mallPool.get(i);
+                CompoundTag c = item.saveForView(regs, player.getUUID(), personalStock);
+                c.putInt("index", i);
+                mallList.add(c);
             }
-            tag.put("adminMall", adminMallList);
+            tag.put("mall", mallList);
+            tag.putBoolean("adminMallFromMall", true);
+            LAST_SENT_MALL_HASH.put(player.getUUID(), mallHash);
         }
         // 管理页的「出货箱」模块：把**兑换规则**按条目下发（代表物品 + 单价 + 每日份数），
         // 格式错误的那几行也在列表里（物品为空 + 原文与原因），界面把它们标红，右键即可删掉。
@@ -1417,6 +1673,11 @@ public final class ShopManager {
         cn.autoforged.module_shop.shop.home.ProfileStatsService.writeSnapshot(player, tag);
         cn.autoforged.module_shop.shop.home.AnnouncementConfig.get().writeSnapshot(tag);
         cn.autoforged.module_shop.shop.currency.CurrencySettlement.writeSnapshot(player, tag, regs);
+        } finally {
+            if (ownedBatch) {
+                ShopNbt.endBatch();
+            }
+        }
 
         ClientboundShopSyncPayload.send(player, tag);
     }
@@ -1500,7 +1761,50 @@ public final class ShopManager {
      * 需求 2：管理员在本地改完商品后执行 /shop reload，即可让服务器与所有在线玩家同步，
      * 无需重启。会按最新商品池重新生成每日列表并静默推送快照（不打断玩家当前界面）。
      */
+    /**
+     * 重置全服所有已知玩家（含在线与离线账户）的当日商店 / 收购生成标记，并广播快照使在线玩家立即重抽生效。
+     */
+    public static void rerollDailyForAll(@Nullable MinecraftServer server, @Nullable ShopSavedData data,
+                                         boolean resetShop, boolean resetBuyback) {
+        if (data == null || (!resetShop && !resetBuyback)) {
+            return;
+        }
+        if (server != null) {
+            for (ServerPlayer online : server.getPlayerList().getPlayers()) {
+                account(online);
+            }
+        }
+        resetAccountsDaily(data.accounts().values(), resetShop, resetBuyback);
+        data.setDirty();
+        if (server != null) {
+            broadcastSnapshots(server);
+        }
+    }
+
+    /** 仅重置指定账户集合的当日商店 / 收购生成标记（供全服重抽与离线单元测试复用）。 */
+    public static void resetAccountsDaily(@Nullable Collection<PlayerAccount> accounts,
+                                          boolean resetShop, boolean resetBuyback) {
+        if (accounts == null || (!resetShop && !resetBuyback)) {
+            return;
+        }
+        for (PlayerAccount acc : accounts) {
+            if (acc == null) {
+                continue;
+            }
+            if (resetShop) {
+                acc.dailyShopDay = Long.MIN_VALUE;
+                acc.dailyShop.clear();
+                acc.dailyFlipped.clear();
+            }
+            if (resetBuyback) {
+                acc.dailyBuybackDay = Long.MIN_VALUE;
+                acc.dailyBuyback.clear();
+            }
+        }
+    }
+
     public static void reload(MinecraftServer server) {
+        LAST_SENT_MALL_HASH.clear();
         cn.autoforged.module_shop.eco.profession.ProfessionConfig.reload();
         cn.autoforged.module_shop.eco.quality.QualityEvaluator.reloadConfig();
         cn.autoforged.module_shop.shop.home.AnnouncementConfig.reload();
@@ -1509,16 +1813,8 @@ public final class ShopManager {
         ShippingRules.refresh();
         ShopSavedData data = data(server);
         loadBrandDefaultIfBlank(data.sidebarLayout);
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            PlayerAccount account = account(player);
-            account.dailyShopDay = Long.MIN_VALUE;
-            account.dailyBuybackDay = Long.MIN_VALUE;
-            account.dailyFlipped.clear();
-        }
-        data.setDirty();
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            sendSnapshot(player, null, true);
-        }
+        rerollDailyForAll(server, data, true, true);
+        flushBroadcastSnapshots(server);
     }
 
     /** 本 tick 内是否有人请求过全服快照（见 {@link #broadcastSnapshots}）。只在服务端主线程读写。 */
@@ -1776,6 +2072,7 @@ public final class ShopManager {
         }
         data.setDirty();
         sendSnapshot(player, type == AdminEditType.MALL ? "mall" : "admin");
+        broadcastSnapshots(player.server);
         notifyPlayer(player, Component.translatable("msg.module_shop.batch_added", added)
                 .withStyle(ChatFormatting.GREEN));
     }
@@ -1947,12 +2244,18 @@ public final class ShopManager {
             case "admin_set_edit_type" -> setAdminEditType(player, tag.getString("type"));
             // 需求 11：管理员添加物品必须使用幽灵槽位，防止刷物品。
             // （现在是**批量**界面：一次最多放 27 种，确认后统一设置价格 / 品质 / 数量。）
-            case "admin_add" -> openBatchAdd(player);
+            case "admin_add" -> {
+                if (tag.contains("mode")) {
+                    setAdminEditType(player, tag.getString("mode"));
+                }
+                openBatchAdd(player);
+            }
             case "admin_batch_prepare" -> adminBatchPrepare(player);
             case "admin_batch_apply" -> adminBatchApply(player, tag);
             case "admin_apply_price" -> adminApplyPrice(player, tag);
             case "admin_remove" -> adminRemove(player, tag);
             case "admin_set_price_new" -> adminSetPriceNew(player, tag);
+            case "admin_reroll_daily", "admin_reroll_daily_go" -> adminRerollDaily(player, tag);
             // ---- 管理员发放（发钱 / 发物品）----
             case "admin_grant_open" -> GrantManager.open(player);
             case "admin_grant_request" -> GrantManager.sendTargets(player);
@@ -2679,6 +2982,8 @@ public final class ShopManager {
 
     /** 出货箱：本游戏日是否已经遍历结算过（避免每 tick 遍历）。服务器启动时重置，见 {@link #resetShippingTick}。 */
     private static long shippingLoggedDay = Long.MIN_VALUE;
+    /** 永昼/冻结时间自动兜底时钟（服务器启动时重置）。 */
+    private static final ShippingSettleClock SHIPPING_CLOCK = new ShippingSettleClock();
 
     /**
      * 服务器启动时调用：清掉上一个存档留下的「今天已结算」标记。
@@ -2686,6 +2991,8 @@ public final class ShopManager {
      */
     public static void resetShippingTick() {
         shippingLoggedDay = Long.MIN_VALUE;
+        SHIPPING_CLOCK.reset();
+        LAST_SENT_MALL_HASH.clear();
     }
 
     /** 出货箱：放不进去的提醒节流（玩家 UUID → 上次提醒时刻）。 */
@@ -2891,9 +3198,19 @@ public final class ShopManager {
         if (!Config.INSTANCE.shippingEnabled.get()) {
             return;
         }
-        long dayTime = server.overworld().getDayTime();
-        long gameDay = Math.floorDiv(dayTime, 24000L);
-        long timeOfDay = Math.floorMod(dayTime, 24000L);
+        var overworld = server.overworld();
+        boolean daylightOn = overworld.getGameRules().getBoolean(net.minecraft.world.level.GameRules.RULE_DAYLIGHT);
+        ShippingSettleClock.Sample clock = SHIPPING_CLOCK.sample(daylightOn, overworld.getDayTime(), overworld.getGameTime());
+        if (clock.modeChanged()) {
+            shippingLoggedDay = Long.MIN_VALUE;
+            org.slf4j.LoggerFactory.getLogger("module_shop").info(
+                    clock.fallbackGameTime()
+                            ? "出货箱：检测到永昼/昼夜时间停滞，已自动切换为运行刻定时结算（每 20 分钟一次）"
+                            : "出货箱：检测到昼夜循环恢复，已切回按游戏时间定时结算");
+            broadcastSnapshots(server);
+        }
+        long gameDay = clock.cycleDay();
+        long timeOfDay = clock.timeOfDay();
         long start = Config.INSTANCE.shippingSettleTick.get();
         // 游戏时间被调回（/time set day、/time set 0 …会把 DayTime 设成绝对值，游戏日从 0 重新数）：旧标记作废。
         if (shippingLoggedDay != Long.MIN_VALUE && shippingLoggedDay > gameDay) {
@@ -2904,7 +3221,7 @@ public final class ShopManager {
         }
         // 以前只在 [start, start + shippingSettleWindow] 这 9 秒窗口里结算：/time add、/time set noon、
         // 或服务器在窗口内卡顿超过 9 秒，都会把窗口整个跳过，当天就不出货了。
-        // 现在改为「当天到点后的第一次 tick 结算」（每个箱子仍然每个游戏日只结算一次，由 lastSettleGameDay 保证）。
+        // 现在改为「当天到点后的第一次 tick 结算」（每个箱子仍然每个周期只结算一次，由 lastSettleGameDay 保证）。
         if (timeOfDay < start) {
             return;
         }
@@ -2957,7 +3274,7 @@ public final class ShopManager {
         if (now - last < interval) {
             return;
         }
-        int restored = restockMall(data);
+        int restored = restockMall(data, false);
         if (byGame) {
             data.mallRefreshLastGame = now;
         } else {
@@ -3031,19 +3348,25 @@ public final class ShopManager {
             return;
         }
         ShopSavedData data = data(server);
-        long timeOfDay = server.overworld().getDayTime() % 24000L;
-        long gameDay = server.overworld().getDayTime() / 24000L;
+        long rawDayTime = server.overworld().getDayTime();
+        long timeOfDay = Math.floorMod(rawDayTime, 24000L);
+        long gameDay = Math.floorDiv(rawDayTime, 24000L);
         boolean restock;
         if (Config.mallRestockGameTime()) {
             long start = Config.mallRestockTick();
-            if (timeOfDay < start) {
-                return;   // 还没到补货时刻
-            }
             if (data.lastMallRestockGameDay == Long.MIN_VALUE) {
                 // 第一次运行只记录基准日（还没到点的话记「昨天」，这样当天的补货时刻仍会生效）
                 data.lastMallRestockGameDay = timeOfDay >= start ? gameDay : gameDay - 1L;
                 data.setDirty();
                 return;
+            }
+            // /time set 调回游戏时间时自动对齐基准日，避免补货长期停摆
+            if (gameDay < data.lastMallRestockGameDay) {
+                data.lastMallRestockGameDay = gameDay - 1L;
+                data.setDirty();
+            }
+            if (timeOfDay < start) {
+                return;   // 还没到补货时刻
             }
             if (gameDay <= data.lastMallRestockGameDay) {
                 return;   // 这个游戏日已经补过了
@@ -3064,9 +3387,10 @@ public final class ShopManager {
             restock = true;
         }
         if (restock) {
-            int restored = restockMall(data);
+            int restored = restockMall(data, true);
             data.setDirty();
             if (restored > 0) {
+                broadcastSnapshots(server);
                 server.getPlayerList().broadcastSystemMessage(
                         Component.translatable("msg.module_shop.mall_restocked", restored)
                                 .withStyle(ChatFormatting.GREEN), false);
@@ -3074,10 +3398,15 @@ public final class ShopManager {
         }
     }
 
-    /** 把货架上卖掉的库存补回目标数量，返回补过的商品件数（{@link #tickMallRestock} 用）。 */
-    private static int restockMall(ShopSavedData data) {
+    /** 把货架上卖掉的库存补回目标数量，返回补过的商品件数（{@link #tickMallRestock} / {@link #tickMallRefresh} 用）。 */
+    public static int restockMall(ShopSavedData data) {
+        return restockMall(data, true);
+    }
+
+    private static int restockMall(ShopSavedData data, boolean useUnifiedAmount) {
+        int unified = useUnifiedAmount ? Config.mallRestockAmount() : 0;
         return cn.autoforged.module_shop.eco.ClearingHouse.restockMallEco(
-                data, Config.mallRestockAmount(), Config.mallStockPersonal());
+                data, unified, Config.mallStockPersonal());
     }
 
     /** 结算单个玩家的出货箱（由 ClearingHouse 统一执行原子结算）。 */
@@ -3198,6 +3527,7 @@ public final class ShopManager {
         }
         tag.put("shippingUpgradeSpecs", writeSpecList(upgradeSpecs));
         tag.putInt("shipSettleTick", Config.INSTANCE.shippingSettleTick.get());
+        tag.putBoolean("shipUseGameTime", SHIPPING_CLOCK.isFallbackGameTime());
         tag.putString("shipResetTime", Config.INSTANCE.shippingResetTime.get());
         List<ShippingRules.Rule> rules = ShippingRules.rules();
         List<String> errors = ShippingRules.errors();
@@ -4279,25 +4609,37 @@ public final class ShopManager {
         if (!canEditAdmin(player)) {
             return;
         }
-        String modeText = tag.getString("expire_mode").trim().toLowerCase(java.util.Locale.ROOT);
-        String mode = ("game".equals(modeText) || "real".equals(modeText)) ? modeText : "permanent";
-        int amount;
-        try {
-            amount = Integer.parseInt(tag.getString("expire_amount").trim());
-        } catch (NumberFormatException ex) {
+        String prevMode = Config.demandExpireMode();
+        int prevAmount = Config.demandExpireAmount();
+        String mode = ShopExpireSupport.normalizeExpireMode(tag.getString("expire_mode"));
+        Integer parsed = ShopExpireSupport.parseExpireAmount(mode, tag.getString("expire_amount"), prevAmount);
+        if (parsed == null) {
             notifyPlayer(player, Component.translatable("msg.module_shop.stall_expire_bad_amount")
                     .withStyle(ChatFormatting.RED));
             return;
         }
-        if (amount < 0 || amount > 100000) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.stall_expire_bad_amount")
-                    .withStyle(ChatFormatting.RED));
+        int amount = parsed;
+        if (!saveExpireConfig("demand", Config.INSTANCE.demandExpireMode, Config.INSTANCE.demandExpireAmount,
+                "demandExpireMode", mode, "demandExpireAmount", amount)) {
+            notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.config_save_failed",
+                    "配置写入磁盘失败，已恢复原设置，请检查配置文件权限").withStyle(ChatFormatting.RED));
             return;
         }
-        Config.INSTANCE.demandExpireMode.set(mode);
-        Config.INSTANCE.demandExpireAmount.set(amount);
-        Config.SPEC.save();
-        Component desc = "permanent".equals(mode) || amount <= 0
+        if (ShopExpireSupport.shouldResetExpireTimestamps(prevMode, prevAmount, mode, amount)) {
+            synchronized (LOCK) {
+                ShopSavedData data = data(player.server);
+                long nowGame = player.server.overworld().getGameTime();
+                long nowReal = System.currentTimeMillis();
+                if (!data.demands.isEmpty()) {
+                    for (DemandEntry entry : data.demands) {
+                        entry.createdGame = nowGame;
+                        entry.createdReal = nowReal;
+                    }
+                    data.setDirty();
+                }
+            }
+        }
+        Component desc = !ShopExpireSupport.isExpireActive(mode, amount)
                 ? Component.translatable("gui.module_shop.choice.expire_mode.permanent")
                 : Component.translatable("gui.module_shop.stall.expire_value",
                         Component.translatable("gui.module_shop.choice.expire_mode." + mode), amount);
@@ -4376,60 +4718,75 @@ public final class ShopManager {
         }
         long nowGame = server.overworld().getGameTime();
         long nowReal = System.currentTimeMillis();
-        ShopSavedData data = data(server);
-        boolean dirty = false;
+        List<ServerPlayer> affectedOnline = new ArrayList<>();
         boolean touched = false;
-        for (Map.Entry<UUID, PlayerAccount> pair : data.accounts().entrySet()) {
-            UUID owner = pair.getKey();
-            PlayerAccount account = pair.getValue();
-            if (account.stall.isEmpty()) {
-                continue;
-            }
-            ServerPlayer online = server.getPlayerList().getPlayer(owner);
-            boolean removed = false;
-            for (int i = account.stall.size() - 1; i >= 0; i--) {
-                StallEntry entry = account.stall.get(i);
-                // 老存档 / 老数据：先补打上架时刻，不立刻下架。
-                if (entry.listedGame <= 0L) {
-                    entry.listedGame = nowGame;
-                    dirty = true;
-                }
-                if (entry.listedReal <= 0L) {
-                    entry.listedReal = nowReal;
-                    dirty = true;
-                }
-                long age = byGame ? nowGame - entry.listedGame : nowReal - entry.listedReal;
-                if (age < limit) {
+        synchronized (LOCK) {
+            ShopSavedData data = data(server);
+            boolean dirty = false;
+            for (Map.Entry<UUID, PlayerAccount> pair : data.accounts().entrySet()) {
+                UUID owner = pair.getKey();
+                PlayerAccount account = pair.getValue();
+                if (account.stall.isEmpty()) {
                     continue;
                 }
-                account.stall.remove(i);
-                dirty = true;
-                touched = true;
-                removed = true;
-                int refundCount = Math.max(0, entry.stock);
-                ItemStack name = entry.stack.copy();
-                if (refundCount > 0) {
-                    ItemStack refund = entry.stack.copy();
-                    refund.setCount(refundCount);
-                    // 在线：直接进背包（满了自动转邮箱）；离线：直接进邮箱。
+                ServerPlayer online = server.getPlayerList().getPlayer(owner);
+                boolean removed = false;
+                for (int i = account.stall.size() - 1; i >= 0; i--) {
+                    StallEntry entry = account.stall.get(i);
+                    // 老存档 / 老数据：先补打上架时刻，不立刻下架。
+                    if (entry.listedGame <= 0L) {
+                        entry.listedGame = nowGame;
+                        dirty = true;
+                    }
+                    if (entry.listedReal <= 0L) {
+                        entry.listedReal = nowReal;
+                        dirty = true;
+                    }
+                    long age = byGame ? nowGame - entry.listedGame : nowReal - entry.listedReal;
+                    if (age < limit) {
+                        continue;
+                    }
+                    account.stall.remove(i);
+                    cn.autoforged.module_shop.shop.stall.StallService.evictItemCache(entry.order);
+                    dirty = true;
+                    touched = true;
+                    removed = true;
+                    int refundCount = Math.max(0, entry.stock);
+                    ItemStack name = entry.stack.copy();
+                    if (refundCount > 0) {
+                        // 按单叠上限拆分，防止高库存（>64/>99/受损装备）退件触发编解码崩溃或非法堆叠。
+                        if (online != null) {
+                            addItemsOrMail(online, entry.stack, refundCount, SOURCE_STALL_EXPIRED);
+                        } else {
+                            List<ItemStack> refundStacks = splitStacks(entry.stack, refundCount);
+                            addMailDraft(server, owner, MailTemplates.build(MailTemplates.Template.STALL_EXPIRED,
+                                            MailTemplates.map("player", nameOf(server, owner),
+                                                    "item", MailTemplates.itemText(name, false) + "×" + refundCount))
+                                    .source(SOURCE_STALL_EXPIRED)
+                                    .addItems(refundStacks));
+                        }
+                    }
                     if (online != null) {
-                        addItemOrMail(online, refund, SOURCE_STALL_EXPIRED);
-                    } else {
-                        addMail(server, owner, refund, SOURCE_STALL_EXPIRED, "系统");
+                        if (refundCount > 0) {
+                            notifyPlayer(online, Component.translatable("msg.module_shop.stall_expired",
+                                    name.getHoverName(), refundCount).withStyle(ChatFormatting.YELLOW));
+                        } else {
+                            notifyPlayer(online, Component.translatableWithFallback("msg.module_shop.stall_expired_empty",
+                                    "已售空的摊位商品「%s」已到期自动下架", name.getHoverName()).withStyle(ChatFormatting.YELLOW));
+                        }
                     }
                 }
-                if (online != null) {
-                    notifyPlayer(online, Component.translatable("msg.module_shop.stall_expired",
-                            name.getHoverName(), refundCount).withStyle(ChatFormatting.YELLOW));
+                if (removed && online != null) {
+                    affectedOnline.add(online);
                 }
             }
-            // 一个玩家可能有多个商品同时到期：这里只推一次快照，免得刷屏。
-            if (removed && online != null) {
-                sendSnapshot(online, "stall");
+            if (dirty) {
+                data.setDirty();
             }
         }
-        if (dirty) {
-            data.setDirty();
+        // 一个玩家可能有多个商品同时到期：在锁外只推一次快照，免得刷屏。
+        for (ServerPlayer online : affectedOnline) {
+            sendSnapshot(online, "stall");
         }
         if (touched) {
             broadcastSnapshots(server);
@@ -4502,11 +4859,10 @@ public final class ShopManager {
                 return;
             }
             StallEntry entry = account.stall.remove(index);
-            // 需求 6：下架时把剩余库存（不是 1 件）全部退还（背包放不下的进邮箱，不丢不复制：先移出摊位再退）。
+            cn.autoforged.module_shop.shop.stall.StallService.evictItemCache(entry.order);
+            // 需求 6：下架时把剩余库存（不是 1 件）全部退还，按单叠上限拆份防止高库存超堆叠。
             if (entry.stock > 0) {
-                ItemStack refund = entry.stack.copy();
-                refund.setCount(entry.stock);
-                addItemOrMail(player, refund, SOURCE_STALL_UNSOLD);
+                addItemsOrMail(player, entry.stack, entry.stock, SOURCE_STALL_UNSOLD);
             }
             data(player.server).setDirty();
         }
@@ -5113,8 +5469,9 @@ public final class ShopManager {
             data.buybackPool.add(offer);
         }
         data.setDirty();
-        // 购物城加完物品直接回购物城页（马上就能看到新上架的那件）；商店/收购仍留在管理页。
+        // 购物城加完物品直接回购物城页（马上就能看到新上架的那件）；商店/收购仍留在管理页，并同步全服快照。
         sendSnapshot(player, type == AdminEditType.MALL ? "mall" : "admin");
+        broadcastSnapshots(player.server);
     }
 
     /** 购物城库存：留空 / 非数字 / 负数 = 无限库存（界面显示 ∞）。 */
@@ -5188,6 +5545,7 @@ public final class ShopManager {
         }
         data.setDirty();
         sendSnapshot(player, "admin");
+        broadcastSnapshots(player.server);
     }
 
     private static void adminRemove(ServerPlayer player, CompoundTag tag) {
@@ -5216,6 +5574,7 @@ public final class ShopManager {
         }
         data.setDirty();
         sendSnapshot(player, "admin");
+        broadcastSnapshots(player.server);
     }
 
     // =========================================================== 货币兑换
@@ -6831,10 +7190,27 @@ public final class ShopManager {
             }
         }
         data.setDirty();
-        // 只重抽当前正在设置的那个列表（改商店参数不动收购，反之亦然）。
-        refreshDaily(player, shop);
+        // 全服所有玩家（含离线）重抽当前正在设置的那个列表（改商店参数不动收购，反之亦然）。
+        rerollDailyForAll(player.server, data, shop, !shop);
         sendSnapshot(player, "admin");
         notifyPlayer(player, Component.translatable("msg.module_shop.gen_set_ok")
+                .withStyle(ChatFormatting.GREEN));
+    }
+
+    /** 管理员一键全服重抽当前模块（每日商店 / 每日收购），覆盖在线与离线玩家。 */
+    private static void adminRerollDaily(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player)) {
+            return;
+        }
+        ShopSavedData data = data(player.server);
+        boolean shop = isShopMode(player, tag);
+        rerollDailyForAll(player.server, data, shop, !shop);
+        sendSnapshot(player, "admin");
+        Component modName = Component.translatable(shop
+                ? "gui.module_shop.admin_shop" : "gui.module_shop.admin_buyback");
+        notifyPlayer(player, Component.translatableWithFallback(
+                "msg.module_shop.admin_rerolled_all",
+                "已按当前商品池为全服玩家重新抽取今日「%s」清单", modName)
                 .withStyle(ChatFormatting.GREEN));
     }
 
@@ -6940,8 +7316,9 @@ public final class ShopManager {
             if (moneyDone && itemsDone) {
                 return;
             }
-            // 定时发放：还没到设定的时间点、且该日程不允许离线领取 → 等在线到点由 tick 发放。
-            if (act.hour >= 0 && java.time.LocalTime.now().getHour() < act.hour && !act.forOffline && !act.catchUp) {
+            // 定时发放：未到设定的时间点一律等待；超过设定时间点仅当开启 catchUp 或 forOffline 时补发。
+            if (!ShopExpireSupport.canGrantActivityDayAtHour(act.hour, java.time.LocalTime.now().getHour(),
+                    act.catchUp, act.forOffline)) {
                 return;
             }
             PriceSpec moneySpec = act.resolveMoneySpec();
@@ -6992,10 +7369,6 @@ public final class ShopManager {
         }
     }
 
-    /** 上一次做活动日离线补发的现实日期（每个日期只跑一次）。 */
-    private static long lastOfflineGrantDay = Long.MIN_VALUE;
-
-    /** 每日检查（挂在服务器 tick 上）：活动日离线补发，每个现实日期只执行一次。 */
     /** 定时发放：日程到了设定的现实时间点时，给当时在线的玩家发物品/星币（每人只发一次）。 */
     private static void tickActivitySchedules(MinecraftServer server) {
         ShopSavedData data = data(server);
@@ -7006,20 +7379,42 @@ public final class ShopManager {
         if (java.time.LocalTime.now().getHour() != act.hour) {
             return;
         }
+        boolean hasMoney = !act.resolveMoneySpec().isZero();
+        boolean hasItems = !act.rewardStacks().isEmpty();
+        if (!hasMoney && !hasItems) {
+            return;
+        }
         for (ServerPlayer online : server.getPlayerList().getPlayers()) {
-            if (!act.granted.contains(online.getUUID()) || !act.giftGranted.contains(online.getUUID())) {
+            UUID id = online.getUUID();
+            boolean needMoney = hasMoney && !act.granted.contains(id);
+            boolean needItems = hasItems && !act.itemsGrantedTo(id);
+            if (needMoney || needItems) {
                 grantActivityDay(online);
             }
         }
     }
 
+    /** 每日检查（挂在服务器 tick 上）：活动日定时在线发放 + 到点后给配置了离线补发的活动日补发。 */
     public static void tickActivityDayOffline(MinecraftServer server) {
         tickActivitySchedules(server);
+        ShopSavedData data = data(server);
         long today = realDay();
-        if (lastOfflineGrantDay == today) {
+        ActivityDay act = data.activityDay(today);
+        if (act == null || !act.forOffline) {
             return;
         }
-        lastOfflineGrantDay = today;
+        int nowHour = java.time.LocalTime.now().getHour();
+        if (!ShopExpireSupport.canGrantActivityOfflineAtHour(act.hour, nowHour)) {
+            return;
+        }
+        int sig = 31 * act.resolveMoneySpec().hashCode() + act.rewardStacks().size();
+        sig = 31 * sig + act.hour;
+        sig = 31 * sig + data.accounts().size();
+        if (data.lastOfflineGrantDay == today && data.lastOfflineGrantSig == sig) {
+            return;
+        }
+        data.lastOfflineGrantDay = today;
+        data.lastOfflineGrantSig = sig;
         grantActivityDayOffline(server);
     }
 
@@ -7030,6 +7425,9 @@ public final class ShopManager {
             long today = realDay();
             ActivityDay act = data.activityDay(today);
             if (act == null || !act.forOffline) {
+                return;
+            }
+            if (!ShopExpireSupport.canGrantActivityOfflineAtHour(act.hour, java.time.LocalTime.now().getHour())) {
                 return;
             }
             PriceSpec moneySpec = act.resolveMoneySpec();
@@ -7691,6 +8089,7 @@ public final class ShopManager {
     }
 
     public static void onLogin(ServerPlayer player) {
+        LAST_SENT_MALL_HASH.remove(player.getUUID());
         // 签到（需求 7）：开启「自动签到」时登录即签到。
         autoSignInIfNeeded(player);
         // 活动日奖励（需求 7）：当天登录即可领取管理员配置的星币。
@@ -7758,6 +8157,7 @@ public final class ShopManager {
     }
 
     public static void onLogout(ServerPlayer player) {
+        LAST_SENT_MALL_HASH.remove(player.getUUID());
         returnPending(player);
         AdminAuthService.onLogout(player.getUUID());
         TradeManager.onLogout(player);
@@ -7945,25 +8345,41 @@ public final class ShopManager {
         if (!canEditAdmin(player)) {
             return;
         }
-        String modeText = tag.getString("expire_mode").trim().toLowerCase(java.util.Locale.ROOT);
-        String mode = ("game".equals(modeText) || "real".equals(modeText)) ? modeText : "permanent";
-        int amount;
-        try {
-            amount = Integer.parseInt(tag.getString("expire_amount").trim());
-        } catch (NumberFormatException ex) {
+        String prevMode = Config.stallExpireMode();
+        int prevAmount = Config.stallExpireAmount();
+        String mode = ShopExpireSupport.normalizeExpireMode(tag.getString("expire_mode"));
+        Integer parsed = ShopExpireSupport.parseExpireAmount(mode, tag.getString("expire_amount"), prevAmount);
+        if (parsed == null) {
             notifyPlayer(player, Component.translatable("msg.module_shop.stall_expire_bad_amount")
                     .withStyle(ChatFormatting.RED));
             return;
         }
-        if (amount < 0 || amount > 100000) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.stall_expire_bad_amount")
-                    .withStyle(ChatFormatting.RED));
+        int amount = parsed;
+        if (!saveExpireConfig("stall", Config.INSTANCE.stallExpireMode, Config.INSTANCE.stallExpireAmount,
+                "stallExpireMode", mode, "stallExpireAmount", amount)) {
+            notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.config_save_failed",
+                    "配置写入磁盘失败，已恢复原设置，请检查配置文件权限").withStyle(ChatFormatting.RED));
             return;
         }
-        Config.INSTANCE.stallExpireMode.set(mode);
-        Config.INSTANCE.stallExpireAmount.set(amount);
-        Config.SPEC.save();
-        Component desc = "permanent".equals(mode) || amount <= 0
+        if (ShopExpireSupport.shouldResetExpireTimestamps(prevMode, prevAmount, mode, amount)) {
+            synchronized (LOCK) {
+                ShopSavedData data = data(player.server);
+                long nowGame = player.server.overworld().getGameTime();
+                long nowReal = System.currentTimeMillis();
+                boolean resetAny = false;
+                for (PlayerAccount account : data.accounts().values()) {
+                    for (StallEntry entry : account.stall) {
+                        entry.listedGame = nowGame;
+                        entry.listedReal = nowReal;
+                        resetAny = true;
+                    }
+                }
+                if (resetAny) {
+                    data.setDirty();
+                }
+            }
+        }
+        Component desc = !ShopExpireSupport.isExpireActive(mode, amount)
                 ? Component.translatable("gui.module_shop.choice.expire_mode.permanent")
                 : Component.translatable("gui.module_shop.stall.expire_value",
                         Component.translatable("gui.module_shop.choice.expire_mode." + mode), amount);
@@ -7971,6 +8387,57 @@ public final class ShopManager {
                 .withStyle(ChatFormatting.GREEN));
         // 让所有玩家立刻拿到新的下架方式（摊位页会显示每个商品的剩余时间）。
         broadcastSnapshots(player.server);
+    }
+
+    /** 持久化摊位 / 求购下架配置：跳过无变化字段，异常或重载竞态时自动走 TOML 原子回写兜底，彻底失败时回滚内存值。 */
+    private static boolean saveExpireConfig(String section,
+            net.minecraftforge.common.ForgeConfigSpec.ConfigValue<String> modeVal,
+            net.minecraftforge.common.ForgeConfigSpec.IntValue amountVal,
+            String modeKey, String mode, String amountKey, int amount) {
+        synchronized (LOCK) {
+            String prevMode = modeVal.get();
+            int prevAmount = amountVal.get();
+            boolean saved = false;
+            try {
+                if (!mode.equals(prevMode)) {
+                    modeVal.set(mode);
+                }
+                if (amount != prevAmount) {
+                    amountVal.set(amount);
+                }
+                Config.SPEC.save();
+                saved = true;
+            } catch (Throwable ex) {
+                org.slf4j.LoggerFactory.getLogger("module_shop")
+                        .warn("[模块商店] 保存 [{}] 下架配置失败，尝试原子回写 TOML：{}", section, ex.toString());
+            }
+            boolean memoryMatches = mode.equals(modeVal.get()) && amount == amountVal.get();
+            if (!saved || !memoryMatches) {
+                Map<String, String> patch = new java.util.LinkedHashMap<>();
+                patch.put(modeKey, "\"" + mode + "\"");
+                patch.put(amountKey, Integer.toString(amount));
+                Path cfgPath = net.minecraftforge.fml.loading.FMLPaths.CONFIGDIR.get().resolve("module_shop_eco-common.toml");
+                if (ShopExpireSupport.writeTomlSectionAtomic(cfgPath, section, patch)) {
+                    try {
+                        if (!mode.equals(modeVal.get())) {
+                            modeVal.set(mode);
+                        }
+                        if (amount != amountVal.get()) {
+                            amountVal.set(amount);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    return true;
+                }
+                try {
+                    modeVal.set(prevMode);
+                    amountVal.set(prevAmount);
+                } catch (Throwable ignored) {
+                }
+                return false;
+            }
+            return true;
+        }
     }
 
     /** 管理员：把所有页签位置恢复默认（编辑中同样只改草稿，点「完成」才广播）。 */
@@ -8186,23 +8653,52 @@ public final class ShopManager {
         }
     }
 
-    public static void addItemOrMail(ServerPlayer player, ItemStack stack, String source) {
-        // Inventory.add 会把传入栈原地 shrink 成“没塞进去的剩余量”，必须保留剩余量，否则半组同类物品时会丢物品。
-        ItemStack remaining = stack.copy();
-        player.getInventory().add(remaining);
-        if (remaining.isEmpty()) {
-            // 需求一：物品获取日志模板「获得 物品名×数量」，物品名可为纯数字，数量单独作字段。
-            notifyPlayer(player, Component.translatable("msg.module_shop.received",
-                    stack.getHoverName(), stack.getCount()).withStyle(ChatFormatting.GREEN));
+    /** 按物品最大堆叠拆成合法单叠列表，避免超堆叠（>64/>99/受损装备）引发存档编码崩溃或非法堆叠。 */
+    public static List<ItemStack> splitStacks(ItemStack template, int totalCount) {
+        List<ItemStack> out = new ArrayList<>();
+        if (template == null || template.isEmpty() || totalCount <= 0) {
+            return out;
+        }
+        int[] counts = ShopExpireSupport.splitStackCounts(totalCount, template.getMaxStackSize());
+        for (int c : counts) {
+            out.add(template.copyWithCount(c));
+        }
+        return out;
+    }
+
+    /** 将指定数量的同种物品按单叠上限拆份后发给在线玩家：能塞背包的进背包，放不下的合并进一封背包已满邮件。 */
+    public static void addItemsOrMail(ServerPlayer player, ItemStack template, int totalCount, String source) {
+        List<ItemStack> parts = splitStacks(template, totalCount);
+        if (parts.isEmpty()) {
             return;
         }
-        // 第七轮：背包放不下的部分进邮箱，并用「背包已满」模板（正文含「背包物品已达限额提醒」）。
+        List<ItemStack> leftovers = new ArrayList<>();
+        int leftoverTotal = 0;
+        for (ItemStack part : parts) {
+            player.getInventory().add(part);
+            if (!part.isEmpty()) {
+                leftovers.add(part);
+                leftoverTotal += part.getCount();
+            }
+        }
+        if (leftovers.isEmpty()) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.received",
+                    template.getHoverName(), totalCount).withStyle(ChatFormatting.GREEN));
+            return;
+        }
         addMailDraft(player.server, player.getUUID(), MailTemplates.build(
                         MailTemplates.Template.BAG_FULL, MailTemplates.map(
                                 "player", player.getGameProfile().getName(),
-                                "item", MailTemplates.itemText(remaining, true)))
+                                "item", MailTemplates.itemText(template, false) + "×" + leftoverTotal))
                 .source(source)
-                .addItem(remaining));
+                .addItems(leftovers));
+    }
+
+    public static void addItemOrMail(ServerPlayer player, ItemStack stack, String source) {
+        if (stack == null || stack.isEmpty()) {
+            return;
+        }
+        addItemsOrMail(player, stack, stack.getCount(), source);
     }
 
     public static void addMail(MinecraftServer server, @Nullable UUID owner, ItemStack stack, String source) {
@@ -8211,34 +8707,44 @@ public final class ShopManager {
 
     /** 需求：带发送者与发送者 UUID 的物品类邮件。 */
     public static void addMail(MinecraftServer server, @Nullable UUID owner, ItemStack stack, String source, String sender) {
-        if (owner == null || stack.isEmpty()) {
+        if (owner == null || stack == null || stack.isEmpty()) {
+            return;
+        }
+        List<ItemStack> parts = splitStacks(stack, stack.getCount());
+        if (parts.isEmpty()) {
             return;
         }
         ShopSavedData data = data(server);
         PlayerAccount account = data.account(owner);
         ServerPlayer online = server.getPlayerList().getPlayer(owner);
         int max = Config.INSTANCE.maxMailboxSize.get();
-        // 同样要处理 Inventory.add 的“部分放入”，只把真正剩下的部分继续进邮箱，避免丢物品。
-        ItemStack remaining = stack.copy();
         if (account.mailbox.size() >= max && !ensureMailRoom(server, account, online)) {
-            // 邮箱已满且没有已读邮件可清理：优先塞背包，仍放不下的直接掉落在玩家脚下。
+            // 邮箱已满且没有已读邮件可清理：按合法单叠优先塞背包，仍放不下的直接掉落在玩家脚下。
             if (online != null) {
-                online.getInventory().add(remaining);
-                if (remaining.isEmpty()) {
+                boolean dropped = false;
+                for (ItemStack part : parts) {
+                    online.getInventory().add(part);
+                    if (!part.isEmpty()) {
+                        online.drop(part, false);
+                        dropped = true;
+                    }
+                }
+                if (!dropped) {
                     notifyPlayer(online, Component.translatable("msg.module_shop.received",
                             stack.getHoverName(), stack.getCount()).withStyle(ChatFormatting.GREEN));
-                    data.setDirty();
-                    return;
+                } else {
+                    notifyPlayer(online, Component.translatable("msg.module_shop.mailbox_full")
+                            .withStyle(ChatFormatting.RED));
                 }
-                online.drop(remaining, false);
-                notifyPlayer(online, Component.translatable("msg.module_shop.mailbox_full")
-                        .withStyle(ChatFormatting.RED));
                 data.setDirty();
                 return;
             }
             // 离线玩家无法掉落，为避免系统返还的物品彻底丢失，仍然保留在邮箱（超出上限仅限系统资产）。
         }
-        MailEntry newEntry = MailEntry.item(remaining, source, sender, null, currentDay(server.overworld()));
+        MailEntry newEntry = MailEntry.item(parts.get(0), source, sender, null, currentDay(server.overworld()));
+        for (int i = 1; i < parts.size(); i++) {
+            newEntry.addStack(parts.get(i));
+        }
         // 第七轮：全服物品发放（admin_grant）保留 30 天有效期；其余邮件默认永久。
         if ("admin_grant".equals(source)) {
             newEntry.expireAt = System.currentTimeMillis() + GRANT_EXPIRE_DAYS * 86_400_000L;

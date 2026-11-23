@@ -237,5 +237,33 @@ class EcoPricingAndTreasuryTest {
         assertTrue(diamondZeroStockAsk > diamondHalfStockAsk && diamondHalfStockAsk > diamondFullTargetAsk,
                 "0 初库进度物资随玩家实业供货增加，官店售价应平滑回落");
         assertEquals(490L, diamondFullTargetAsk);
+
+        // 核验开服配置包落盘文件关键防线（秘银 4:1、拉菲与威士忌回调、进度物品 0 库存 0 补货）
+        java.nio.file.Path tomlPath = java.nio.file.Path.of("presets", "心自安然开服配置包", "module_shop_eco-common.toml");
+        java.nio.file.Path jsonPath = java.nio.file.Path.of("presets", "心自安然开服配置包", "module_shop_eco", "shop_config.json");
+        if (java.nio.file.Files.isRegularFile(tomlPath) && java.nio.file.Files.isRegularFile(jsonPath)) {
+            String toml = java.nio.file.Files.readString(tomlPath, java.nio.charset.StandardCharsets.UTF_8);
+            assertTrue(toml.contains("\"kaleidoscope_tavern:whiskey=7 x64\""), "威士忌应回调至原料合理倍率");
+            assertTrue(toml.contains("\"kaleidoscope_world_liquor:lafite_1982=21 x48\""), "拉菲1982应回归葡萄酿造成本");
+            assertTrue(toml.contains("\"minecraft:wither_skeleton_skull=52 x6\""), "凋灵骷髅头应限价限额防挂机塔");
+            assertTrue(toml.contains("\"irons_spellbooks:mithril_scrap=55 x12\"")
+                    && toml.contains("\"irons_spellbooks:mithril_ingot=220 x4\""), "秘银碎片与秘银锭必须严格 4:1 等价防双向套利");
+            assertTrue(toml.contains("shippingUpgradeCosts = [\"8000\", \"28000\", \"75000\"]"), "出货箱升级曲线应拉长至 11.1 万星币");
+            assertTrue(toml.contains("shippingDailyLimits = [\"1000\", \"2200\", \"4500\", \"8000\"]"), "出货箱每日上限应收紧至 1000~8000");
+
+            String shopJson = java.nio.file.Files.readString(jsonPath, java.nio.charset.StandardCharsets.UTF_8);
+            for (String progId : new String[]{
+                    "minecraft:iron_ingot", "minecraft:diamond",
+                    "minecraft:ender_pearl", "minecraft:blaze_rod", "minecraft:shulker_shell"}) {
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                        "\"item\":\\s*\"" + java.util.regex.Pattern.quote(progId)
+                                + "\"[\\s\\S]*?\"supply_mode\":\\s*\"player_pool\"[\\s\\S]*?"
+                                + "\"floor_restock_pct\":\\s*(\\d+),\\s*\"stock\":\\s*(\\d+)")
+                        .matcher(shopJson);
+                assertTrue(m.find(), "官方商城做市池应包含进度物资: " + progId);
+                assertEquals("0", m.group(1), progId + " 方案1每日保底补货必须为 0%");
+                assertEquals("0", m.group(2), progId + " 方案1开服初始库存必须为 0");
+            }
+        }
     }
 }
