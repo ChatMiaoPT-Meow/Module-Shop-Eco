@@ -45,9 +45,14 @@ public final class PlayerAccount {
     /** 出货箱（新增模块）：每个玩家一份独立空间。 */
     public final ShippingBin shipping = new ShippingBin();
 
-    /** Eco 单向货币结汇：记录自然日与当日已兑入星币总额。 */
+    /** Eco 单向货币结汇：记录自然日、当日已兑入星币总额与各货币条目当日已兑件数。 */
     public long exchangeDay = Long.MIN_VALUE;
     public long exchangeToday = 0L;
+    public final Map<String, Integer> exchangeEntryUsedToday = new java.util.LinkedHashMap<>();
+
+    /** 实体货币每日兑换统计（自然日与当日已兑换总面值）。 */
+    public long physConvertDay = Long.MIN_VALUE;
+    public long physConvertToday = 0L;
 
     /** Eco 八大职业熟练度与每日专注点档案。 */
     public final PlayerProfessionProfile career = new PlayerProfessionProfile();
@@ -110,6 +115,19 @@ public final class PlayerAccount {
         tag.put("shipping", shipping.save(registries));
         tag.putLong("exchangeDay", exchangeDay);
         tag.putLong("exchangeToday", exchangeToday);
+        if (!exchangeEntryUsedToday.isEmpty()) {
+            CompoundTag exUsed = new CompoundTag();
+            for (Map.Entry<String, Integer> e : exchangeEntryUsedToday.entrySet()) {
+                if (e.getKey() != null && !e.getKey().isEmpty() && e.getValue() != null && e.getValue() > 0) {
+                    exUsed.putInt(e.getKey(), e.getValue());
+                }
+            }
+            if (!exUsed.isEmpty()) {
+                tag.put("exchangeEntryUsed", exUsed);
+            }
+        }
+        tag.putLong("physConvertDay", physConvertDay);
+        tag.putLong("physConvertToday", physConvertToday);
         tag.put("career", career.save());
         return tag;
     }
@@ -166,11 +184,25 @@ public final class PlayerAccount {
             account.shipping.ruleUsed.putAll(loaded.ruleUsed);
             account.shipping.lastSettleGameDay = loaded.lastSettleGameDay;
             account.shipping.lastPayout = loaded.lastPayout;
+            account.shipping.lastPhysPayout.clear();
+            account.shipping.lastPhysPayout.putAll(loaded.lastPhysPayout);
+            account.shipping.lastPayoutSummary = loaded.lastPayoutSummary;
             account.shipping.lastCount = loaded.lastCount;
             account.shipping.pendingNotice = loaded.pendingNotice;
         }
         account.exchangeDay = tag.contains("exchangeDay") ? tag.getLong("exchangeDay") : Long.MIN_VALUE;
         account.exchangeToday = Math.max(0L, tag.getLong("exchangeToday"));
+        if (tag.contains("exchangeEntryUsed", Tag.TAG_COMPOUND)) {
+            CompoundTag exUsed = tag.getCompound("exchangeEntryUsed");
+            for (String key : exUsed.getAllKeys()) {
+                int v = exUsed.getInt(key);
+                if (v > 0) {
+                    account.exchangeEntryUsedToday.put(key, v);
+                }
+            }
+        }
+        account.physConvertDay = tag.contains("physConvertDay") ? tag.getLong("physConvertDay") : Long.MIN_VALUE;
+        account.physConvertToday = Math.max(0L, tag.getLong("physConvertToday"));
         if (tag.contains("career")) {
             PlayerProfessionProfile loadedCareer = PlayerProfessionProfile.load(tag.getCompound("career"));
             account.career.focusPoints = loadedCareer.focusPoints;

@@ -229,8 +229,8 @@ if (nonAsciiProjectPath) {
         dependsOn 'createMinecraftArtifacts'
         into new File(asciiSafeRoot, 'mc-jars')
     }
-    def asciiRuntimeDeps = sourceSets.test.runtimeClasspath.filter { File f ->
-        f.path.chars().allMatch { it < 128 }
+    def asciiRuntimeDeps = (sourceSets.test.runtimeClasspath + sourceSets.main.runtimeClasspath).filter { File f ->
+        f.isFile() && f.path.chars().allMatch { it < 128 }
     }
     tasks.named('test', Test).configure {
         dependsOn syncMainForTest, syncTestClasses, syncMcJars
@@ -241,13 +241,6 @@ if (nonAsciiProjectPath) {
                 asciiRuntimeDeps,
                 fileTree(new File(asciiSafeRoot, 'mc-jars'))
         )
-    }
-} else {
-    tasks.named('test', Test).configure {
-        dependsOn 'createMinecraftArtifacts'
-        classpath += fileTree(layout.buildDirectory.dir('moddev/artifacts')) {
-            include "neoforge-${project.neo_version}-merged.jar", "neoforge-${project.neo_version}.jar"
-        }
     }
 }
 
@@ -265,9 +258,16 @@ tasks.withType(ProcessResources).configureEach {
     filteringCharset = 'UTF-8'
 }
 
+// 主 jar 按启动器与版本格式命名；apiJar 保持 module_shop_eco-<version>-api.jar 供附属模组稳定引用。
+tasks.named('jar', Jar).configure {
+    archiveFileName = "Module-Shop-Eco-${mod_version}-for-NeoForge-${minecraft_version}.jar"
+}
+
 // 公共 API 单独打一个 jar（只含 cn.autoforged.module_shop.api.**）：附属模组只对它编译，
 // 从构建层面保证附属碰不到 ShopManager / ShopSavedData 等内部实现。运行时仍由完整的 module_shop jar 提供。
 def apiJar = tasks.register('apiJar', Jar) {
+    archiveBaseName = 'module_shop_eco'
+    archiveVersion = mod_version
     archiveClassifier = 'api'
     from(sourceSets.main.output) {
         include 'cn/autoforged/module_shop/api/**'

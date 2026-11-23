@@ -10,6 +10,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.core.BlockPos;
@@ -28,19 +29,26 @@ import net.minecraft.tags.EntityTypeTags;
 import net.minecraft.tags.TagKey;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.OwnableEntity;
+import net.minecraft.world.entity.TamableAnimal;
+import net.minecraft.world.entity.animal.AbstractGolem;
 import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.animal.Cow;
 import net.minecraft.world.entity.animal.MushroomCow;
 import net.minecraft.world.entity.animal.Sheep;
 import net.minecraft.world.entity.animal.SnowGolem;
 import net.minecraft.world.entity.animal.goat.Goat;
+import net.minecraft.world.entity.animal.horse.AbstractHorse;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.npc.Npc;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.AbstractFurnaceMenu;
 import net.minecraft.world.inventory.BrewingStandMenu;
 import net.minecraft.world.inventory.EnchantmentMenu;
 import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.EnchantedBookItem;
 import net.minecraft.world.item.HoeItem;
 import net.minecraft.world.item.Item;
@@ -52,6 +60,7 @@ import net.minecraft.world.item.alchemy.PotionContents;
 import net.minecraft.world.item.alchemy.Potions;
 import net.minecraft.world.item.component.CustomData;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.BambooSaplingBlock;
 import net.minecraft.world.level.block.BambooStalkBlock;
 import net.minecraft.world.level.block.BeehiveBlock;
 import net.minecraft.world.level.block.Block;
@@ -59,11 +68,15 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.BonemealableBlock;
 import net.minecraft.world.level.block.BushBlock;
 import net.minecraft.world.level.block.CactusBlock;
+import net.minecraft.world.level.block.CakeBlock;
 import net.minecraft.world.level.block.CocoaBlock;
 import net.minecraft.world.level.block.CropBlock;
+import net.minecraft.world.level.block.GrowingPlantBlock;
 import net.minecraft.world.level.block.LeavesBlock;
+import net.minecraft.world.level.block.MangrovePropaguleBlock;
 import net.minecraft.world.level.block.NetherWartBlock;
 import net.minecraft.world.level.block.PumpkinBlock;
+import net.minecraft.world.level.block.SaplingBlock;
 import net.minecraft.world.level.block.StemBlock;
 import net.minecraft.world.level.block.SugarCaneBlock;
 import net.minecraft.world.level.block.SweetBerryBushBlock;
@@ -114,8 +127,10 @@ public final class ProfessionBehaviorListeners {
     // ④/⑤/⑦/⑧ 右键方块前后状态微快照（同一服务端 Tick 末尾比对结算）
     private static final List<PendingRightClickCheck> PENDING_RIGHT_CLICKS = new ArrayList<>();
 
-    // ⑤ 厨师 & ⑧ 魔导师：有界面方块打开期间的容器快照追踪
+    // ⑤ 厨师 & ⑧ 魔导师：有界面方块打开期间的容器快照追踪（且强校验最近右键了已绑定厨具）
     private static final Map<UUID, TrackedMenuSession> OPEN_MENUS = new ConcurrentHashMap<>();
+    private static final Map<UUID, RecentCookingBlockClick> RECENT_COOKING_BLOCK_CLICKS = new ConcurrentHashMap<>();
+    private static final Map<Class<?>, List<String>> CLASS_HIERARCHY_CACHE = new ConcurrentHashMap<>();
 
     // ⑥ 钓鱼：三通道防重与东篱/捕星者钩子追踪
     private static final Map<UUID, Long> LAST_FISH_AWARD_TICK = new ConcurrentHashMap<>();
@@ -127,6 +142,31 @@ public final class ProfessionBehaviorListeners {
     private static volatile boolean optionalHooksRegistered;
 
     private ProfessionBehaviorListeners() {
+    }
+
+    private record RecentCookingBlockClick(String blockId, BlockPos pos, long gameTime) {}
+
+    private static List<String> collectHierarchyNames(Class<?> cls) {
+        return CLASS_HIERARCHY_CACHE.computeIfAbsent(cls, c -> {
+            List<String> names = new ArrayList<>();
+            for (Class<?> cur = c; cur != null && cur != Object.class; cur = cur.getSuperclass()) {
+                names.add(cur.getName().toLowerCase(Locale.ROOT));
+                for (Class<?> iface : cur.getInterfaces()) {
+                    addInterfaceHierarchy(iface, names);
+                }
+            }
+            return List.copyOf(names);
+        });
+    }
+
+    private static void addInterfaceHierarchy(Class<?> iface, List<String> out) {
+        String name = iface.getName().toLowerCase(Locale.ROOT);
+        if (!out.contains(name)) {
+            out.add(name);
+        }
+        for (Class<?> parent : iface.getInterfaces()) {
+            addInterfaceHierarchy(parent, out);
+        }
     }
 
     private static final TagKey<Item> TAG_C_SEEDS = TagKey.create(
@@ -266,12 +306,24 @@ public final class ProfessionBehaviorListeners {
         if (killer == null) {
             return;
         }
+        if (victim == killer || isSummonOrPetOrNpc(victim)) {
+            return;
+        }
+        ResourceLocation victimKey = BuiltInRegistries.ENTITY_TYPE.getKey(victim.getType());
+        String ns = victimKey != null ? victimKey.getNamespace() : "";
+        String path = victimKey != null ? victimKey.getPath() : "";
 
         // A. 敌对怪物或 Boss -> 【战斗】职业
-        boolean isBoss = victim.getMaxHealth() >= 150.0F
-                || victim.getType().is(EntityTypeTags.RAIDERS) && victim.getMaxHealth() >= 80.0F
-                || BuiltInRegistries.ENTITY_TYPE.getKey(victim.getType()).getPath().contains("boss");
-        if (victim instanceof Enemy || isBoss) {
+        boolean isEnemy = victim instanceof Enemy;
+        boolean isBoss = ProfessionOutputFilter.isHostileBossCandidate(
+                ns, path, victim.getMaxHealth(),
+                victim.getType().is(EntityTypeTags.RAIDERS),
+                isEnemy,
+                victim.getType().getCategory().isFriendly(),
+                victim instanceof Animal,
+                victim instanceof AbstractGolem && !isEnemy,
+                false);
+        if (isEnemy || isBoss) {
             float maxHp = Math.max(1.0F, victim.getMaxHealth());
             long baseXp;
             if (maxHp >= 200.0F) {
@@ -332,18 +384,45 @@ public final class ProfessionBehaviorListeners {
         return (double) (threshold * 2 - count) / (double) threshold;
     }
 
-    private static boolean isAdultLivestock(LivingEntity entity) {
-        if (entity instanceof Animal animal) {
-            return !animal.isBaby();
+    private static boolean isSummonOrPetOrNpc(LivingEntity entity) {
+        if (entity == null) {
+            return false;
         }
         ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
-        if (id != null && "flavor_immersed_daily_argo".equals(id.getNamespace())) {
-            String p = id.getPath();
-            return (p.contains("duck") || p.contains("goose") || p.contains("turkey")
-                    || p.contains("pigeon") || p.contains("quail") || p.contains("bullfrog")
-                    || p.contains("bamboo_rat") || p.contains("bamboorat")) && !entity.isBaby();
+        String ns = id != null ? id.getNamespace() : "";
+        String path = id != null ? id.getPath() : "";
+        boolean isTamable = entity instanceof TamableAnimal;
+        boolean isOwnedNonHorse = !(entity instanceof AbstractHorse)
+                && entity instanceof OwnableEntity ownable
+                && ownable.getOwnerUUID() != null;
+        boolean isTamedHorse = entity instanceof AbstractHorse horse && horse.isTamed();
+        boolean isNpc = entity instanceof Npc;
+        return ProfessionOutputFilter.isSummonOrPetOrNpc(
+                ns, path, isTamable, isOwnedNonHorse, isTamedHorse, isNpc,
+                collectHierarchyNames(entity.getClass()));
+    }
+
+    private static boolean isAdultLivestock(LivingEntity entity) {
+        if (entity == null || entity.isBaby() || isSummonOrPetOrNpc(entity)) {
+            return false;
         }
-        return false;
+        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
+        String ns = id != null ? id.getNamespace() : "";
+        String path = id != null ? id.getPath() : "";
+        boolean fidaLoaded = ModList.get().isLoaded("flavor_immersed_daily_argo");
+        return ProfessionOutputFilter.isAdultButcherLivestockId(
+                ns, path, entity instanceof Animal, fidaLoaded);
+    }
+
+    private static boolean isBreedableLivestock(LivingEntity entity) {
+        if (entity == null || isSummonOrPetOrNpc(entity)) {
+            return false;
+        }
+        ResourceLocation id = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
+        String ns = id != null ? id.getNamespace() : "";
+        String path = id != null ? id.getPath() : "";
+        return ProfessionOutputFilter.isBreedableLivestockId(
+                ns, path, entity instanceof Animal);
     }
 
     // =========================================================================
@@ -562,7 +641,7 @@ public final class ProfessionBehaviorListeners {
             return;
         }
         ServerPlayer sp = RealPlayerGuard.asRealSurvivalPlayer(event.getCausedByPlayer());
-        if (sp != null) {
+        if (sp != null && isBreedableLivestock(event.getParentA())) {
             ProfessionManager.grantXp(sp, ProfessionConfig.FARMING, 12L, "breed_animal");
         }
     }
@@ -625,6 +704,9 @@ public final class ProfessionBehaviorListeners {
 
         ProfessionConfig cfg = ProfessionConfig.get();
         boolean isCooking = cfg.isCookingBlockBound(blockId);
+        if (isCooking) {
+            RECENT_COOKING_BLOCK_CLICKS.put(sp.getUUID(), new RecentCookingBlockClick(blockId, pos, level.getGameTime()));
+        }
         boolean isBartending = cfg.isBartendingBlockBound(blockId);
         boolean isAlchCauldron = "irons_spellbooks:alchemist_cauldron".equals(blockId);
 
@@ -664,7 +746,39 @@ public final class ProfessionBehaviorListeners {
         }
     }
 
+    private static boolean hasFruitingBooleanProperty(BlockState state) {
+        for (Property<?> prop : state.getProperties()) {
+            if (prop instanceof BooleanProperty) {
+                String name = prop.getName().toLowerCase(Locale.ROOT);
+                if (name.equals("berries") || name.equals("has_fruit") || name.equals("ripe")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isNonCropStageOrFruitBlock(Block block, BlockState state) {
+        if (block instanceof SaplingBlock
+                || block instanceof MangrovePropaguleBlock
+                || block instanceof BambooSaplingBlock
+                || block instanceof CactusBlock
+                || block instanceof SugarCaneBlock
+                || block instanceof BambooStalkBlock) {
+            return true;
+        }
+        if (block instanceof GrowingPlantBlock && !hasFruitingBooleanProperty(state)) {
+            return true;
+        }
+        ResourceLocation id = BuiltInRegistries.BLOCK.getKey(block);
+        String blockId = id != null ? id.toString() : "";
+        return ProfessionOutputFilter.isNonCropStageOrFruitBlockName(blockId, block.getClass().getName());
+    }
+
     private static boolean isCropLikeBlock(Block block, BlockState state) {
+        if (isNonCropStageOrFruitBlock(block, state)) {
+            return false;
+        }
         return block instanceof CropBlock
                 || block instanceof BushBlock
                 || block instanceof StemBlock
@@ -775,10 +889,20 @@ public final class ProfessionBehaviorListeners {
      * 通吃原版 + harvest_with_ease + 森罗架子作物 + 丰饶果树/茶树 + 东篱果树菌木 + 农夫乐事！
      */
     private static int extractMaturityScore(BlockState state) {
+        if (isNonCropStageOrFruitBlock(state.getBlock(), state)) {
+            return -1;
+        }
         // 先调用 CropBlock.isMaxAge，兼容如南山作物复用原版 AGE(0..7) 但覆写 getMaxAge()=3/4 的方块
         if (state.getBlock() instanceof CropBlock crop) {
             int max = Math.max(1, crop.getMaxAge());
             return crop.isMaxAge(state) ? 100 : (crop.getAge(state) * 90 / max);
+        }
+        for (Property<?> prop : state.getProperties()) {
+            String name = prop.getName().toLowerCase(Locale.ROOT);
+            if (prop instanceof BooleanProperty boolProp
+                    && (name.equals("berries") || name.equals("has_fruit") || name.equals("ripe"))) {
+                return Boolean.TRUE.equals(state.getValue(boolProp)) ? 100 : 0;
+            }
         }
         for (Property<?> prop : state.getProperties()) {
             String name = prop.getName().toLowerCase(Locale.ROOT);
@@ -789,9 +913,6 @@ public final class ProfessionBehaviorListeners {
                 if (max > 0) {
                     return cur >= max ? 100 : (cur * 90 / max);
                 }
-            } else if (prop instanceof BooleanProperty boolProp
-                    && (name.equals("berries") || name.equals("has_fruit") || name.equals("ripe"))) {
-                return Boolean.TRUE.equals(state.getValue(boolProp)) ? 100 : 0;
             }
         }
         return -1;
@@ -834,6 +955,9 @@ public final class ProfessionBehaviorListeners {
             }
             return;
         }
+        if (menu instanceof AbstractFurnaceMenu) {
+            return;
+        }
         String menuCls = menu.getClass().getName();
         if ("io.redspace.ironsspellbooks.gui.arcane_anvil.ArcaneAnvilMenu".equals(menuCls)) {
             TrackedMenuSession sess = new TrackedMenuSession(menu.containerId, "arcane_anvil", "irons_spellbooks:arcane_anvil", Map.of());
@@ -844,11 +968,28 @@ public final class ProfessionBehaviorListeners {
             OPEN_MENUS.put(sp.getUUID(), sess);
             return;
         }
-        // 若是刚通过右键绑定做饭方块打开的非原版熔炉自定义厨具菜单（如 fidworkblock CookingMenu、bakeries、hotpot）
-        if (isLikelyModCookingMenu(menuCls)) {
-            OPEN_MENUS.put(sp.getUUID(), new TrackedMenuSession(
-                    menu.containerId, "cooking", menuCls, snapshotPlayerItems(sp)));
+        RecentCookingBlockClick recentClick = RECENT_COOKING_BLOCK_CLICKS.remove(sp.getUUID());
+        if (recentClick == null
+                || !ProfessionOutputFilter.isAllowedModCookingMenu(menuCls)
+                || !(sp.level() instanceof ServerLevel serverLevel)) {
+            return;
         }
+        long ageTicks = Math.abs(serverLevel.getGameTime() - recentClick.gameTime());
+        if (ageTicks > 5L || sp.blockPosition().distSqr(recentClick.pos()) > 100.0D) {
+            return;
+        }
+        // 仅当玩家 5 tick 内亲自右键过已绑定厨具，且菜单属于白名单厨具类时才追踪
+        Map<String, Integer> baseline = snapshotPlayerItems(sp);
+        for (Slot slot : menu.slots) {
+            if (slot.container != sp.getInventory() && slot.hasItem()) {
+                ItemStack slotStack = slot.getItem();
+                if (slot.mayPlace(slotStack)) {
+                    accumulateForSnapshot(baseline, slotStack);
+                }
+            }
+        }
+        OPEN_MENUS.put(sp.getUUID(), new TrackedMenuSession(
+                menu.containerId, "cooking", recentClick.blockId(), baseline));
     }
 
     @SubscribeEvent
@@ -859,20 +1000,6 @@ public final class ProfessionBehaviorListeners {
                 settleMenuCookingDelta(sp, sess);
             }
         }
-    }
-
-    private static boolean isLikelyModCookingMenu(String menuClassName) {
-        String lower = menuClassName.toLowerCase(Locale.ROOT);
-        return lower.startsWith("com.fidtest.")
-                || lower.contains("bakeries")
-                || lower.contains("hotpot")
-                || lower.contains("bountifulfares")
-                || lower.contains("baishi")
-                || lower.contains("kaleidoscope")
-                || lower.contains("flavor_immersed")
-                || lower.contains("farmersdelight")
-                || lower.contains("cooking")
-                || lower.contains("brewinandchewin");
     }
 
     private static void settleMenuCookingDelta(ServerPlayer sp, TrackedMenuSession sess) {
@@ -1013,7 +1140,8 @@ public final class ProfessionBehaviorListeners {
             // A. 右键采摘成熟农作物 / 果树 / 茶树 / 葡萄架（同方块生长阶段从满熟回落）
             if (!check.areaHarvestTargets().containsKey(check.pos())
                     && check.beforeMaturityScore() >= 100
-                    && afterBlockId.equals(check.blockId())) {
+                    && afterBlockId.equals(check.blockId())
+                    && isCropLikeBlock(afterState.getBlock(), afterState)) {
                 int afterMaturity = extractMaturityScore(afterState);
                 if (afterMaturity >= 0 && afterMaturity < check.beforeMaturityScore()) {
                     ProfessionManager.grantXp(sp, ProfessionConfig.FARMING, 4L, "right_click_harvest");
@@ -1219,7 +1347,43 @@ public final class ProfessionBehaviorListeners {
         }
         ResourceLocation id = BuiltInRegistries.ITEM.getKey(stack.getItem());
         return id != null && ProfessionOutputFilter.isEligibleCookedDishForXp(
-                id.getNamespace(), id.getPath(), stack.has(DataComponents.FOOD));
+                id.getNamespace(), id.getPath(), hasFoodOrPlaceableDishFeature(stack));
+    }
+
+    private static boolean hasFoodOrPlaceableDishFeature(ItemStack stack) {
+        if (stack.has(DataComponents.FOOD)) {
+            return true;
+        }
+        CustomData cd = stack.get(DataComponents.CUSTOM_DATA);
+        if (cd != null && !cd.isEmpty() && cd.copyTag().contains("WokDish", CompoundTag.TAG_COMPOUND)) {
+            return true;
+        }
+        return isPlaceableFoodBlockItem(stack.getItem());
+    }
+
+    private static boolean isPlaceableFoodBlockItem(Item item) {
+        if (!(item instanceof BlockItem blockItem)) {
+            return false;
+        }
+        Block block = blockItem.getBlock();
+        if (block instanceof CakeBlock) {
+            return true;
+        }
+        for (String clsName : collectHierarchyNames(block.getClass())) {
+            int dot = clsName.lastIndexOf('.');
+            String simple = dot >= 0 ? clsName.substring(dot + 1) : clsName;
+            if (simple.contains("feast")
+                    || simple.contains("cake")
+                    || simple.equals("pieblock")
+                    || simple.endsWith("pieblock")
+                    || simple.contains("foodblock")
+                    || simple.contains("dish")
+                    || simple.contains("dessert")
+                    || simple.contains("edible")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isEligibleBartendingOutputForXp(ItemStack stack) {

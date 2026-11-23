@@ -3,6 +3,8 @@ package cn.autoforged.module_shop.shop;
 import cn.autoforged.module_shop.Config;
 import cn.autoforged.module_shop.ModuleShopMod;
 import cn.autoforged.module_shop.admin.AdminEditType;
+import cn.autoforged.module_shop.config.ShopTemplateStore;
+import cn.autoforged.module_shop.config.TemplateTransferManager;
 import cn.autoforged.module_shop.data.ActivityDay;
 import cn.autoforged.module_shop.data.AuctionEntry;
 import cn.autoforged.module_shop.data.ConfiguredOffer;
@@ -13,10 +15,13 @@ import cn.autoforged.module_shop.data.ExchangeEntry;
 import cn.autoforged.module_shop.data.MailEntry;
 import cn.autoforged.module_shop.data.MailType;
 import cn.autoforged.module_shop.data.MallItem;
+import cn.autoforged.module_shop.data.SupplyMode;
 import cn.autoforged.module_shop.data.MallPurchase;
 import cn.autoforged.module_shop.data.ShippingBin;
 import cn.autoforged.module_shop.data.NotificationType;
 import cn.autoforged.module_shop.data.PlayerAccount;
+import cn.autoforged.module_shop.data.PriceSpec;
+import cn.autoforged.module_shop.data.PriceSpec.CurrencyMode;
 import cn.autoforged.module_shop.data.Rarity;
 import cn.autoforged.module_shop.data.RedeemCode;
 import cn.autoforged.module_shop.data.ShopNbt;
@@ -25,13 +30,29 @@ import cn.autoforged.module_shop.data.SidebarLayout;
 import cn.autoforged.module_shop.data.SignInData;
 import cn.autoforged.module_shop.data.StallEntry;
 import cn.autoforged.module_shop.data.TransactionEntry;
+import cn.autoforged.module_shop.eco.ClearingHouse;
+import cn.autoforged.module_shop.eco.EcoPricing;
 import cn.autoforged.module_shop.menu.BatchAddMenu;
 import cn.autoforged.module_shop.menu.DepositMenu;
 import cn.autoforged.module_shop.menu.GrantMenu;
 import cn.autoforged.module_shop.menu.ShippingBinMenu;
+import cn.autoforged.module_shop.shop.auth.AdminAuthService;
+import cn.autoforged.module_shop.shop.currency.CurrencySettlement;
+import cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig;
+import cn.autoforged.module_shop.shop.currency.PhysicalCurrencyEngine;
 import cn.autoforged.module_shop.shop.mail.MailTemplates;
+import cn.autoforged.module_shop.shop.media.ShopMediaStore;
 import cn.autoforged.module_shop.network.payload.ClientboundShopSyncPayload;
 import cn.autoforged.module_shop.sound.ModSounds;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -42,12 +63,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import net.neoforged.fml.loading.FMLPaths;
 import net.minecraft.ChatFormatting;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.StringTag;
+import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
@@ -117,6 +140,326 @@ public final class ShopManager {
         return ShopSavedData.get(server);
     }
 
+    private static final Gson BRAND_GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+    private static final String BRAND_DEFAULT_FILE = "brand_default.json";
+
+    public static boolean canEditAdmin(@Nullable ServerPlayer player) {
+        return AdminAuthService.canEditAdmin(player);
+    }
+
+    public static void promptAdminAuth(@Nullable ServerPlayer player) {
+        if (player == null) {
+            return;
+        }
+        CompoundTag out = new CompoundTag();
+        out.putString("reasonKey", "msg.module_shop.auth_required");
+        out.putBoolean("adminLockEnabled", AdminAuthService.isLockEnabled());
+        out.putBoolean("adminUnlocked", player.hasPermissions(2) && AdminAuthService.isUnlocked(player));
+        out.putInt("retryAfterSeconds", AdminAuthService.remainingCooldownSeconds(player));
+        sendSpecial(player, "admin_auth_prompt", out);
+    }
+
+    private static boolean requireUnlockedAdmin(@Nullable ServerPlayer player) {
+        if (player == null || !player.hasPermissions(2)) {
+            return false;
+        }
+        if (!AdminAuthService.isUnlocked(player)) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.auth_required")
+                    .withStyle(ChatFormatting.RED));
+            promptAdminAuth(player);
+            return false;
+        }
+        return true;
+    }
+
+    public static void sendSpecial(ServerPlayer player, String kind, @Nullable CompoundTag extra) {
+        if (player == null || kind == null || kind.isBlank()) {
+            return;
+        }
+        CompoundTag out = extra == null ? new CompoundTag() : extra.copy();
+        out.putString("kind", kind);
+        ClientboundShopSyncPayload.send(player, out);
+    }
+
+    public static void refreshAllClients(MinecraftServer server, @Nullable ShopSavedData data) {
+        if (server == null) {
+            return;
+        }
+        if (data != null) {
+            loadBrandDefaultIfBlank(data.sidebarLayout);
+        }
+        broadcastSnapshots(server);
+        broadcastSidebarLayout(server);
+    }
+
+    private static Path brandDefaultFile() {
+        return FMLPaths.CONFIGDIR.get().resolve(ShopTemplateStore.DIR_NAME).resolve(BRAND_DEFAULT_FILE);
+    }
+
+    public static void saveBrandDefault(@Nullable SidebarLayout layout) {
+        if (layout == null) {
+            return;
+        }
+        Path file = brandDefaultFile();
+        try {
+            Files.createDirectories(file.getParent());
+            JsonObject obj = new JsonObject();
+            String title = layout.shopTitle();
+            obj.addProperty("shopTitle", title == null ? "" : title);
+            obj.addProperty("brandIconId", layout.brandIconId());
+            Path tmp = file.resolveSibling(BRAND_DEFAULT_FILE + ".tmp");
+            Files.writeString(tmp, BRAND_GSON.toJson(obj), StandardCharsets.UTF_8);
+            try {
+                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException ex) {
+                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (Throwable ex) {
+            org.slf4j.LoggerFactory.getLogger("module_shop")
+                    .warn("[ModuleShop] 写入 {} 失败：{}", BRAND_DEFAULT_FILE, ex.toString());
+        }
+    }
+
+    public static void loadBrandDefaultIfBlank(@Nullable SidebarLayout layout) {
+        if (layout == null) {
+            return;
+        }
+        boolean needTitle = layout.shopTitle() == null;
+        boolean needIcon = layout.brandIconId().isBlank();
+        if (!needTitle && !needIcon) {
+            return;
+        }
+        Path file = brandDefaultFile();
+        try {
+            if (!Files.isRegularFile(file)) {
+                return;
+            }
+            String raw = Files.readString(file, StandardCharsets.UTF_8);
+            if (raw.startsWith("\uFEFF")) {
+                raw = raw.substring(1);
+            }
+            var elem = JsonParser.parseString(raw);
+            if (!elem.isJsonObject()) {
+                return;
+            }
+            JsonObject obj = elem.getAsJsonObject();
+            if (needTitle && obj.has("shopTitle") && obj.get("shopTitle").isJsonPrimitive()) {
+                String savedTitle = obj.get("shopTitle").getAsString();
+                if (savedTitle != null && !savedTitle.isBlank()) {
+                    layout.setShopTitle(savedTitle);
+                }
+            }
+            if (needIcon && obj.has("brandIconId") && obj.get("brandIconId").isJsonPrimitive()) {
+                String savedIcon = obj.get("brandIconId").getAsString();
+                if (ShopMediaStore.isValidId(savedIcon == null ? "" : savedIcon.trim())) {
+                    layout.setBrandIconId(savedIcon);
+                }
+            }
+        } catch (Throwable ex) {
+            org.slf4j.LoggerFactory.getLogger("module_shop")
+                    .warn("[ModuleShop] 读取 {} 失败：{}", BRAND_DEFAULT_FILE, ex.toString());
+        }
+    }
+
+    private static void adminAuthUnlock(ServerPlayer player, CompoundTag tag) {
+        if (player == null || !player.hasPermissions(2)) {
+            return;
+        }
+        String password = tag == null ? "" : tag.getString("password");
+        AdminAuthService.UnlockOutcome outcome = AdminAuthService.tryUnlock(player, password);
+        CompoundTag out = new CompoundTag();
+        out.putString("mode", "unlock");
+        out.putBoolean("ok", outcome.ok());
+        out.putString("errorKey", outcome.errorKey());
+        out.putInt("retryAfterSeconds", outcome.retryAfterSeconds());
+        out.putBoolean("adminLockEnabled", AdminAuthService.isLockEnabled());
+        out.putBoolean("adminUnlocked", AdminAuthService.isUnlocked(player));
+        out.putInt("adminSessionTimeout", AdminAuthService.sessionTimeoutMinutes());
+        sendSpecial(player, "admin_auth_result", out);
+        if (outcome.ok()) {
+            sendSnapshot(player, null, true);
+            notifyPlayer(player, Component.translatable("msg.module_shop.auth_ok")
+                    .withStyle(ChatFormatting.GREEN));
+        }
+    }
+
+    private static void adminAuthLock(ServerPlayer player) {
+        if (player == null || !player.hasPermissions(2)) {
+            return;
+        }
+        AdminAuthService.lockPlayer(player.getUUID());
+        CompoundTag out = new CompoundTag();
+        out.putString("mode", "lock");
+        out.putBoolean("ok", true);
+        out.putString("errorKey", "");
+        out.putInt("retryAfterSeconds", 0);
+        out.putBoolean("adminLockEnabled", AdminAuthService.isLockEnabled());
+        out.putBoolean("adminUnlocked", AdminAuthService.isUnlocked(player));
+        out.putInt("adminSessionTimeout", AdminAuthService.sessionTimeoutMinutes());
+        sendSpecial(player, "admin_auth_result", out);
+        sendSnapshot(player, null, true);
+        notifyPlayer(player, Component.translatable("msg.module_shop.auth_locked")
+                .withStyle(ChatFormatting.YELLOW));
+    }
+
+    private static void adminAuthConfigure(ServerPlayer player, CompoundTag tag) {
+        if (player == null || !player.hasPermissions(2) || tag == null) {
+            return;
+        }
+        boolean enable = tag.getBoolean("enable");
+        String currentPassword = tag.getString("currentPassword");
+        String newPassword = tag.getString("newPassword");
+        int timeoutMinutes = tag.contains("timeoutMinutes")
+                ? tag.getInt("timeoutMinutes")
+                : AdminAuthService.sessionTimeoutMinutes();
+        AdminAuthService.SaveAuthOutcome res = AdminAuthService.configure(
+                player, enable, currentPassword, newPassword, timeoutMinutes);
+        CompoundTag out = new CompoundTag();
+        out.putString("mode", "configure");
+        out.putBoolean("ok", res.ok());
+        out.putString("errorKey", res.errorKey());
+        out.putInt("retryAfterSeconds", 0);
+        out.putBoolean("adminLockEnabled", AdminAuthService.isLockEnabled());
+        out.putBoolean("adminUnlocked", AdminAuthService.isUnlocked(player));
+        out.putInt("adminSessionTimeout", AdminAuthService.sessionTimeoutMinutes());
+        sendSpecial(player, "admin_auth_result", out);
+        if (res.ok()) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.auth_saved")
+                    .withStyle(ChatFormatting.GREEN));
+            for (ServerPlayer online : player.server.getPlayerList().getPlayers()) {
+                if (online.hasPermissions(2)) {
+                    sendSnapshot(online, null, true);
+                }
+            }
+        }
+    }
+
+    private static void adminMediaUpload(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player) || tag == null) {
+            return;
+        }
+        String purpose = tag.getString("purpose");
+        String requestId = tag.getString("requestId");
+        byte[] bytes = tag.getByteArray("bytes");
+        ShopMediaStore.SaveResult res = ShopMediaStore.saveVerified(bytes);
+        CompoundTag out = new CompoundTag();
+        out.putBoolean("ok", res.ok());
+        out.putString("errorKey", res.errorKey());
+        out.putString("purpose", purpose);
+        out.putString("requestId", requestId);
+        if (res.ok() && res.meta() != null) {
+            out.putString("id", res.meta().id());
+            out.putInt("width", res.meta().width());
+            out.putInt("height", res.meta().height());
+            notifyPlayer(player, Component.translatable("msg.module_shop.media_upload_ok")
+                    .withStyle(ChatFormatting.GREEN));
+        } else {
+            out.putString("id", "");
+            out.putInt("width", 0);
+            out.putInt("height", 0);
+            notifyPlayer(player, Component.translatable("msg.module_shop.media_bad_image")
+                    .withStyle(ChatFormatting.RED));
+        }
+        sendSpecial(player, "media_uploaded", out);
+    }
+
+    private static void adminShopIconSet(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player) || tag == null) {
+            return;
+        }
+        String mediaId = tag.getString("mediaId").trim().toLowerCase(java.util.Locale.ROOT);
+        if (mediaId.isEmpty() && tag.contains("icon", Tag.TAG_BYTE_ARRAY)) {
+            byte[] iconBytes = tag.getByteArray("icon");
+            if (iconBytes.length > 0) {
+                ShopMediaStore.SaveResult saved = ShopMediaStore.saveVerified(iconBytes);
+                if (!saved.ok() || saved.meta() == null) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.media_bad_image")
+                            .withStyle(ChatFormatting.RED));
+                    return;
+                }
+                mediaId = saved.meta().id();
+            }
+        }
+        if (!mediaId.isEmpty()) {
+            if (!ShopMediaStore.isValidId(mediaId) || ShopMediaStore.readMeta(mediaId) == null) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.media_bad_image")
+                        .withStyle(ChatFormatting.RED));
+                return;
+            }
+        }
+        ShopSavedData data = data(player.server);
+        boolean editing = layoutEditing(player);
+        SidebarLayout target = editing ? layoutDraft(data, player).layout : data.sidebarLayout;
+        target.setBrandIconId(mediaId);
+        if (!editing) {
+            data.setDirty();
+            saveBrandDefault(data.sidebarLayout);
+        }
+        pushLayoutTo(player);
+        notifyPlayer(player, Component.translatable("msg.module_shop.brand_saved")
+                .withStyle(ChatFormatting.GREEN));
+    }
+
+    private static void handleMediaFetch(ServerPlayer player, CompoundTag tag) {
+        if (player == null || tag == null) {
+            return;
+        }
+        String id = tag.getString("id").trim().toLowerCase(java.util.Locale.ROOT);
+        CompoundTag out = new CompoundTag();
+        out.putString("id", id);
+        if (!ShopMediaStore.isValidId(id)) {
+            out.putBoolean("ok", false);
+            out.putInt("width", 0);
+            out.putInt("height", 0);
+            out.putString("mime", "");
+            out.putByteArray("bytes", new byte[0]);
+            out.putString("errorKey", "bad_image");
+            sendSpecial(player, "media_data", out);
+            return;
+        }
+        ShopMediaStore.MediaMeta meta = ShopMediaStore.readMeta(id);
+        byte[] bytes = meta == null ? null : ShopMediaStore.readBytes(id);
+        if (meta == null || bytes == null || bytes.length == 0) {
+            out.putBoolean("ok", false);
+            out.putInt("width", 0);
+            out.putInt("height", 0);
+            out.putString("mime", "");
+            out.putByteArray("bytes", new byte[0]);
+            out.putString("errorKey", "missing");
+            sendSpecial(player, "media_data", out);
+            return;
+        }
+        out.putBoolean("ok", true);
+        out.putInt("width", meta.width());
+        out.putInt("height", meta.height());
+        out.putString("mime", meta.mime());
+        out.putByteArray("bytes", bytes);
+        out.putString("errorKey", "");
+        sendSpecial(player, "media_data", out);
+    }
+
+    private static int parseOptionalNonNegativeInt(ServerPlayer player, CompoundTag tag, String key) {
+        String raw = tag == null || !tag.contains(key) ? "" : tag.getString(key).trim();
+        if (raw.isEmpty() || "0".equals(raw)) {
+            return 0;
+        }
+        try {
+            long val = Long.parseLong(raw);
+            if (val < 0L || val > 1_000_000_000L) {
+                notifyPlayer(player, Component.translatableWithFallback(
+                        "msg.module_shop.invalid_daily_max", "每日出货上限无效：请留空或填 0 及以上的整数")
+                        .withStyle(ChatFormatting.RED));
+                return -1;
+            }
+            return (int) val;
+        } catch (NumberFormatException ex) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.invalid_daily_max", "每日出货上限无效：请留空或填 0 及以上的整数")
+                    .withStyle(ChatFormatting.RED));
+            return -1;
+        }
+    }
+
     /**
      * 现实时间日：需求明确“每日0点”指现实时间，因此以服务器本地日历日（LocalDate）为准，
      * 在本地时间午夜切换，而不是按游戏内天数（24000 tick）。
@@ -152,6 +495,8 @@ public final class ShopManager {
             generateDailyShop(player, account, data);
             dirty = true;
             shopRefreshed = true;
+        } else if (syncDailyShopWithPool(player, account, data)) {
+            dirty = true;
         }
         if (account.dailyBuybackDay != day) {
             account.dailyBuybackDay = day;
@@ -162,6 +507,8 @@ public final class ShopManager {
             generateDailyBuyback(player, account, data);
             dirty = true;
             buybackRefreshed = true;
+        } else if (syncDailyBuybackWithPool(player, account, data)) {
+            dirty = true;
         }
         if (dirty) {
             data.setDirty();
@@ -227,7 +574,7 @@ public final class ShopManager {
             }
             chosen.add(picked.stack.getItem());
             usedByRarity.merge(picked.rarity, 1, Integer::sum);
-            DailyShopEntry entry = new DailyShopEntry(picked.stack.copy(), picked.price, picked.rarity);
+            DailyShopEntry entry = new DailyShopEntry(picked.stack.copy(), picked.resolvePriceSpec(), picked.rarity);
             // 需求 7/11：每个物品各自的购买上限来自管理员配置的数量。
             entry.limit = Math.max(1, picked.amountOr(picked.rarity.purchaseLimit()));
             account.dailyShop.add(entry);
@@ -239,7 +586,7 @@ public final class ShopManager {
     }
 
     /** 按指定权重（传说/史诗/稀有/普通）抽品质；权重全为 0 时退回配置权重。 */
-    private static Rarity rollRarity(RandomSource random, List<Rarity> available, int[] weights) {
+    public static Rarity rollRarity(RandomSource random, List<Rarity> available, int[] weights) {
         int total = 0;
         for (Rarity rarity : available) {
             total += Math.max(0, weightOf(rarity, weights));
@@ -270,7 +617,7 @@ public final class ShopManager {
     }
 
     /** 每日收购用：池子里出现过的品质列表。 */
-    private static List<Rarity> raritiesOf(List<ConfiguredOffer> pool) {
+    public static List<Rarity> raritiesOf(List<ConfiguredOffer> pool) {
         List<Rarity> list = new ArrayList<>();
         for (ConfiguredOffer offer : pool) {
             if (!list.contains(offer.rarity)) {
@@ -281,7 +628,7 @@ public final class ShopManager {
     }
 
     private static DailyShopEntry shopEntryOf(ConfiguredOffer picked) {
-        DailyShopEntry entry = new DailyShopEntry(picked.stack.copy(), picked.price, picked.rarity);
+        DailyShopEntry entry = new DailyShopEntry(picked.stack.copy(), picked.resolvePriceSpec(), picked.rarity);
         entry.limit = Math.max(1, picked.amountOr(picked.rarity.purchaseLimit()));
         return entry;
     }
@@ -332,6 +679,246 @@ public final class ShopManager {
         }
     }
 
+    private static DailyBuybackEntry buybackEntryOf(ConfiguredOffer picked) {
+        return buybackEntryOf(picked, picked.resolvePriceSpec());
+    }
+
+    public static DailyBuybackEntry buybackEntryOf(ConfiguredOffer picked, PriceSpec spec) {
+        DailyBuybackEntry entry = new DailyBuybackEntry(picked.stack.copy(), spec);
+        entry.rarity = picked.rarity == null ? Rarity.COMMON : picked.rarity;
+        entry.limit = Math.max(1, picked.amountOr(Config.INSTANCE.buybackCapacity.get()));
+        return entry;
+    }
+
+    static void applyBuybackGuarantee(RandomSource random, List<DailyBuybackEntry> entries,
+            List<ConfiguredOffer> pool, int[] guarantee) {
+        applyBuybackGuarantee(random, entries, pool, guarantee, ConfiguredOffer::resolvePriceSpec);
+    }
+
+    public static void applyBuybackGuarantee(RandomSource random, List<DailyBuybackEntry> entries,
+            List<ConfiguredOffer> pool, int[] guarantee,
+            java.util.function.Function<ConfiguredOffer, PriceSpec> specResolver) {
+        Rarity[] order = {Rarity.RARE, Rarity.EPIC, Rarity.LEGENDARY};
+        for (int i = 0; i < order.length && i < guarantee.length; i++) {
+            int need = Math.max(0, guarantee[i]);
+            if (need <= 0) {
+                continue;
+            }
+            Rarity rarity = order[i];
+            long have = 0L;
+            for (DailyBuybackEntry entry : entries) {
+                if (entry.rarity == rarity) {
+                    have++;
+                }
+            }
+            while (have < need) {
+                List<ConfiguredOffer> candidates = new ArrayList<>();
+                for (ConfiguredOffer offer : pool) {
+                    if (offer.rarity == rarity && !offer.stack.isEmpty()
+                            && !containsBuybackStack(entries, offer.stack)) {
+                        candidates.add(offer);
+                    }
+                }
+                if (candidates.isEmpty()) {
+                    break;
+                }
+                ConfiguredOffer picked = pick(random, candidates);
+                if (picked == null) {
+                    break;
+                }
+                PriceSpec spec = specResolver.apply(picked);
+                if (spec == null || !spec.isValid()) {
+                    break;
+                }
+                boolean replaced = false;
+                for (int k = entries.size() - 1; k >= 0; k--) {
+                    if (entries.get(k).rarity == Rarity.COMMON) {
+                        entries.set(k, buybackEntryOf(picked, spec));
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced && entries.size() < MAX_DAILY_SLOTS) {
+                    entries.add(buybackEntryOf(picked, spec));
+                }
+                have++;
+            }
+        }
+    }
+
+    private static boolean containsShopStack(List<DailyShopEntry> entries, ItemStack stack) {
+        for (DailyShopEntry entry : entries) {
+            if (!entry.stack.isEmpty() && ItemStack.isSameItemSameComponents(entry.stack, stack)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static boolean containsBuybackStack(List<DailyBuybackEntry> entries, ItemStack stack) {
+        for (DailyBuybackEntry entry : entries) {
+            if (!entry.stack.isEmpty() && ItemStack.isSameItemSameComponents(entry.stack, stack)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 同日增量同步（每日商店）：移除已被管理员从池中删除的条目（保留其余卡牌翻面下标），
+     * 并在玩家当日槽位未满（如管理员先清空池再上架、或池内新增条目且未达上限）时自动补齐。
+     */
+    private static boolean syncDailyShopWithPool(ServerPlayer player, PlayerAccount account, ShopSavedData data) {
+        boolean changed = false;
+        int targetSlots = Math.max(0, Math.min(MAX_DAILY_SLOTS, data.shopSlotCount));
+        if (targetSlots == 0) {
+            if (!account.dailyShop.isEmpty() || !account.dailyFlipped.isEmpty()) {
+                account.dailyShop.clear();
+                account.dailyFlipped.clear();
+                return true;
+            }
+            return false;
+        }
+        if (!account.dailyShop.isEmpty()) {
+            List<DailyShopEntry> kept = new ArrayList<>(account.dailyShop.size());
+            Set<Integer> newFlipped = new HashSet<>();
+            for (int i = 0; i < account.dailyShop.size(); i++) {
+                DailyShopEntry entry = account.dailyShop.get(i);
+                if (findOffer(data.shopPool, entry.stack) != null) {
+                    if (account.dailyFlipped.contains(i)) {
+                        newFlipped.add(kept.size());
+                    }
+                    kept.add(entry);
+                } else {
+                    changed = true;
+                }
+            }
+            if (changed) {
+                account.dailyShop.clear();
+                account.dailyShop.addAll(kept);
+                account.dailyFlipped.clear();
+                account.dailyFlipped.addAll(newFlipped);
+            }
+        }
+        if (account.dailyShop.isEmpty()) {
+            if (!data.shopPool.isEmpty()) {
+                generateDailyShop(player, account, data);
+                if (!account.dailyShop.isEmpty()) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        if (account.dailyShop.size() < targetSlots && !data.shopPool.isEmpty()) {
+            List<ConfiguredOffer> freshPool = new ArrayList<>();
+            for (ConfiguredOffer offer : data.shopPool) {
+                if (!offer.stack.isEmpty() && offer.resolvePriceSpec().isValid()
+                        && !containsShopStack(account.dailyShop, offer.stack)) {
+                    freshPool.add(offer);
+                }
+            }
+            RandomSource random = player.getRandom();
+            while (account.dailyShop.size() < targetSlots && !freshPool.isEmpty()) {
+                List<Rarity> avail = raritiesOf(freshPool);
+                Rarity want = rollRarity(random, avail.isEmpty() ? List.of(Rarity.COMMON) : avail, data.shopWeights);
+                List<ConfiguredOffer> ofRarity = new ArrayList<>();
+                for (ConfiguredOffer offer : freshPool) {
+                    if (offer.rarity == want) {
+                        ofRarity.add(offer);
+                    }
+                }
+                ConfiguredOffer picked = pick(random, ofRarity.isEmpty() ? freshPool : ofRarity);
+                if (picked == null) {
+                    break;
+                }
+                freshPool.removeIf(o -> ItemStack.isSameItemSameComponents(o.stack, picked.stack));
+                account.dailyShop.add(shopEntryOf(picked));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * 同日增量同步（每日收购）：移除已从收购池删除或触发防套利拦截的条目，
+     * 并在玩家当日收购清单未满（如空池先登后摆、或池子条目数 <= 槽位上限时新增收购品）时实时补齐给所有玩家。
+     */
+    private static boolean syncDailyBuybackWithPool(ServerPlayer player, PlayerAccount account, ShopSavedData data) {
+        boolean changed = false;
+        int maxSlots = Math.max(0, Math.min(MAX_DAILY_SLOTS, data.buybackSlotCount));
+        if (maxSlots == 0) {
+            if (!account.dailyBuyback.isEmpty()) {
+                account.dailyBuyback.clear();
+                return true;
+            }
+            return false;
+        }
+        HolderLookup.Provider regs = player.level().registryAccess();
+        if (!account.dailyBuyback.isEmpty()) {
+            boolean removed = account.dailyBuyback.removeIf(entry -> {
+                ConfiguredOffer match = findOffer(data.buybackPool, entry.stack);
+                if (match == null) {
+                    return true;
+                }
+                PriceSpec spec = match.resolvePriceSpec();
+                return !spec.isValid()
+                        || CurrencySettlement.isBlockingBuybackAndShippingForSpec(entry.stack, spec, regs, true);
+            });
+            if (removed) {
+                changed = true;
+            }
+        }
+        if (account.dailyBuyback.isEmpty()) {
+            if (!data.buybackPool.isEmpty()) {
+                generateDailyBuyback(player, account, data);
+                if (!account.dailyBuyback.isEmpty()) {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        if (account.dailyBuyback.size() < maxSlots && !data.buybackPool.isEmpty()) {
+            if (EcoPricing.isEcoActive()) {
+                if (ClearingHouse.topUpDailyBuybackEco(player, account, data, maxSlots)) {
+                    changed = true;
+                }
+                return changed;
+            }
+            List<ConfiguredOffer> freshPool = new ArrayList<>();
+            for (ConfiguredOffer offer : data.buybackPool) {
+                PriceSpec offerSpec = offer.resolvePriceSpec();
+                if (offer.stack.isEmpty() || !offerSpec.isValid()) {
+                    continue;
+                }
+                if (CurrencySettlement.isBlockingBuybackAndShippingForSpec(offer.stack, offerSpec, regs, true)) {
+                    continue;
+                }
+                if (!containsBuybackStack(account.dailyBuyback, offer.stack)) {
+                    freshPool.add(offer);
+                }
+            }
+            RandomSource random = player.getRandom();
+            while (account.dailyBuyback.size() < maxSlots && !freshPool.isEmpty()) {
+                List<Rarity> avail = raritiesOf(freshPool);
+                Rarity want = rollRarity(random, avail.isEmpty() ? List.of(Rarity.COMMON) : avail, data.buybackWeights);
+                List<ConfiguredOffer> ofRarity = new ArrayList<>();
+                for (ConfiguredOffer offer : freshPool) {
+                    if (offer.rarity == want) {
+                        ofRarity.add(offer);
+                    }
+                }
+                ConfiguredOffer picked = pick(random, ofRarity.isEmpty() ? freshPool : ofRarity);
+                if (picked == null) {
+                    break;
+                }
+                freshPool.removeIf(o -> ItemStack.isSameItemSameComponents(o.stack, picked.stack));
+                account.dailyBuyback.add(buybackEntryOf(picked));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     private static void generateDailyBuyback(ServerPlayer player, PlayerAccount account, ShopSavedData data) {
         if (cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
             cn.autoforged.module_shop.eco.ClearingHouse.generateDailyBuybackEco(player, account, data, MAX_DAILY_SLOTS);
@@ -340,7 +927,19 @@ public final class ShopManager {
         if (data.buybackPool.isEmpty()) {
             return;
         }
-        List<ConfiguredOffer> pool = new ArrayList<>(data.buybackPool);
+        List<ConfiguredOffer> pool = new ArrayList<>();
+        HolderLookup.Provider regs = player.level().registryAccess();
+        for (ConfiguredOffer offer : data.buybackPool) {
+            PriceSpec offerSpec = offer.resolvePriceSpec();
+            if (offer.stack.isEmpty() || !offerSpec.isValid()) {
+                continue;
+            }
+            if (CurrencySettlement.isBlockingBuybackAndShippingForSpec(offer.stack, offerSpec, regs, true)) {
+                continue;
+            }
+            pool.add(offer);
+        }
+        List<ConfiguredOffer> eligiblePool = new ArrayList<>(pool);
         RandomSource random = player.getRandom();
         // 上下限由管理员设置（0 ~ 64）：0 = 今天不生成收购需求。
         int slots = Math.min(MAX_DAILY_SLOTS, Math.min(Math.max(0, data.buybackSlotCount), pool.size()));
@@ -359,12 +958,11 @@ public final class ShopManager {
             if (picked == null) {
                 break;
             }
-            pool.remove(picked);
-            DailyBuybackEntry entry = new DailyBuybackEntry(picked.stack.copy(), picked.price);
-            // 需求 6/9：收购品质与可收购数量来自管理员配置。
-            entry.rarity = picked.rarity;
-            entry.limit = Math.max(1, picked.amountOr(Config.INSTANCE.buybackCapacity.get()));
-            account.dailyBuyback.add(entry);
+            pool.removeIf(o -> ItemStack.isSameItemSameComponents(o.stack, picked.stack));
+            account.dailyBuyback.add(buybackEntryOf(picked));
+        }
+        if (slots > 0) {
+            applyBuybackGuarantee(random, account.dailyBuyback, eligiblePool, data.buybackGuarantee);
         }
     }
 
@@ -397,7 +995,7 @@ public final class ShopManager {
     }
 
     @Nullable
-    private static ConfiguredOffer pick(RandomSource random, List<ConfiguredOffer> list) {
+    public static ConfiguredOffer pick(RandomSource random, List<ConfiguredOffer> list) {
         if (list.isEmpty()) {
             return null;
         }
@@ -446,7 +1044,7 @@ public final class ShopManager {
             return;
         }
         HolderLookup.Provider regs = server.registryAccess();
-        long receivedDay = System.currentTimeMillis() / 86_400_000L;
+        long receivedDay = currentDay(server.overworld());
         // 第八轮：一次发放只发**一封**邮件（所有物品装在同一封里），并在 storeMail 里与同渠道未领取的邮件继续合并，
         // 避免"一件物品一封邮件"把邮箱塞满。
         List<ItemStack> draftItems = draft.items();
@@ -628,48 +1226,39 @@ public final class ShopManager {
         return true;
     }
 
-    /** 第七轮：按单封邮件的到期时间清理（占位注释，保留方法顺序便于阅读）。 */
+    /** 每日例行清理：按单封邮件到期时间 + 跨日清理已读/已领过期邮件（玩家摊位到期统一由 {@link #tickStallExpire} 按配置执行）。 */
     public static void tickDaily(MinecraftServer server) {
+        if (server == null) {
+            return;
+        }
         purgeExpiredMails(server);
-        ShopSavedData data = data(server);
-        long day = currentDay(server.overworld());
-        if (data.lastStallClearDay == Long.MIN_VALUE) {
+        synchronized (LOCK) {
+            ShopSavedData data = data(server);
+            long day = currentDay(server.overworld());
+            if (data.lastStallClearDay == Long.MIN_VALUE) {
+                data.lastStallClearDay = day;
+                data.setDirty();
+                return;
+            }
+            if (!ShopExpireSupport.shouldAdvanceDailyDay(day, data.lastStallClearDay)) {
+                return;
+            }
             data.lastStallClearDay = day;
-            return;
-        }
-        if (day == data.lastStallClearDay) {
-            return;
-        }
-        data.lastStallClearDay = day;
-        int expireDays = Config.INSTANCE.mailExpireDays.get();
-        for (Map.Entry<UUID, PlayerAccount> entry : new ArrayList<>(data.accounts().entrySet())) {
-            PlayerAccount account = entry.getValue();
-            if (!account.stall.isEmpty()) {
-                for (StallEntry stall : account.stall) {
-                    // 需求 6：到期清摊时退还全部剩余库存，而不是 1 件。
-                    if (stall.stock > 0) {
-                        ItemStack refund = stall.stack.copy();
-                        refund.setCount(stall.stock);
-                        addMailDraft(server, entry.getKey(), MailTemplates.build(MailTemplates.Template.STALL_EXPIRED,
-                        MailTemplates.map("player", nameOf(server, entry.getKey()),
-                                "item", MailTemplates.itemText(refund, false)))
-                .source(SOURCE_STALL_UNSOLD)
-                .addItem(refund));
-                    }
-                }
-                account.stall.clear();
-            }
+            int expireDays = Config.INSTANCE.mailExpireDays.get();
             if (expireDays > 0) {
-                // 只清理“已经领取/查看过”的邮件：未领取的物品、未查看的货款不能因为过期直接蒸发。
-                // receivedDay<=0 表示旧存档缺这个字段，按“刚收到”处理，避免一开过期功能就清空历史邮件。
-                // 标星的邮件永不自动过期（和「一键清理」「邮箱满了自动删」保持同一规则）。
-                account.mailbox.removeIf(mail -> !mail.pending()
-                        && !mail.starred
-                        && mail.receivedDay > 0
-                        && day - mail.receivedDay >= expireDays);
+                for (Map.Entry<UUID, PlayerAccount> entry : new ArrayList<>(data.accounts().entrySet())) {
+                    PlayerAccount account = entry.getValue();
+                    // 只清理“已经领取/查看过”的邮件：未领取的物品、未查看的货款不能因为过期直接蒸发。
+                    // receivedDay<=0 表示旧存档缺这个字段，按“刚收到”处理，避免一开过期功能就清空历史邮件。
+                    // 标星的邮件永不自动过期（和「一键清理」「邮箱满了自动删」保持同一规则）。
+                    account.mailbox.removeIf(mail -> !mail.pending()
+                            && !mail.starred
+                            && mail.receivedDay > 0
+                            && day - mail.receivedDay >= expireDays);
+                }
             }
+            data.setDirty();
         }
-        data.setDirty();
     }
 
     /** 拍卖结算。 */
@@ -698,17 +1287,55 @@ public final class ShopManager {
         sendSnapshot(player, tab, silent, false);
     }
 
+    /** 已发给各在线玩家的购物城货架指纹：未变化时快照直接带 mallUnchanged=true，避免每次开商店/动钱重传上万件商品。 */
+    private static final Map<UUID, Long> LAST_SENT_MALL_HASH = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static long mallViewHash(ShopSavedData data, UUID viewer, boolean personalStock) {
+        long h = 1125899906842597L;
+        boolean eco = EcoPricing.isEcoActive();
+        h = 31L * h + (personalStock ? 1L : 0L);
+        h = 31L * h + (eco ? 1L : 0L);
+        h = 31L * h + data.mallPool.size();
+        for (MallItem item : data.mallPool) {
+            h = 31L * h + System.identityHashCode(item);
+            h = 31L * h + System.identityHashCode(item.stack);
+            h = 31L * h + item.stack.getCount();
+            h = 31L * h + item.stock;
+            h = 31L * h + item.stockMax;
+            h = 31L * h + item.sort;
+            h = 31L * h + item.rarity.ordinal();
+            h = 31L * h + item.supplyMode.ordinal();
+            h = 31L * h + item.basePrice;
+            h = 31L * h + item.floorRestockPercent;
+            h = 31L * h + (item.permanentLimit ? 1L : 0L);
+            PriceSpec spec = item.resolvePriceSpec();
+            h = 31L * h + spec.hashCode();
+            if (item.permanentLimit) {
+                h = 31L * h + item.permanentCap();
+                h = 31L * h + item.permanentUsedFor(viewer);
+            } else if (personalStock) {
+                h = 31L * h + item.remainingFor(viewer);
+            } else if (eco && spec.supportsStar() && item.supplyMode == SupplyMode.PLAYER_POOL && !item.unlimited()) {
+                h = 31L * h + EcoPricing.computeMallAskAtStock(item, Math.max(0, item.stock));
+            }
+        }
+        return h == 0L ? 1L : h;
+    }
+
     private static void sendSnapshot(ServerPlayer player, @Nullable String tab, boolean silent, boolean open) {
         ConfigMigration.runOnce();
         logBalanceCapOnce();
         PlayerAccount account = account(player);
         ShopSavedData data = data(player.server);
+        loadBrandDefaultIfBlank(data.sidebarLayout);
         ensureDaily(player, account, data);
         // 需求 3：价格始终以服务端商品池为权威，下发前用最新池数据刷新每日报价。
         refreshDailyPrices(account, data);
         HolderLookup.Provider regs = player.level().registryAccess();
-
-        CompoundTag tag = new CompoundTag();
+        boolean ownedBatch = ShopNbt.beginBatchIfAbsent(regs);
+        CompoundTag tag;
+        try {
+        tag = new CompoundTag();
         tag.putString("kind", "snapshot");
         tag.putBoolean("silent", silent);
         // open=true 才允许客户端"自动弹出商店界面"（默认 false：只更新数据，绝不再抢夺玩家的界面）
@@ -724,10 +1351,13 @@ public final class ShopManager {
         tag.putString("moneySuffix", currencyText);
         boolean snapshotAdmin = player.hasPermissions(2);
         tag.putBoolean("canAdmin", snapshotAdmin);
+        tag.putBoolean("adminLockEnabled", AdminAuthService.isLockEnabled());
+        tag.putBoolean("adminUnlocked", AdminAuthService.canEditAdmin(player));
+        tag.putInt("adminSessionTimeout", AdminAuthService.sessionTimeoutMinutes());
         // 需求 11：下发服务端当前记录的编辑模块，界面据此高亮“每日商店/每日收购”并显示当前模式。
         tag.putString("adminEditType",
                 ADMIN_EDIT_TYPE.getOrDefault(player.getUUID(), AdminEditType.DAILY_SHOP).id());
-        tag.putString("defaultTab", tab == null ? "daily" : tab);
+        tag.putString("defaultTab", (tab == null || tab.isBlank()) ? "home" : tab);
         // 主界面左上角需要显示玩家名称
         tag.putString("playerName", player.getGameProfile().getName());
         // 需求 4：交易界面需要展示在线玩家名片
@@ -743,7 +1373,7 @@ public final class ShopManager {
         ListTag daily = new ListTag();
         for (DailyShopEntry entry : account.dailyShop) {
             CompoundTag c = ShopNbt.saveStack(entry.stack, regs);
-            c.putLong("price", entry.price);
+            entry.resolvePriceSpec().writeToParent(c, "priceSpec", "price");
             c.putString("rarity", entry.rarity.id());
             c.putInt("bought", entry.bought);
             // 需求 11：上限按物品下发，不再使用品质公用上限。
@@ -753,13 +1383,27 @@ public final class ShopManager {
         tag.put("dailyShop", daily);
 
         // 付费刷新每日商店：refreshCost = -1 表示今日次数已用完（按钮变灰）。
+        List<PriceSpec> shopRefreshList = data.resolveDailyRefreshSpecs();
+        PriceSpec nextShopRefresh = data.nextRefreshSpec(account, true);
         tag.putInt("refreshUsed", account.dailyShopRefreshUsed);
-        tag.putInt("refreshMax", Config.INSTANCE.dailyRefreshCosts.get().size());
-        tag.putLong("refreshCost", nextRefreshCost(account, true));
+        tag.putInt("refreshMax", shopRefreshList.size());
+        tag.putLong("refreshCost", nextShopRefresh == null ? -1L
+                : (nextShopRefresh.supportsStar() ? nextShopRefresh.starPrice : 0L));
+        if (nextShopRefresh != null) {
+            tag.put("refreshSpec", nextShopRefresh.toTag());
+        }
+        tag.put("dailyRefreshSpecs", writeSpecList(shopRefreshList));
         // 付费刷新每日收购：与商店**完全分开**的次数与价格。
+        List<PriceSpec> bbRefreshList = data.resolveBuybackRefreshSpecs();
+        PriceSpec nextBbRefresh = data.nextRefreshSpec(account, false);
         tag.putInt("buybackRefreshUsed", account.dailyBuybackRefreshUsed);
-        tag.putInt("buybackRefreshMax", Config.INSTANCE.buybackRefreshCosts.get().size());
-        tag.putLong("buybackRefreshCost", nextRefreshCost(account, false));
+        tag.putInt("buybackRefreshMax", bbRefreshList.size());
+        tag.putLong("buybackRefreshCost", nextBbRefresh == null ? -1L
+                : (nextBbRefresh.supportsStar() ? nextBbRefresh.starPrice : 0L));
+        if (nextBbRefresh != null) {
+            tag.put("buybackRefreshSpec", nextBbRefresh.toTag());
+        }
+        tag.put("buybackRefreshSpecs", writeSpecList(bbRefreshList));
 
         int[] flipped = new int[account.dailyFlipped.size()];
         for (int i = 0; i < flipped.length; i++) {
@@ -770,7 +1414,7 @@ public final class ShopManager {
         ListTag buyback = new ListTag();
         for (DailyBuybackEntry entry : account.dailyBuyback) {
             CompoundTag c = ShopNbt.saveStack(entry.stack, regs);
-            c.putLong("price", entry.price);
+            entry.resolvePriceSpec().writeToParent(c, "priceSpec", "price");
             c.putString("rarity", entry.rarity.id());
             c.putInt("sold", entry.sold);
             // 需求 6/9：按物品下发可收购数量。
@@ -779,8 +1423,9 @@ public final class ShopManager {
         }
         tag.put("dailyBuyback", buyback);
 
-        // 收购全清奖励：界面据此显示「全部完成可再得 X星币（还剩 N 项）」。
-        tag.putLong("buybackBonus", buybackBonusAmount(data));
+        // 收购全清奖励：界面据此显示「全部完成可再得 X（还剩 N 项）」。
+        PriceSpec bonusSpec = buybackBonusSpec(data);
+        bonusSpec.writeToParent(tag, "buybackBonusSpec", "buybackBonus");
         tag.putBoolean("buybackBonusEnabled", data.buybackBonusEnabled);
         tag.putBoolean("buybackBonusDone", account.dailyBuybackBonusDone);
         int buybackLeft = 0;
@@ -798,13 +1443,15 @@ public final class ShopManager {
         ListTag stall = new ListTag();
         for (StallEntry entry : account.stall) {
             CompoundTag c = ShopNbt.saveStack(entry.stack, regs);
-            c.putLong("price", entry.price);
+            entry.resolvePriceSpec().writeToParent(c, "priceSpec", "price");
             // 需求 6：管理界面需要显示剩余库存/已售空。
             c.putInt("stock", entry.stock);
             // 需求 9：按商品统计的累计已售出件数。
             c.putInt("sold", entry.sold);
             // 商品 id（改价 / 补货 / 下架都按它定位，不受下标变化影响）
             c.putLong("order", entry.order);
+            c.putLong("listedGame", entry.listedGame);
+            c.putLong("listedReal", entry.listedReal);
             stall.add(c);
         }
         tag.put("stall", stall);
@@ -873,30 +1520,24 @@ public final class ShopManager {
             tag.put("adminBuyback", offerList(data.buybackPool, regs));
         }
 
-        // ---- 购物城（新增模块）：常驻货架 + 管理端同结构列表 + 最近购买记录 ----
-        // 「个人库存」模式下每件商品的 stock 字段按**这个玩家自己的剩余量**下发，
-        // 所以客户端不用区分两种模式，只认 stock 就是对的。
+        // ---- 购物城（新增模块）：按指纹增量下发 + 复用单份列表，彻底消除上万件商品开商店/动钱卡顿 ----
         boolean personalStock = Config.mallStockPersonal();
-        ListTag mallList = new ListTag();
-        for (int i = 0; i < data.mallPool.size(); i++) {
-            MallItem item = data.mallPool.get(i);
-            CompoundTag c = item.saveForView(regs, player.getUUID(), personalStock);
-            c.putInt("index", i);
-            mallList.add(c);
-        }
-        tag.put("mall", mallList);
+        long mallHash = mallViewHash(data, player.getUUID(), personalStock);
+        Long prevMallHash = LAST_SENT_MALL_HASH.get(player.getUUID());
         tag.putBoolean("mallStockPersonal", personalStock);
-        // 管理页复用 ConfiguredOffer 的结构（amount 当库存用，-1 = 无限），前端一套行渲染即可。
-        if (snapshotAdmin) {
-            ListTag adminMallList = new ListTag();
-            for (MallItem item : data.mallPool) {
-                CompoundTag c = ShopNbt.saveStack(item.stack, regs);
-                c.putLong("price", item.price);
-                c.putString("rarity", item.rarity.id());
-                c.putInt("amount", item.stock);
-                adminMallList.add(c);
+        if (prevMallHash != null && prevMallHash == mallHash) {
+            tag.putBoolean("mallUnchanged", true);
+        } else {
+            ListTag mallList = new ListTag();
+            for (int i = 0; i < data.mallPool.size(); i++) {
+                MallItem item = data.mallPool.get(i);
+                CompoundTag c = item.saveForView(regs, player.getUUID(), personalStock);
+                c.putInt("index", i);
+                mallList.add(c);
             }
-            tag.put("adminMall", adminMallList);
+            tag.put("mall", mallList);
+            tag.putBoolean("adminMallFromMall", true);
+            LAST_SENT_MALL_HASH.put(player.getUUID(), mallHash);
         }
         // 管理页的「出货箱」模块：把**兑换规则**按条目下发（代表物品 + 单价 + 每日份数），
         // 格式错误的那几行也在列表里（物品为空 + 原文与原因），界面把它们标红，右键即可删掉。
@@ -909,7 +1550,8 @@ public final class ShopManager {
             ShippingRules.Entry entry = shipEntries.get(i);
             ItemStack stack = i < shipStacks.size() ? shipStacks.get(i) : ItemStack.EMPTY;
             CompoundTag c = ShopNbt.saveStack(stack, regs);
-            c.putLong("price", entry.rule() == null ? 0L : entry.rule().price());
+            PriceSpec ruleSpec = entry.rule() == null ? PriceSpec.ZERO : entry.rule().resolvePriceSpec();
+            ruleSpec.writeToParent(c, "priceSpec", "price");
             c.putString("rarity", Rarity.COMMON.id());
             c.putInt("amount", entry.rule() == null ? 0 : entry.rule().dailyMax());
             c.putString("rule", entry.raw());
@@ -931,12 +1573,18 @@ public final class ShopManager {
         // ---- 出货箱（新增模块）：等级 / 格数 / 本次结算金额 / 今日额度 / 规则状态 ----
         sendShippingInfo(player, tag, data);
 
-        // 货币兑换：所有玩家都能看到汇率、图标与自己的持有量，仅管理员能改配置。
+        // 货币兑换：所有玩家都能看到汇率、图标、持有量与单品每日限额，仅管理员能改配置。
+        long exQuotaDay = Config.shippingQuotaDay();
         ListTag exchange = new ListTag();
         for (ExchangeEntry entry : data.exchangePool) {
             CompoundTag c = ShopNbt.saveStack(entry.stack, regs);
             c.putLong("value", entry.value);
             c.putInt("owned", countMatching(player, entry.stack));
+            c.putInt("dailyLimit", Math.max(0, entry.dailyLimit));
+            int usedToday = account.exchangeDay == exQuotaDay
+                    ? Math.max(0, account.exchangeEntryUsedToday.getOrDefault(entry.limitKey(regs), 0))
+                    : 0;
+            c.putInt("usedToday", usedToday);
             exchange.add(c);
         }
         tag.put("exchange", exchange);
@@ -951,8 +1599,8 @@ public final class ShopManager {
         tag.putBoolean("signInEnabled", data.signInEnabled);
         tag.putBoolean("signInAuto", data.signInAuto);
         tag.putBoolean("signInCumulative", data.signInCumulative);
-        tag.putLong("signInBase", data.signInBaseDaily);
-        tag.putLong("signInMakeupCost", data.signInMakeupCost);
+        data.resolveSignInBaseSpec().writeToParent(tag, "signInBaseSpec", "signInBase");
+        data.resolveSignInMakeupSpec().writeToParent(tag, "signInMakeupSpec", "signInMakeupCost");
         tag.putInt("signInMakeupDays", data.signInMakeupDays);
         tag.putLong("signInToday", realDay);
         tag.putBoolean("signInDone", sign.signedOn(realDay));
@@ -961,8 +1609,18 @@ public final class ShopManager {
         tag.putLongArray("signInDays", sign.recentDays(realDay));
         tag.putIntArray("signInTierDays", data.signInTierDays);
         tag.putLongArray("signInTierBonus", data.signInTierBonus);
+        List<PriceSpec> resolvedTierSpecs = new ArrayList<>(data.signInTierBonusSpecs.length);
+        for (int i = 0; i < data.signInTierBonusSpecs.length; i++) {
+            resolvedTierSpecs.add(data.resolveSignInTierSpec(i));
+        }
+        tag.put("signInTierBonusSpecs", writeSpecList(resolvedTierSpecs));
         tag.putIntArray("signInMileDays", data.signInMileDays);
         tag.putLongArray("signInMileMoney", data.signInMileMoney);
+        List<PriceSpec> resolvedMileSpecs = new ArrayList<>(data.signInMileSpecs.length);
+        for (int i = 0; i < data.signInMileSpecs.length; i++) {
+            resolvedMileSpecs.add(data.resolveSignInMileSpec(i));
+        }
+        tag.put("signInMileSpecs", writeSpecList(resolvedMileSpecs));
         // 里程轮次长度：客户端据此把进度条按「本轮第几天」画，而不是按总连续天数（那样到 7 天就永远满格）。
         tag.putInt("signInCycleDays", SIGNIN_CYCLE_DAYS);
         ListTag actList = new ListTag();
@@ -971,7 +1629,7 @@ public final class ShopManager {
             c.putLong("day", act.day);
             c.putString("title", act.title);
             c.putString("note", act.note);
-            c.putLong("money", act.money);
+            act.resolveMoneySpec().writeToParent(c, "moneySpec", "money");
             c.putBoolean("forOffline", act.forOffline);
             c.putBoolean("granted", act.granted.contains(player.getUUID()));
             c.putBoolean("catchUp", act.catchUp);
@@ -987,7 +1645,9 @@ public final class ShopManager {
         tag.put("activityDays", actList);
         // 侧栏布局：管理员拖过之后的所有玩家都用这套坐标（服务端权威 + 热同步）。
         // 编辑布局中的管理员拿到的是**草稿**布局，其他玩家仍是已发布的那份。
-        tag.put("sidebarLayout", layoutFor(data, player.getUUID()).save());
+        SidebarLayout activeLayout = layoutFor(data, player.getUUID());
+        tag.put("sidebarLayout", activeLayout.save());
+        tag.putString("brandIconId", activeLayout.brandIconId());
         // 需求 8：下发刷新参数（管理员设置界面据此回填）。
         tag.putIntArray("shopWeights", data.shopWeights);
         tag.putIntArray("shopGuarantee", data.shopGuarantee);
@@ -1018,18 +1678,46 @@ public final class ShopManager {
             demandList.add(entry.save(regs));
         }
         tag.put("demands", demandList);
-
         // Eco 官方做市商总钱箱、八大职业熟练度与专注点快照
         cn.autoforged.module_shop.eco.ClearingHouse.writeEcoSnapshot(player, account, data, tag, regs);
+        // 个人主页（在线时长 / LuckPerms 称号 / 公告）与分层实体货币配置/背包持币
+        cn.autoforged.module_shop.shop.home.ProfileStatsService.writeSnapshot(player, tag);
+        cn.autoforged.module_shop.shop.home.AnnouncementConfig.get().writeSnapshot(tag);
+        cn.autoforged.module_shop.shop.currency.CurrencySettlement.writeSnapshot(player, tag, regs);
+        } finally {
+            if (ownedBatch) {
+                ShopNbt.endBatch();
+            }
+        }
 
         ClientboundShopSyncPayload.send(player, tag);
+    }
+
+    private static ListTag writeSpecList(List<PriceSpec> specs) {
+        ListTag list = new ListTag();
+        if (specs != null) {
+            for (PriceSpec spec : specs) {
+                list.add((spec == null ? PriceSpec.ZERO : spec).toTag());
+            }
+        }
+        return list;
+    }
+
+    private static ListTag writeStarSpecArray(long[] amounts) {
+        ListTag list = new ListTag();
+        if (amounts != null) {
+            for (long amount : amounts) {
+                list.add(PriceSpec.star(Math.max(0L, amount)).toTag());
+            }
+        }
+        return list;
     }
 
     private static ListTag offerList(List<ConfiguredOffer> pool, HolderLookup.Provider regs) {
         ListTag list = new ListTag();
         for (ConfiguredOffer offer : pool) {
             CompoundTag c = ShopNbt.saveStack(offer.stack, regs);
-            c.putLong("price", offer.price);
+            offer.resolvePriceSpec().writeToParent(c, "priceSpec", "price");
             c.putString("rarity", offer.rarity.id());
             // 需求 6/7：管理员配置界面上要能看到并修改数量/品质/价值。
             c.putInt("amount", offer.amount);
@@ -1046,7 +1734,7 @@ public final class ShopManager {
         for (DailyShopEntry entry : account.dailyShop) {
             ConfiguredOffer match = findOffer(data.shopPool, entry.stack);
             if (match != null) {
-                entry.price = match.price;
+                entry.setPriceSpec(match.resolvePriceSpec());
                 entry.rarity = match.rarity;
                 entry.limit = Math.max(1, match.amountOr(match.rarity.purchaseLimit()));
             }
@@ -1054,8 +1742,12 @@ public final class ShopManager {
         for (DailyBuybackEntry entry : account.dailyBuyback) {
             ConfiguredOffer match = findOffer(data.buybackPool, entry.stack);
             if (match != null) {
-                if (!cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
-                    entry.price = match.price;
+                PriceSpec matchSpec = match.resolvePriceSpec();
+                if (!EcoPricing.isEcoActive() || !matchSpec.supportsStar()) {
+                    entry.setPriceSpec(matchSpec);
+                } else {
+                    long currentStar = entry.price > 0L ? entry.price : matchSpec.starPrice;
+                    entry.setPriceSpec(matchSpec.withStarPrice(currentStar));
                 }
                 entry.rarity = match.rarity;
                 entry.limit = Math.max(1, match.amountOr(Config.INSTANCE.buybackCapacity.get()));
@@ -1069,7 +1761,7 @@ public final class ShopManager {
             return null;
         }
         for (ConfiguredOffer offer : pool) {
-            if (!offer.stack.isEmpty() && offer.stack.getItem() == stack.getItem()) {
+            if (!offer.stack.isEmpty() && ItemStack.isSameItemSameComponents(offer.stack, stack)) {
                 return offer;
             }
         }
@@ -1080,21 +1772,56 @@ public final class ShopManager {
      * 需求 2：管理员在本地改完商品后执行 /shop reload，即可让服务器与所有在线玩家同步，
      * 无需重启。会按最新商品池重新生成每日列表并静默推送快照（不打断玩家当前界面）。
      */
+    /**
+     * 重置全服所有已知玩家（含在线与离线账户）的当日商店 / 收购生成标记，并广播快照使在线玩家立即重抽生效。
+     */
+    public static void resetAccountsDaily(java.util.Collection<PlayerAccount> accounts,
+                                          boolean resetShop, boolean resetBuyback) {
+        if (accounts == null || (!resetShop && !resetBuyback)) {
+            return;
+        }
+        for (PlayerAccount acc : accounts) {
+            if (resetShop) {
+                acc.dailyShopDay = Long.MIN_VALUE;
+                acc.dailyShop.clear();
+                acc.dailyFlipped.clear();
+            }
+            if (resetBuyback) {
+                acc.dailyBuybackDay = Long.MIN_VALUE;
+                acc.dailyBuyback.clear();
+            }
+        }
+    }
+
+    public static void rerollDailyForAll(@Nullable MinecraftServer server, @Nullable ShopSavedData data,
+                                         boolean resetShop, boolean resetBuyback) {
+        if (data == null || (!resetShop && !resetBuyback)) {
+            return;
+        }
+        if (server != null) {
+            for (ServerPlayer online : server.getPlayerList().getPlayers()) {
+                account(online);
+            }
+        }
+        resetAccountsDaily(data.accounts().values(), resetShop, resetBuyback);
+        data.setDirty();
+        if (server != null) {
+            broadcastSnapshots(server);
+        }
+    }
+
     public static void reload(MinecraftServer server) {
+        LAST_SENT_MALL_HASH.clear();
         cn.autoforged.module_shop.eco.profession.ProfessionConfig.reload();
         cn.autoforged.module_shop.eco.quality.QualityEvaluator.reloadConfig();
+        cn.autoforged.module_shop.shop.home.AnnouncementConfig.reload();
+        cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig.reload();
+        AdminAuthService.reload();
         ShippingRules.refresh();
         ShopSavedData data = data(server);
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            PlayerAccount account = account(player);
-            account.dailyShopDay = Long.MIN_VALUE;
-            account.dailyBuybackDay = Long.MIN_VALUE;
-            account.dailyFlipped.clear();
-        }
-        data.setDirty();
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            sendSnapshot(player, "daily", true);
-        }
+        loadBrandDefaultIfBlank(data.sidebarLayout);
+        rerollDailyForAll(server, data, true, true);
+        flushBroadcastSnapshots(server);
     }
 
     /** 本 tick 内是否有人请求过全服快照（见 {@link #broadcastSnapshots}）。只在服务端主线程读写。 */
@@ -1201,8 +1928,8 @@ public final class ShopManager {
      * 与单件添加一样，槽里只是模板副本，关闭时会原样退还。
      */
     private static void openBatchAdd(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!requireUnlockedAdmin(player)) {
             return;
         }
         DEPOSIT_CONTEXT.put(player.getUUID(), "admin");
@@ -1232,7 +1959,7 @@ public final class ShopManager {
      * 存成模板后就不依赖它是否还开着（与单件添加的 ADMIN_TEMPLATE 同一套思路）。
      */
     private static void adminBatchPrepare(ServerPlayer player) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         if (!(player.containerMenu instanceof BatchAddMenu menu)) {
@@ -1257,7 +1984,16 @@ public final class ShopManager {
         CompoundTag extra = new CompoundTag();
         extra.putString("mode", type.id());
         if (type == AdminEditType.SHIPPING) {
-            openInput(player, "admin_batch_apply", "gui.module_shop.input.shipping_rule_new", extra, "price");
+            openInput(player, "admin_batch_apply", "gui.module_shop.input.shipping_rule_new", extra,
+                    "price", "daily_max");
+        } else if (type == AdminEditType.MALL) {
+            ListTag permChoices = new ListTag();
+            permChoices.add(StringTag.valueOf("0"));
+            permChoices.add(StringTag.valueOf("1"));
+            extra.put("choices_permanent_limit", permChoices);
+            extra.putString("default_permanent_limit", "0");
+            openInput(player, "admin_batch_apply", "gui.module_shop.input.admin_offer", extra,
+                    "price", "rarity", "quantity", "permanent_limit");
         } else {
             openInput(player, "admin_batch_apply", "gui.module_shop.input.admin_offer", extra,
                     "price", "rarity", "quantity");
@@ -1269,10 +2005,10 @@ public final class ShopManager {
 
     /**
      * 批量添加第二步：把模板里的每种物品按**统一的价格 / 品质 / 数量**加进当前模块的清单。
-     * 出货箱只认价格（它没有品质与数量）。
+     * 出货箱支持单价与每日出货上限（没有品质）。
      */
     private static void adminBatchApply(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         List<ItemStack> templates = BATCH_TEMPLATE.remove(player.getUUID());
@@ -1282,11 +2018,19 @@ public final class ShopManager {
             return;
         }
         AdminEditType type = editType(player, tag);
-        long price = parseAdminPrice(player, tag.getString("price"));
-        if (price <= 0L) {
+        PriceSpec priceSpec = parseAdminSpec(player, tag);
+        if (priceSpec == null) {
             return;
         }
-        Rarity rarity = parseRarity(tag.getString("rarity"), price);
+        int shippingDailyMax = 0;
+        if (type == AdminEditType.SHIPPING) {
+            shippingDailyMax = parseOptionalNonNegativeInt(player, tag, "daily_max");
+            if (shippingDailyMax < 0) {
+                return;
+            }
+        }
+        long rarityHint = priceSpec.supportsStar() ? priceSpec.starPrice : Math.max(1L, priceSpec.physCount);
+        Rarity rarity = parseRarity(tag.getString("rarity"), rarityHint);
         int quantity = parseInt(tag.getString("quantity"));
         ShopSavedData data = data(player.server);
         List<ItemStack> shippingRules = new ArrayList<>();
@@ -1297,18 +2041,27 @@ public final class ShopManager {
             }
             switch (type) {
                 case MALL -> {
-                    MallItem item = new MallItem(template, price, rarity, parseMallStock(tag.getString("quantity")));
+                    boolean permLimit = isTruthyFlag(tag.getString("permanent_limit"));
+                    int stockVal = parseMallStock(tag.getString("quantity"));
+                    if (permLimit && stockVal <= 0) {
+                        stockVal = 1;
+                    }
+                    MallItem item = new MallItem(template, priceSpec, rarity, stockVal);
+                    item.permanentLimit = permLimit;
+                    if (permLimit) {
+                        item.supplyMode = SupplyMode.STATIC;
+                    }
                     item.sort = data.mallPool.size();
                     data.mallPool.add(item);
                 }
                 case SHIPPING -> shippingRules.add(template);
                 case DAILY_SHOP -> {
-                    ConfiguredOffer offer = new ConfiguredOffer(template, price, rarity);
+                    ConfiguredOffer offer = new ConfiguredOffer(template, priceSpec, rarity);
                     offer.amount = quantity;
                     data.shopPool.add(offer);
                 }
                 case BUYBACK -> {
-                    ConfiguredOffer offer = new ConfiguredOffer(template, price, rarity);
+                    ConfiguredOffer offer = new ConfiguredOffer(template, priceSpec, rarity);
                     offer.amount = quantity;
                     data.buybackPool.add(offer);
                 }
@@ -1317,7 +2070,7 @@ public final class ShopManager {
         }
         if (type == AdminEditType.SHIPPING && !shippingRules.isEmpty()) {
             // 规则一次写完再落盘（避免 27 次重写配置文件）
-            ShippingRules.addRules(shippingRules, price);
+            ShippingRules.addRules(shippingRules, priceSpec, shippingDailyMax);
         }
         if (added == 0) {
             notifyPlayer(player, Component.translatable("msg.module_shop.batch_none")
@@ -1326,6 +2079,7 @@ public final class ShopManager {
         }
         data.setDirty();
         sendSnapshot(player, type == AdminEditType.MALL ? "mall" : "admin");
+        broadcastSnapshots(player.server);
         notifyPlayer(player, Component.translatable("msg.module_shop.batch_added", added)
                 .withStyle(ChatFormatting.GREEN));
     }
@@ -1350,8 +2104,33 @@ public final class ShopManager {
 
     private static void handleActionInner(ServerPlayer player, CompoundTag tag) {
         String action = tag.getString("action");
-        // 服务端权威：管理操作必须校验权限，客户端不再可信（canAdmin 只是显示开关）。
-        if (action.startsWith("admin_") && !player.hasPermissions(2)) {
+        if ("admin_auth_unlock".equals(action)) {
+            adminAuthUnlock(player, tag);
+            return;
+        }
+        if ("admin_auth_lock".equals(action)) {
+            adminAuthLock(player);
+            return;
+        }
+        if ("admin_auth_configure".equals(action)) {
+            adminAuthConfigure(player, tag);
+            return;
+        }
+        if ("media_fetch".equals(action)) {
+            handleMediaFetch(player, tag);
+            return;
+        }
+        if (action.startsWith("cfg_")) {
+            if (!requireUnlockedAdmin(player)) {
+                return;
+            }
+            if (TemplateTransferManager.handleServerAction(
+                    player.server, player, data(player.server), action, tag)) {
+                return;
+            }
+        }
+        // 服务端权威：管理操作必须校验权限与密码锁，客户端不再可信（canAdmin 只是显示开关）。
+        if (action.startsWith("admin_") && !requireUnlockedAdmin(player)) {
             return;
         }
         // 拍卖行（上架 / 出价 / 一口价 / 撤销 / 列表 / 详情 / 管理）统一由 AuctionService 处理。
@@ -1368,9 +2147,11 @@ public final class ShopManager {
             case "create_auction" -> openDeposit(player, "auction");
             case "create_stall" -> openDeposit(player, "stall");
             case "deposit_confirm" -> handleDepositConfirm(player);
-            case "buy_shop" -> buyShop(player, tag.getInt("index"), parseInt(tag.getString("quantity")));
+            case "buy_shop" -> buyShop(player, tag.getInt("index"), parseInt(tag.getString("quantity")),
+                    tag.getString("pay_channel"));
             // ---- 购物城（新增模块）----
-            case "buy_mall" -> buyMall(player, tag.getInt("index"), parseInt(tag.getString("quantity")));
+            case "buy_mall" -> buyMall(player, tag.getInt("index"), parseInt(tag.getString("quantity")),
+                    tag.getString("pay_channel"));
             case "admin_mall_import" -> adminMallImport(player, tag);
             case "admin_mall_remove_mod" -> adminMallRemoveMod(player, tag);
             case "admin_mall_restock" -> adminMallRestock(player, tag);
@@ -1378,12 +2159,12 @@ public final class ShopManager {
             case "admin_mall_refresh" -> adminMallRefresh(player, tag);
             // ---- 出货箱（新增模块，参考星露谷售货箱）----
             case "shipping_open" -> openShippingBin(player);
-            case "shipping_upgrade" -> upgradeShippingBin(player);
+            case "shipping_upgrade" -> upgradeShippingBin(player, tag.getString("pay_channel"));
             case "admin_shipping_limits" -> adminShippingLimits(player, tag);
             case "flip_shop" -> flipShop(player, tag.getInt("index"));
             // 付费刷新每日商店（价格与次数见 Config.dailyRefreshCosts）。
-            case "refresh_daily_shop" -> refreshDailyShopPaid(player);
-            case "refresh_daily_buyback" -> refreshDailyBuybackPaid(player);
+            case "refresh_daily_shop" -> refreshDailyShopPaid(player, tag.getString("pay_channel"));
+            case "refresh_daily_buyback" -> refreshDailyBuybackPaid(player, tag.getString("pay_channel"));
             // 账单：玩家点主界面余额打开账单界面时请求一次明细。
             case "bill_request" -> sendBill(player);
             // 侧栏布局：管理员拖拽排序后保存顺序 / 恢复默认。
@@ -1394,12 +2175,9 @@ public final class ShopManager {
             case "admin_layout_commit" -> adminLayoutCommit(player);
             // 左上角主标题改名（空 = 恢复默认「模块商店」）—— 现在**唯一**的改名入口
             case "admin_shop_title_set" -> adminShopTitleSet(player, tag);
-            // ---- 商店模板（导出 / 导入 / 保存为默认 / 手动初始化）----
-            case "cfg_export" -> cfgExport(player, tag);
-            case "cfg_save_default" -> cfgSaveDefault(player, tag);
-            case "cfg_import_preview" -> cfgImportPreview(player, tag);
-            case "cfg_import_apply" -> cfgImportApply(player, tag);
-            case "cfg_init_from_default" -> cfgInitFromDefault(player);
+            case "admin_shop_icon_set" -> adminShopIconSet(player, tag);
+            case "admin_media_upload" -> adminMediaUpload(player, tag);
+            case "cfg_open" -> cfgOpenUi(player);
             // 编辑布局里右键余额 → 改货币名称（空 = 恢复配置默认）
             case "admin_currency_set" -> adminCurrencySet(player, tag);
             // 商店设置 → 摊位：自动下架时间（永久 / 游戏时间 / 现实时间）
@@ -1412,7 +2190,8 @@ public final class ShopManager {
             case "admin_demand_set" -> adminDemandSet(player, tag);
             case "admin_demand_expire" -> adminDemandExpire(player, tag);
             case "admin_demand_cancel" -> demandCancel(player, tag);
-            case "sell_buyback" -> sellBuyback(player, tag.getInt("index"), parseInt(tag.getString("quantity")));
+            case "sell_buyback" -> sellBuyback(player, tag.getInt("index"), parseInt(tag.getString("quantity")),
+                    tag.getString("pay_channel"));
             case "bid" -> placeBid(player, tag);
             case "claim_mail" -> claimMail(player, tag.getString("mail_id"));
             // 第七轮：星标（置顶显示）
@@ -1454,9 +2233,9 @@ public final class ShopManager {
             // 需求 3：从自己的交易区域删除已放入的物品并返还背包/邮箱。
             case "trade_remove_item" -> TradeManager.removeItem(player, tag.getInt("index"));
             case "trade_money_gui" -> {
-                // 需求 3：交易金额界面显示玩家余额（服务端权威数值随输入界面下发）。
+                // 需求 3：交易金额界面显示玩家可用星币余额（纯星币账本）。
                 CompoundTag moneyExtra = new CompoundTag();
-                moneyExtra.putLong("balance", account(player).balance);
+                moneyExtra.putLong("balance", Math.max(0L, account(player).balance));
                 moneyExtra.putBoolean("show_balance", true);
                 openInput(player, "trade_set_money", "gui.module_shop.input.trade_money", moneyExtra, "amount");
             }
@@ -1472,12 +2251,18 @@ public final class ShopManager {
             case "admin_set_edit_type" -> setAdminEditType(player, tag.getString("type"));
             // 需求 11：管理员添加物品必须使用幽灵槽位，防止刷物品。
             // （现在是**批量**界面：一次最多放 27 种，确认后统一设置价格 / 品质 / 数量。）
-            case "admin_add" -> openBatchAdd(player);
+            case "admin_add" -> {
+                if (tag.contains("mode")) {
+                    setAdminEditType(player, tag.getString("mode"));
+                }
+                openBatchAdd(player);
+            }
             case "admin_batch_prepare" -> adminBatchPrepare(player);
             case "admin_batch_apply" -> adminBatchApply(player, tag);
             case "admin_apply_price" -> adminApplyPrice(player, tag);
             case "admin_remove" -> adminRemove(player, tag);
             case "admin_set_price_new" -> adminSetPriceNew(player, tag);
+            case "admin_reroll_daily", "admin_reroll_daily_go" -> adminRerollDaily(player, tag);
             // ---- 管理员发放（发钱 / 发物品）----
             case "admin_grant_open" -> GrantManager.open(player);
             case "admin_grant_request" -> GrantManager.sendTargets(player);
@@ -1498,7 +2283,7 @@ public final class ShopManager {
             case "admin_buyback_bonus_set" -> adminBuybackBonusSet(player, tag);
             // ---- 签到（需求 7）----
             case "sign_in" -> doSignIn(player);
-            case "sign_makeup" -> doMakeupSign(player, tag.getLong("day"));
+            case "sign_makeup" -> doMakeupSign(player, tag.getLong("day"), tag.getString("pay_channel"));
             case "admin_signin_auto_toggle" -> adminSignInAutoToggle(player);
             case "admin_signin_cumulative_toggle" -> adminSignInCumulativeToggle(player);
             case "admin_signin_set" -> adminSignInSet(player, tag);
@@ -1512,6 +2297,18 @@ public final class ShopManager {
             case "admin_signin_reward_cancel" -> adminActivityRewardCancel(player);
             case "admin_shop_gen_set" -> adminShopGenSet(player, tag);
             case "eco_toggle_focus" -> ecoToggleFocus(player);
+            // ---- 个人主页公告 & 分层实体货币 & 系统定额费用 ----
+            case "admin_announcements_save" -> adminAnnouncementsSave(player, tag);
+            case "admin_phys_currency_save" -> adminPhysCurrencySave(player, tag);
+            case "admin_system_costs_set" -> adminSystemCostsSet(player, tag);
+            case "admin_exchange_limits" -> adminExchangeLimits(player, tag);
+            case "admin_profession_config_save" -> adminProfessionConfigSave(player, tag);
+            case "phys_currency_convert" -> {
+                synchronized (LOCK) {
+                    cn.autoforged.module_shop.shop.currency.PhysicalCurrencyEngine.executeConvert(
+                            player, tag.getInt("tierIndex"), tag.getString("direction"), tag.getInt("batches"));
+                }
+            }
             default -> {
             }
         }
@@ -1541,20 +2338,37 @@ public final class ShopManager {
         }
         // 需求 11：管理员用幽灵槽，模板单独保存，不进入 PENDING_ITEM，避免与返还的原物重复。
         if ("exchange".equals(context)) {
+            if (!requireUnlockedAdmin(player)) {
+                return;
+            }
             ADMIN_TEMPLATE.put(player.getUUID(), taken);
-            openInput(player, "admin_exchange_set", "gui.module_shop.input.exchange_value", null, "value");
+            CompoundTag exExtra = new CompoundTag();
+            exExtra.putString("default_daily_limit", "0");
+            openInput(player, "admin_exchange_set", "gui.module_shop.input.exchange_value", exExtra,
+                    "value", "daily_limit");
             return;
         }
         if ("admin".equals(context)) {
+            if (!requireUnlockedAdmin(player)) {
+                return;
+            }
             ADMIN_TEMPLATE.put(player.getUUID(), taken);
             AdminEditType type = ADMIN_EDIT_TYPE.getOrDefault(player.getUUID(), AdminEditType.DAILY_SHOP);
             CompoundTag extra = new CompoundTag();
             extra.putString("mode", type.id());
             // 需求 6/7：价值、品质、数量一次配置完成。
-            // 出货箱的「兑换规则」只需要物品 + 单价（每日份数由各等级的「每日额度」统一管），所以少两个字段。
+            // 出货箱的「兑换规则」支持物品 + 单价 + 每日上限（空 = 无限）。
             if (type == AdminEditType.SHIPPING) {
                 openInput(player, "admin_set_price_new", "gui.module_shop.input.shipping_rule_new", extra,
-                        "price");
+                        "price", "daily_max");
+            } else if (type == AdminEditType.MALL) {
+                ListTag permChoices = new ListTag();
+                permChoices.add(StringTag.valueOf("0"));
+                permChoices.add(StringTag.valueOf("1"));
+                extra.put("choices_permanent_limit", permChoices);
+                extra.putString("default_permanent_limit", "0");
+                openInput(player, "admin_set_price_new", "gui.module_shop.input.admin_offer", extra,
+                        "price", "rarity", "quantity", "permanent_limit");
             } else {
                 openInput(player, "admin_set_price_new", "gui.module_shop.input.admin_offer", extra,
                         "price", "rarity", "quantity");
@@ -1578,7 +2392,7 @@ public final class ShopManager {
 
     /** 需求 11：记录管理员当前编辑的模块（只有管理员能设，否则改价/删除会打到别人的上下文里）。 */
     public static void setAdminEditType(ServerPlayer player, String type) {
-        if (player == null || !player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         ADMIN_EDIT_TYPE.put(player.getUUID(), AdminEditType.byId(type));
@@ -1651,30 +2465,36 @@ public final class ShopManager {
      * {@code shop=true} 用每日商店的价格表与次数，{@code false} 用每日收购的（两者完全独立）。
      */
     public static long nextRefreshCost(PlayerAccount account, boolean shop) {
-        List<? extends String> costs = shop
-                ? Config.INSTANCE.dailyRefreshCosts.get() : Config.INSTANCE.buybackRefreshCosts.get();
+        List<PriceSpec> specs = shop ? Config.dailyRefreshSpecList() : Config.buybackRefreshSpecList();
         int used = Math.max(0, shop ? account.dailyShopRefreshUsed : account.dailyBuybackRefreshUsed);
-        if (used >= costs.size()) {
+        if (used >= specs.size()) {
             return -1L;
         }
-        try {
-            return Math.max(1L, Long.parseLong(String.valueOf(costs.get(used)).trim()));
-        } catch (NumberFormatException ex) {
-            return -1L;
+        PriceSpec spec = specs.get(used);
+        return spec.supportsStar() ? spec.starPrice : 0L;
+    }
+
+    private static PriceSpec paidSpecOf(CurrencySettlement.PayResult payRes, PriceSpec fallback) {
+        if (payRes == null) {
+            return fallback == null ? PriceSpec.ZERO : fallback;
         }
+        return switch (payRes.executedMode()) {
+            case PHYS_ONLY -> PriceSpec.phys(payRes.physTierKey(), payRes.physPaidCount());
+            case BOTH -> PriceSpec.both(payRes.starPaid(), payRes.physTierKey(), payRes.physPaidCount());
+            default -> PriceSpec.star(payRes.starPaid());
+        };
     }
 
     /**
-     * 付费刷新**每日商店**（只重抽卡牌，不动每日收购）：按价格表顺序扣费（默认第一次 200、第二次 500），
-     * 每日次数由价格表长度决定（默认 2 次），扣完即不可再刷新。
+     * 付费刷新**每日商店**（只重抽卡牌，不动每日收购）：支持四态 PriceSpec 阶梯收费（可配置 0 免费）。
      */
-    private static void refreshDailyShopPaid(ServerPlayer player) {
+    private static void refreshDailyShopPaid(ServerPlayer player, @Nullable String payChannel) {
         synchronized (LOCK) {
             PlayerAccount account = account(player);
             ShopSavedData data = data(player.server);
             ensureDaily(player, account, data);
-            long cost = nextRefreshCost(account, true);
-            if (cost < 0L) {
+            PriceSpec costSpec = data.nextRefreshSpec(account, true);
+            if (costSpec == null) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.refresh_no_uses")
                         .withStyle(ChatFormatting.RED));
                 return;
@@ -1684,14 +2504,11 @@ public final class ShopManager {
                         .withStyle(ChatFormatting.RED));
                 return;
             }
-            if (account.balance < cost) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.no_money")
-                        .withStyle(ChatFormatting.RED));
+            var payRes = CurrencySettlement.paySpec(
+                    player, account, data, costSpec, 1, payChannel, "purchase", SOURCE_EXCHANGE, true);
+            if (!payRes.ok()) {
+                CurrencySettlement.notifyPayFailure(player, payRes);
                 return;
-            }
-            if (debit(account, cost, "purchase") < 0L) { return; }
-            if (cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
-                data.treasury.inflow(cost, Config.shippingQuotaDay());
             }
             account.dailyShopRefreshUsed++;
             account.dailyShop.clear();
@@ -1699,15 +2516,31 @@ public final class ShopManager {
             generateDailyShop(player, account, data);
             refreshDailyPrices(account, data);
             data.setDirty();
+            PriceSpec paidSpec = paidSpecOf(payRes, costSpec);
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.SHOP_REFRESH, "模块商店",
-                    -cost, account.balance, "商店刷新");
-            long next = nextRefreshCost(account, true);
-            if (next < 0L) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.refresh_ok_last", cost)
-                        .withStyle(ChatFormatting.GREEN));
+                    -payRes.starPaid(), account.balance,
+                    payRes.paidPhys() ? "商店刷新 " + CurrencySettlement.formatSpec(paidSpec, player.server) : "商店刷新");
+            PriceSpec nextSpec = data.nextRefreshSpec(account, true);
+            if (!payRes.paidPhys() && (nextSpec == null || nextSpec.mode == CurrencyMode.STAR_ONLY)) {
+                long cost = payRes.starPaid();
+                long next = nextSpec == null ? -1L : nextSpec.starPrice;
+                if (next < 0L) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.refresh_ok_last", cost)
+                            .withStyle(ChatFormatting.GREEN));
+                } else {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.refresh_ok", cost, next)
+                            .withStyle(ChatFormatting.GREEN));
+                }
             } else {
-                notifyPlayer(player, Component.translatable("msg.module_shop.refresh_ok", cost, next)
-                        .withStyle(ChatFormatting.GREEN));
+                String spentStr = CurrencySettlement.formatSpec(paidSpec, player.server);
+                if (nextSpec == null) {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.refresh_ok_last_spec",
+                            "已刷新每日商店，花费 %s（今日刷新次数已用完）", spentStr).withStyle(ChatFormatting.GREEN));
+                } else {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.refresh_ok_spec",
+                            "已刷新每日商店，花费 %s（下次刷新：%s）", spentStr,
+                            CurrencySettlement.formatSpec(nextSpec, player.server)).withStyle(ChatFormatting.GREEN));
+                }
             }
             sendSnapshot(player, "daily");
         }
@@ -1715,15 +2548,15 @@ public final class ShopManager {
 
     /**
      * 付费刷新**每日收购**（只重抽收购清单，不动每日商店卡牌）：
-     * 价格与每日次数走 {@link Config#buybackRefreshCosts}，与商店分开计数。
+     * 价格与每日次数走配置表（支持实体货币与双通道），与商店分开计数。
      */
-    private static void refreshDailyBuybackPaid(ServerPlayer player) {
+    private static void refreshDailyBuybackPaid(ServerPlayer player, @Nullable String payChannel) {
         synchronized (LOCK) {
             PlayerAccount account = account(player);
             ShopSavedData data = data(player.server);
             ensureDaily(player, account, data);
-            long cost = nextRefreshCost(account, false);
-            if (cost < 0L) {
+            PriceSpec costSpec = data.nextRefreshSpec(account, false);
+            if (costSpec == null) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.refresh_no_uses")
                         .withStyle(ChatFormatting.RED));
                 return;
@@ -1733,38 +2566,52 @@ public final class ShopManager {
                         .withStyle(ChatFormatting.RED));
                 return;
             }
-            if (account.balance < cost) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.no_money")
-                        .withStyle(ChatFormatting.RED));
+            var payRes = CurrencySettlement.paySpec(
+                    player, account, data, costSpec, 1, payChannel, "purchase", SOURCE_EXCHANGE, true);
+            if (!payRes.ok()) {
+                CurrencySettlement.notifyPayFailure(player, payRes);
                 return;
-            }
-            if (debit(account, cost, "purchase") < 0L) { return; }
-            if (cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
-                data.treasury.inflow(cost, Config.shippingQuotaDay());
             }
             account.dailyBuybackRefreshUsed++;
             account.dailyBuyback.clear();
             generateDailyBuyback(player, account, data);
             refreshDailyPrices(account, data);
             data.setDirty();
+            PriceSpec paidSpec = paidSpecOf(payRes, costSpec);
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.SHOP_REFRESH, "模块商店",
-                    -cost, account.balance, "收购刷新");
-            long next = nextRefreshCost(account, false);
-            if (next < 0L) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.buyback_refresh_ok_last", cost)
-                        .withStyle(ChatFormatting.GREEN));
+                    -payRes.starPaid(), account.balance,
+                    payRes.paidPhys() ? "收购刷新 " + CurrencySettlement.formatSpec(paidSpec, player.server) : "收购刷新");
+            PriceSpec nextSpec = data.nextRefreshSpec(account, false);
+            if (!payRes.paidPhys() && (nextSpec == null || nextSpec.mode == CurrencyMode.STAR_ONLY)) {
+                long cost = payRes.starPaid();
+                long next = nextSpec == null ? -1L : nextSpec.starPrice;
+                if (next < 0L) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.buyback_refresh_ok_last", cost)
+                            .withStyle(ChatFormatting.GREEN));
+                } else {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.buyback_refresh_ok", cost, next)
+                            .withStyle(ChatFormatting.GREEN));
+                }
             } else {
-                notifyPlayer(player, Component.translatable("msg.module_shop.buyback_refresh_ok", cost, next)
-                        .withStyle(ChatFormatting.GREEN));
+                String spentStr = CurrencySettlement.formatSpec(paidSpec, player.server);
+                if (nextSpec == null) {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.buyback_refresh_ok_last_spec",
+                            "已刷新每日收购，花费 %s（今日刷新次数已用完）", spentStr).withStyle(ChatFormatting.GREEN));
+                } else {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.buyback_refresh_ok_spec",
+                            "已刷新每日收购，花费 %s（下次刷新：%s）", spentStr,
+                            CurrencySettlement.formatSpec(nextSpec, player.server)).withStyle(ChatFormatting.GREEN));
+                }
             }
             sendSnapshot(player, "buyback");
         }
     }
 
-    /** 当日收购清单全部卖完的一次性奖励（每天一次，Config.buybackAllBonus）。 */
+    /** 当日收购清单全部卖完的一次性奖励（每天一次，支持星币 / 实体货币 / 双账本）。 */
     private static void maybeGrantBuybackBonus(ServerPlayer player, PlayerAccount account, ShopSavedData data) {
-        long bonus = buybackBonusAmount(data);
-        if (bonus <= 0L || account.dailyBuybackBonusDone || account.dailyBuyback.isEmpty()) {
+        PriceSpec bonusSpec = buybackBonusSpec(data);
+        if (!data.buybackBonusEnabled || bonusSpec.isZero() || !bonusSpec.isValid()
+                || account.dailyBuybackBonusDone || account.dailyBuyback.isEmpty()) {
             return;
         }
         for (DailyBuybackEntry entry : account.dailyBuyback) {
@@ -1774,38 +2621,77 @@ public final class ShopManager {
         }
         long max = Config.maxBalanceLimit();
         long walletRoom = Math.max(0L, max - account.balance);
-        if (walletRoom <= 0L) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.grant_cap_reached")
-                    .withStyle(ChatFormatting.YELLOW));
-            return;
-        }
-        boolean eco = cn.autoforged.module_shop.eco.EcoPricing.isEcoActive();
-        long quotaDay = Config.shippingQuotaDay();
+        boolean eco = EcoPricing.isEcoActive();
         long minFloor = Config.INSTANCE.treasuryMinFloor.get();
-        long wantBonus = Math.min(bonus, walletRoom);
-        long payable = eco ? data.treasury.outflowUpTo(wantBonus, minFloor, quotaDay) : wantBonus;
-        if (payable <= 0L) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.treasury_capped")
-                    .withStyle(ChatFormatting.YELLOW));
-            return;
+        long treasurySpendable = eco ? data.treasury.spendableAboveFloor(minFloor) : Long.MAX_VALUE;
+
+        String channel = null;
+        if (bonusSpec.mode == CurrencyMode.EITHER) {
+            boolean starPossible = bonusSpec.starPrice > 0L && walletRoom > 0L && treasurySpendable > 0L;
+            if (!starPossible && bonusSpec.supportsPhys() && PhysicalCurrencyConfig.get().isActive()) {
+                channel = "phys";
+            } else {
+                channel = "star";
+            }
         }
-        long credited = credit(account, payable, max);
-        if (eco && payable > credited) {
-            data.treasury.refundOutflow(payable - credited, quotaDay);
+        boolean wantStar = bonusSpec.mode == CurrencyMode.STAR_ONLY
+                || bonusSpec.mode == CurrencyMode.BOTH
+                || ("star".equals(channel) && bonusSpec.mode == CurrencyMode.EITHER);
+        boolean wantPhys = bonusSpec.mode == CurrencyMode.PHYS_ONLY
+                || bonusSpec.mode == CurrencyMode.BOTH
+                || ("phys".equals(channel) && bonusSpec.mode == CurrencyMode.EITHER);
+
+        if (wantStar && !wantPhys) {
+            if (walletRoom <= 0L) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.grant_cap_reached")
+                        .withStyle(ChatFormatting.YELLOW));
+                return;
+            }
+            if (eco && treasurySpendable <= 0L) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.treasury_capped")
+                        .withStyle(ChatFormatting.YELLOW));
+                return;
+            }
         }
-        if (credited <= 0L) {
+
+        var payout = CurrencySettlement.payoutSpec(player.server, player.getUUID(), account, data,
+                bonusSpec, 1, channel, SOURCE_ADMIN, "每日收购", ItemStack.EMPTY, false, true);
+        if (payout.starCredited() <= 0L && payout.physPaidCount() <= 0L) {
+            if (wantStar && walletRoom <= 0L) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.grant_cap_reached")
+                        .withStyle(ChatFormatting.YELLOW));
+            } else if (wantStar) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.treasury_capped")
+                        .withStyle(ChatFormatting.YELLOW));
+            }
             return;
         }
         account.dailyBuybackBonusDone = true;
         data.setDirty();
+        PriceSpec grantedSpec = switch (payout.executedMode()) {
+            case PHYS_ONLY -> PriceSpec.phys(payout.physTierKey(), payout.physPaidCount());
+            case BOTH -> PriceSpec.both(payout.starCredited(), payout.physTierKey(), payout.physPaidCount());
+            default -> PriceSpec.star(payout.starCredited());
+        };
         TransactionLog.record(player.server, player.getUUID(), TransactionLog.BUYBACK_BONUS, "模块商店",
-                credited, account.balance, "");
-        notifyPlayer(player, Component.translatable("msg.module_shop.buyback_all_bonus", credited)
-                .withStyle(ChatFormatting.GOLD));
+                payout.starCredited(), account.balance,
+                payout.physPaidCount() > 0L ? CurrencySettlement.formatSpec(grantedSpec, player.server) : "");
+        if (payout.physPaidCount() > 0L) {
+            notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.buyback_all_bonus_spec",
+                    "今日收购清单全部完成！额外奖励 %s",
+                    CurrencySettlement.formatSpec(grantedSpec, player.server)).withStyle(ChatFormatting.GOLD));
+        } else {
+            notifyPlayer(player, Component.translatable("msg.module_shop.buyback_all_bonus", payout.starCredited())
+                    .withStyle(ChatFormatting.GOLD));
+        }
     }
 
-    /** 需求 8：每日商店支持一次购买多件（数量由客户端弹窗选择，服务端按限购/余额夹取）。 */
+    /** 需求 8：每日商店支持一次购买多件（兼容入口，自动按默认账本通道结算）。 */
     public static void buyShop(ServerPlayer player, int index, int requested) {
+        buyShop(player, index, requested, "");
+    }
+
+    public static void buyShop(ServerPlayer player, int index, int requested, @Nullable String payChannel) {
         // 需求 8：限购、余额、发货在同一把锁内完成，防止并发抢购最后一件。
         synchronized (LOCK) {
             PlayerAccount account = account(player);
@@ -1822,42 +2708,65 @@ public final class ShopManager {
                 return;
             }
             int buyCount = Math.min(Math.max(1, requested), remaining);
-            // 价格×数量必须做溢出保护：极端价格下裸乘会溢出成负数，
-            // 于是“余额不足”判定恒通过、扣款反而变成给买家加钱。
-            long total = safeMultiply(entry.price, buyCount);
-            if (total <= 0L) {
+            PriceSpec unitSpec = entry.resolvePriceSpec();
+            PriceSpec totalSpec = unitSpec.scale(buyCount);
+            if (!totalSpec.isValid()) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
                 return;
             }
-            // 需求 9：价格重新从服务端条目读取，绝不使用客户端传来的价格。
-            if (account.balance < total) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.no_money").withStyle(ChatFormatting.RED));
+            var plan = CurrencySettlement.planSpec(player, account, unitSpec, buyCount, payChannel);
+            if (!plan.ok()) {
+                CurrencySettlement.notifyPayFailure(player,
+                        CurrencySettlement.PayResult.fail(plan.failKey(), plan.failFallback()));
                 return;
             }
-            // 需求 10：保留附魔/自定义名/NBT；数量超过单栈上限时按份交付。
-            Component rewardName = entry.stack.getHoverName();
-            if (debit(account, total, "purchase") < 0L) { return; }
-            if (cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
-                data.treasury.inflow(total, Config.shippingQuotaDay());
+            if (plan.resolvedMode().includesPhys()) {
+                PriceSpec physCheck = PriceSpec.phys(plan.physTierKey(), plan.physCount());
+                if (PhysicalCurrencyEngine.isBuyPhysBelowCurrencyValue(
+                        entry.stack, buyCount, physCheck, player.level().registryAccess())) {
+                    notifyPlayer(player, Component.translatableWithFallback(
+                            "msg.module_shop.phys_buy_blocked_arbitrage",
+                            "防套利保护：该商品属于已启用的实体货币且售价低于面值，已禁止购买")
+                            .withStyle(ChatFormatting.RED));
+                    return;
+                }
+            }
+            // 需求 9：价格重新从服务端条目读取，绝不使用客户端传来的价格。
+            var payRes = CurrencySettlement.paySpec(
+                    player, account, data, unitSpec, buyCount, payChannel, "purchase", SOURCE_EXCHANGE, true);
+            if (!payRes.ok()) {
+                CurrencySettlement.notifyPayFailure(player, payRes);
+                return;
             }
             entry.bought += buyCount;
             data.setDirty();
-            // 背包放不下的部分转邮箱，避免因买多件而丢物品。
-            // 这里不再用“没有空格就拒绝购买”的预检：那会把“没有空槽但同类还能堆叠”误判成背包已满。
             deliver(player, entry.stack, buyCount, SOURCE_ADMIN);
+            PriceSpec paidSpec = paidSpecOf(payRes, totalSpec);
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.BUY, "模块商店",
-                    -total, account.balance, entry.stack.getHoverName().getString() + "×" + buyCount);
+                    -payRes.starPaid(), account.balance,
+                    entry.stack.getHoverName().getString() + "×" + buyCount
+                            + (payRes.paidPhys() ? " [" + CurrencySettlement.formatSpec(paidSpec, player.server) + "]" : ""));
             cn.autoforged.module_shop.api.event.ApiEvents.post(
                     new cn.autoforged.module_shop.api.event.PurchaseCompletedEvent(
-                            player.getUUID(), "daily", "daily-" + index, entry.stack, buyCount, total));
-            // 需求 6：摘要统一为“购买物品X，花费100星币”。
-            // 需求一：购买模板「花费 金额 星币 购买 物品名」，金额在前、物品名在后，物品名可为纯数字。
-            if (buyCount <= 1) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.bought",
-                        total, entry.stack.getHoverName()).withStyle(ChatFormatting.GREEN));
+                            player.getUUID(), "daily", "daily-" + index, entry.stack, buyCount, payRes.starPaid()));
+            if (!payRes.paidPhys()) {
+                long total = payRes.starPaid();
+                if (buyCount <= 1) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.bought",
+                            total, entry.stack.getHoverName()).withStyle(ChatFormatting.GREEN));
+                } else {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.bought_count",
+                            total, entry.stack.getHoverName(), buyCount).withStyle(ChatFormatting.GREEN));
+                }
             } else {
-                notifyPlayer(player, Component.translatable("msg.module_shop.bought_count",
-                        total, entry.stack.getHoverName(), buyCount).withStyle(ChatFormatting.GREEN));
+                String paidText = CurrencySettlement.formatSpec(paidSpec, player.server);
+                if (buyCount <= 1) {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.bought_spec",
+                            "花费 %s 购买 %s", paidText, entry.stack.getHoverName()).withStyle(ChatFormatting.GREEN));
+                } else {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.bought_count_spec",
+                            "花费 %s 购买 %s×%s", paidText, entry.stack.getHoverName(), buyCount).withStyle(ChatFormatting.GREEN));
+                }
             }
             sendSnapshot(player, "daily");
         }
@@ -1868,8 +2777,13 @@ public final class ShopManager {
     // 常驻货架：每件商品有 价格 / 品质 / 库存（-1 = 无限），购买即扣库存并记一条"最近购买"。
     // 管理端支持三种录入方式：幽灵槽单件添加、管理页逐条编辑（价格/品质/库存）、整模组批量导入。
 
-    /** 购物城：购买货架上的第 index 件商品（库存不够时按剩余数量成交）。 */
+    /** 购物城：购买货架上的第 index 件商品（兼容入口）。 */
     public static void buyMall(ServerPlayer player, int index, int requested) {
+        buyMall(player, index, requested, "");
+    }
+
+    /** 购物城：购买货架上的第 index 件商品（支持星币/实体货币/双通道结算）。 */
+    public static void buyMall(ServerPlayer player, int index, int requested, @Nullable String payChannel) {
         synchronized (LOCK) {
             PlayerAccount account = account(player);
             ShopSavedData data = data(player.server);
@@ -1877,34 +2791,62 @@ public final class ShopManager {
                 return;
             }
             MallItem item = data.mallPool.get(index);
-            // 「个人库存」模式下 stock 是**每个玩家各自的上限**，可用量要减去这个人已经买走的。
+            // 「每人永久限购」优先级最高（不随刷新/补货重置）；其次看全局「个人库存」模式。
             boolean personal = Config.mallStockPersonal();
-            int available = personal && !item.unlimited() ? item.remainingFor(player.getUUID()) : item.available();
+            int available = item.permanentLimit
+                    ? item.permanentRemainingFor(player.getUUID())
+                    : (personal && !item.unlimited() ? item.remainingFor(player.getUUID()) : item.available());
             if (available <= 0) {
-                // 个人库存里的「售罄」其实是「你自己这份已经买完」，文案要和全服库存区分开。
-                notifyPlayer(player, Component.translatable(personal
-                                ? "msg.module_shop.mall_personal_sold_out" : "msg.module_shop.mall_sold_out",
-                        item.stack.getHoverName()).withStyle(ChatFormatting.RED));
+                if (item.permanentLimit) {
+                    notifyPlayer(player, Component.translatableWithFallback(
+                            "msg.module_shop.mall_permanent_sold_out",
+                            "%s 为每人永久限购商品（你已购满 %s/%s，不随刷新重置）",
+                            item.stack.getHoverName(),
+                            item.permanentUsedFor(player.getUUID()),
+                            item.permanentCap()).withStyle(ChatFormatting.RED));
+                } else {
+                    // 个人库存里的「售罄」其实是「你自己这份已经买完」，文案要和全服库存区分开。
+                    notifyPlayer(player, Component.translatable(personal
+                                    ? "msg.module_shop.mall_personal_sold_out" : "msg.module_shop.mall_sold_out",
+                            item.stack.getHoverName()).withStyle(ChatFormatting.RED));
+                }
                 return;
             }
             int buyCount = Math.min(Math.max(1, requested), available);
-            // Eco 模式采用逐件积分计价：一次买 N 件与分 N 次每次买 1 件总价严格相等，防拆单漏洞。
-            long total = cn.autoforged.module_shop.eco.EcoPricing.quoteMallBatchAsk(item, buyCount);
-            if (total <= 0L) {
+            // Eco 模式采用逐件积分计价：一次买 N 件与分 N 次每次买 1 件总价严格相等，防拆单漏洞；实体货币按倍率缩放。
+            PriceSpec totalSpec = EcoPricing.quoteMallBatchSpec(item, buyCount);
+            if (!totalSpec.isValid()) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
                         .withStyle(ChatFormatting.RED));
                 return;
             }
-            if (account.balance < total) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.no_money")
-                        .withStyle(ChatFormatting.RED));
+            var plan = CurrencySettlement.planSpec(player, account, totalSpec, 1, payChannel);
+            if (!plan.ok()) {
+                CurrencySettlement.notifyPayFailure(player,
+                        CurrencySettlement.PayResult.fail(plan.failKey(), plan.failFallback()));
                 return;
             }
-            if (debit(account, total, "purchase") < 0L) { return; }
-            if (cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
-                data.treasury.inflow(total, Config.shippingQuotaDay());
+            if (plan.resolvedMode().includesPhys()) {
+                PriceSpec physCheck = PriceSpec.phys(plan.physTierKey(), plan.physCount());
+                if (PhysicalCurrencyEngine.isBuyPhysBelowCurrencyValue(
+                        item.stack, buyCount, physCheck, player.level().registryAccess())) {
+                    notifyPlayer(player, Component.translatableWithFallback(
+                            "msg.module_shop.phys_buy_blocked_arbitrage",
+                            "防套利保护：该商品属于已启用的实体货币且售价低于面值，已禁止购买")
+                            .withStyle(ChatFormatting.RED));
+                    return;
+                }
             }
-            if (!item.unlimited()) {
+            var payRes = CurrencySettlement.paySpec(
+                    player, account, data, totalSpec, 1, payChannel, "purchase", SOURCE_EXCHANGE, true);
+            if (!payRes.ok()) {
+                CurrencySettlement.notifyPayFailure(player, payRes);
+                return;
+            }
+            if (item.permanentLimit) {
+                // 每人永久限购：永久累计个人已购次数，绝不扣全服 stock，也不随刷新重置。
+                item.addPersonalUsed(player.getUUID(), buyCount);
+            } else if (!item.unlimited()) {
                 if (personal) {
                     // 个人库存：只记「这个人买了多少」，全服货架的 stock 不动。
                     item.addPersonalUsed(player.getUUID(), buyCount);
@@ -1912,22 +2854,42 @@ public final class ShopManager {
                     item.stock = Math.max(0, item.stock - buyCount);
                 }
             }
-            long avgUnitPrice = Math.max(1L, total / buyCount);
+            PriceSpec paidSpec = paidSpecOf(payRes, totalSpec);
+            PriceSpec avgUnitSpec = switch (payRes.executedMode()) {
+                case PHYS_ONLY -> PriceSpec.phys(payRes.physTierKey(), Math.max(1L, payRes.physPaidCount() / buyCount));
+                case BOTH -> PriceSpec.both(Math.max(1L, payRes.starPaid() / buyCount),
+                        payRes.physTierKey(), Math.max(1L, payRes.physPaidCount() / buyCount));
+                default -> PriceSpec.star(Math.max(1L, payRes.starPaid() / buyCount));
+            };
             data.addMallRecent(new MallPurchase(player.getGameProfile().getName(), item.stack, buyCount,
-                    avgUnitPrice, System.currentTimeMillis()));
+                    avgUnitSpec, paidSpec, System.currentTimeMillis()));
             data.setDirty();
             deliver(player, item.stack, buyCount, SOURCE_ADMIN);
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.BUY, "购物城",
-                    -total, account.balance, item.stack.getHoverName().getString() + "×" + buyCount);
+                    -payRes.starPaid(), account.balance,
+                    item.stack.getHoverName().getString() + "×" + buyCount
+                            + (payRes.paidPhys() ? " [" + CurrencySettlement.formatSpec(paidSpec, player.server) + "]" : ""));
             cn.autoforged.module_shop.api.event.ApiEvents.post(
                     new cn.autoforged.module_shop.api.event.PurchaseCompletedEvent(
-                            player.getUUID(), "mall", "mall-" + index, item.stack, buyCount, total));
-            if (buyCount <= 1) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.bought",
-                        total, item.stack.getHoverName()).withStyle(ChatFormatting.GREEN));
+                            player.getUUID(), "mall", "mall-" + index, item.stack, buyCount, payRes.starPaid()));
+            if (!payRes.paidPhys()) {
+                long total = payRes.starPaid();
+                if (buyCount <= 1) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.bought",
+                            total, item.stack.getHoverName()).withStyle(ChatFormatting.GREEN));
+                } else {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.bought_count",
+                            total, item.stack.getHoverName(), buyCount).withStyle(ChatFormatting.GREEN));
+                }
             } else {
-                notifyPlayer(player, Component.translatable("msg.module_shop.bought_count",
-                        total, item.stack.getHoverName(), buyCount).withStyle(ChatFormatting.GREEN));
+                String paidText = CurrencySettlement.formatSpec(paidSpec, player.server);
+                if (buyCount <= 1) {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.bought_spec",
+                            "花费 %s 购买 %s", paidText, item.stack.getHoverName()).withStyle(ChatFormatting.GREEN));
+                } else {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.bought_count_spec",
+                            "花费 %s 购买 %s×%s", paidText, item.stack.getHoverName(), buyCount).withStyle(ChatFormatting.GREEN));
+                }
             }
             sendSnapshot(player, "mall");
         }
@@ -1938,25 +2900,25 @@ public final class ShopManager {
      * 已经在货架上的物品按注册名去重跳过，重复导入不会出现两行一样的商品。
      */
     private static void adminMallImport(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         String namespace = tag.getString("mod").trim();
         if (namespace.isEmpty()) {
             return;
         }
-        long price = parseAdminPrice(player, tag.getString("price"));
-        if (price <= 0) {
+        PriceSpec priceSpec = parseAdminSpec(player, tag);
+        if (priceSpec == null) {
             return;
         }
-        Rarity rarity = parseRarity(tag.getString("rarity"), price);
+        long rarityHint = priceSpec.supportsStar() ? priceSpec.starPrice : Math.max(1L, priceSpec.physCount);
+        Rarity rarity = parseRarity(tag.getString("rarity"), rarityHint);
         int stock = parseMallStock(tag.getString("quantity"));
         ShopSavedData data = data(player.server);
-        Set<ResourceLocation> existing = new HashSet<>();
+        Map<Item, List<ItemStack>> existingByItem = new HashMap<>();
         for (MallItem item : data.mallPool) {
-            ResourceLocation id = BuiltInRegistries.ITEM.getKey(item.stack.getItem());
-            if (id != null) {
-                existing.add(id);
+            if (item != null && item.stack != null && !item.stack.isEmpty()) {
+                existingByItem.computeIfAbsent(item.stack.getItem(), k -> new ArrayList<>()).add(item.stack);
             }
         }
         int added = 0;
@@ -1980,7 +2942,18 @@ public final class ShopManager {
                 unnamed++;
                 continue;
             }
-            if (existing.contains(id)) {
+            ItemStack candidate = new ItemStack(item);
+            List<ItemStack> sameItem = existingByItem.get(item);
+            boolean duplicate = false;
+            if (sameItem != null) {
+                for (ItemStack existingStack : sameItem) {
+                    if (ItemStack.isSameItemSameComponents(existingStack, candidate)) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+            }
+            if (duplicate) {
                 skipped++;
                 continue;
             }
@@ -1989,10 +2962,10 @@ public final class ShopManager {
                 break;
             }
             // 用注册名的默认 ItemStack（含默认组件），保证和玩家实际拿到的物品一致。
-            MallItem mallItem = new MallItem(new ItemStack(item), price, rarity, stock);
+            MallItem mallItem = new MallItem(candidate, priceSpec, rarity, stock);
             mallItem.sort = data.mallPool.size();
             data.mallPool.add(mallItem);
-            existing.add(id);
+            existingByItem.computeIfAbsent(item, k -> new ArrayList<>()).add(candidate);
             added++;
         }
         data.setDirty();
@@ -2015,6 +2988,8 @@ public final class ShopManager {
 
     /** 出货箱：本游戏日是否已经遍历结算过（避免每 tick 遍历）。服务器启动时重置，见 {@link #resetShippingTick}。 */
     private static long shippingLoggedDay = Long.MIN_VALUE;
+    /** 永昼/冻结时间自动兜底时钟（服务器启动时重置）。 */
+    private static final ShippingSettleClock SHIPPING_CLOCK = new ShippingSettleClock();
 
     /**
      * 服务器启动时调用：清掉上一个存档留下的「今天已结算」标记。
@@ -2022,6 +2997,8 @@ public final class ShopManager {
      */
     public static void resetShippingTick() {
         shippingLoggedDay = Long.MIN_VALUE;
+        SHIPPING_CLOCK.reset();
+        LAST_SENT_MALL_HASH.clear();
     }
 
     /** 出货箱：放不进去的提醒节流（玩家 UUID → 上次提醒时刻）。 */
@@ -2032,12 +3009,25 @@ public final class ShopManager {
      * 由容器菜单在槽位拒绝放置时调用。
      */
     public static void notifyShippingRejected(ServerPlayer player) {
+        notifyShippingRejected(player, ItemStack.EMPTY);
+    }
+
+    public static void notifyShippingRejected(ServerPlayer player, ItemStack rejected) {
         long now = System.currentTimeMillis();
         Long last = SHIPPING_REJECT_WARNED.get(player.getUUID());
         if (last != null && now - last < 2000L) {
             return;
         }
         SHIPPING_REJECT_WARNED.put(player.getUUID(), now);
+        if (rejected != null && !rejected.isEmpty()
+                && CurrencySettlement.isBlockingBuybackAndShipping(
+                        rejected, player.level().registryAccess())) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                            "msg.module_shop.phys_sell_blocked_arbitrage",
+                            "防套利保护：已启用的实体货币物品禁止通过出货箱出售")
+                    .withStyle(ChatFormatting.RED));
+            return;
+        }
         notifyPlayer(player, Component.translatable("msg.module_shop.shipping_reject")
                 .withStyle(ChatFormatting.RED));
     }
@@ -2083,44 +3073,57 @@ public final class ShopManager {
                 .withStyle(ChatFormatting.GRAY));
     }
 
-    /** 出货箱：升级（花星币，最高到配置的最大等级）。 */
+    /** 出货箱：升级（兼容入口，支持星币 / 实体货币 / 双通道定价）。 */
     private static void upgradeShippingBin(ServerPlayer player) {
+        upgradeShippingBin(player, "");
+    }
+
+    private static void upgradeShippingBin(ServerPlayer player, @Nullable String payChannel) {
         if (!Config.INSTANCE.shippingEnabled.get()) {
             return;
         }
-        PlayerAccount account = account(player);
-        ShippingBin bin = account.shipping;
-        int maxLevel = Config.shippingLevels();
-        if (bin.level >= maxLevel) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.shipping_max_level", maxLevel)
-                    .withStyle(ChatFormatting.YELLOW));
-            return;
+        synchronized (LOCK) {
+            PlayerAccount account = account(player);
+            ShippingBin bin = account.shipping;
+            ShopSavedData savedData = data(player.server);
+            int maxLevel = savedData.shippingMaxLevel();
+            if (bin.level >= maxLevel) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.shipping_max_level", maxLevel)
+                        .withStyle(ChatFormatting.YELLOW));
+                return;
+            }
+            PriceSpec costSpec = savedData.shippingUpgradeSpecFor(bin.level);
+            if (costSpec == null) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.shipping_no_upgrade")
+                        .withStyle(ChatFormatting.YELLOW));
+                return;
+            }
+            var payRes = CurrencySettlement.paySpec(
+                    player, account, savedData, costSpec, 1, payChannel, "purchase", SOURCE_EXCHANGE, true);
+            if (!payRes.ok()) {
+                CurrencySettlement.notifyPayFailure(player, payRes);
+                return;
+            }
+            bin.level += 1;
+            int slots = Config.shippingSlotsFor(bin.level);
+            bin.resize(slots);
+            savedData.setDirty();
+            PriceSpec paidSpec = paidSpecOf(payRes, costSpec);
+            TransactionLog.record(player.server, player.getUUID(), TransactionLog.SHOP_REFRESH, "出货箱升级",
+                    -payRes.starPaid(), account.balance,
+                    "出货箱 → Lv." + bin.level + "（" + slots + " 格）"
+                            + (payRes.paidPhys() ? " [" + CurrencySettlement.formatSpec(paidSpec, player.server) + "]" : ""));
+            if (payRes.paidPhys()) {
+                notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.shipping_upgraded_spec",
+                        "出货箱已升级至 Lv.%s（%s 格），花费 %s",
+                        bin.level, slots, CurrencySettlement.formatSpec(paidSpec, player.server))
+                        .withStyle(ChatFormatting.GREEN));
+            } else {
+                notifyPlayer(player, Component.translatable("msg.module_shop.shipping_upgraded",
+                        bin.level, slots, payRes.starPaid()).withStyle(ChatFormatting.GREEN));
+            }
+            sendSnapshot(player, "shipping");
         }
-        long cost = Config.shippingUpgradeCost(bin.level);
-        if (cost < 0L) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.shipping_no_upgrade")
-                    .withStyle(ChatFormatting.YELLOW));
-            return;
-        }
-        if (account.balance < cost) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.no_money")
-                    .withStyle(ChatFormatting.RED));
-            return;
-        }
-        if (debit(account, cost, "purchase") < 0L) { return; }
-        ShopSavedData savedData = data(player.server);
-        if (cost > 0L && cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
-            savedData.treasury.inflow(cost, Config.shippingQuotaDay());
-        }
-        bin.level += 1;
-        int slots = Config.shippingSlotsFor(bin.level);
-        bin.resize(slots);
-        savedData.setDirty();
-        TransactionLog.record(player.server, player.getUUID(), TransactionLog.SHOP_REFRESH, "出货箱升级",
-                -cost, account.balance, "出货箱 → Lv." + bin.level + "（" + slots + " 格）");
-        notifyPlayer(player, Component.translatable("msg.module_shop.shipping_upgraded",
-                bin.level, slots, cost).withStyle(ChatFormatting.GREEN));
-        sendSnapshot(player, "shipping");
     }
 
     /**
@@ -2202,9 +3205,19 @@ public final class ShopManager {
         if (!Config.INSTANCE.shippingEnabled.get()) {
             return;
         }
-        long dayTime = server.overworld().getDayTime();
-        long gameDay = Math.floorDiv(dayTime, 24000L);
-        long timeOfDay = Math.floorMod(dayTime, 24000L);
+        var overworld = server.overworld();
+        boolean daylightOn = overworld.getGameRules().getBoolean(net.minecraft.world.level.GameRules.RULE_DAYLIGHT);
+        ShippingSettleClock.Sample clock = SHIPPING_CLOCK.sample(daylightOn, overworld.getDayTime(), overworld.getGameTime());
+        if (clock.modeChanged()) {
+            shippingLoggedDay = Long.MIN_VALUE;
+            org.slf4j.LoggerFactory.getLogger("module_shop").info(
+                    clock.fallbackGameTime()
+                            ? "出货箱：检测到永昼/昼夜时间停滞，已自动切换为运行刻定时结算（每 20 分钟一次）"
+                            : "出货箱：检测到昼夜循环恢复，已切回按游戏时间定时结算");
+            broadcastSnapshots(server);
+        }
+        long gameDay = clock.cycleDay();
+        long timeOfDay = clock.timeOfDay();
         long start = Config.INSTANCE.shippingSettleTick.get();
         // 游戏时间被调回（/time set day、/time set 0 …会把 DayTime 设成绝对值，游戏日从 0 重新数）：旧标记作废。
         if (shippingLoggedDay != Long.MIN_VALUE && shippingLoggedDay > gameDay) {
@@ -2215,7 +3228,7 @@ public final class ShopManager {
         }
         // 以前只在 [start, start + shippingSettleWindow] 这 9 秒窗口里结算：/time add、/time set noon、
         // 或服务器在窗口内卡顿超过 9 秒，都会把窗口整个跳过，当天就不出货了。
-        // 现在改为「当天到点后的第一次 tick 结算」（每个箱子仍然每个游戏日只结算一次，由 lastSettleGameDay 保证）。
+        // 现在改为「当天到点后的第一次 tick 结算」（每个箱子仍然每个周期只结算一次，由 lastSettleGameDay 保证）。
         if (timeOfDay < start) {
             return;
         }
@@ -2268,7 +3281,7 @@ public final class ShopManager {
         if (now - last < interval) {
             return;
         }
-        int restored = restockMall(data);
+        int restored = restockMall(data, false);
         if (byGame) {
             data.mallRefreshLastGame = now;
         } else {
@@ -2287,7 +3300,7 @@ public final class ShopManager {
 
     /** 管理员：购物城库存设置（库存模式：全服 / 个人；刷新方式：关闭 / 现实小时 / 游戏天数）。 */
     private static void adminMallRefresh(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         String stockText = tag.getString("stock_mode").trim().toLowerCase(java.util.Locale.ROOT);
@@ -2317,6 +3330,9 @@ public final class ShopManager {
         if (!stockMode.equals(wasPersonal ? "personal" : "global")) {
             ShopSavedData data = data(player.server);
             for (MallItem item : data.mallPool) {
+                if (item.permanentLimit) {
+                    continue;
+                }
                 if (item.stockMax >= 0) {
                     item.stock = item.stockMax;
                 }
@@ -2339,19 +3355,25 @@ public final class ShopManager {
             return;
         }
         ShopSavedData data = data(server);
-        long timeOfDay = server.overworld().getDayTime() % 24000L;
-        long gameDay = server.overworld().getDayTime() / 24000L;
+        long rawDayTime = server.overworld().getDayTime();
+        long timeOfDay = Math.floorMod(rawDayTime, 24000L);
+        long gameDay = Math.floorDiv(rawDayTime, 24000L);
         boolean restock;
         if (Config.mallRestockGameTime()) {
             long start = Config.mallRestockTick();
-            if (timeOfDay < start) {
-                return;   // 还没到补货时刻
-            }
             if (data.lastMallRestockGameDay == Long.MIN_VALUE) {
                 // 第一次运行只记录基准日（还没到点的话记「昨天」，这样当天的补货时刻仍会生效）
                 data.lastMallRestockGameDay = timeOfDay >= start ? gameDay : gameDay - 1L;
                 data.setDirty();
                 return;
+            }
+            // /time set 调回游戏时间时自动对齐基准日，避免补货长期停摆
+            if (gameDay < data.lastMallRestockGameDay) {
+                data.lastMallRestockGameDay = gameDay - 1L;
+                data.setDirty();
+            }
+            if (timeOfDay < start) {
+                return;   // 还没到补货时刻
             }
             if (gameDay <= data.lastMallRestockGameDay) {
                 return;   // 这个游戏日已经补过了
@@ -2372,9 +3394,10 @@ public final class ShopManager {
             restock = true;
         }
         if (restock) {
-            int restored = restockMall(data);
+            int restored = restockMall(data, true);
             data.setDirty();
             if (restored > 0) {
+                broadcastSnapshots(server);
                 server.getPlayerList().broadcastSystemMessage(
                         Component.translatable("msg.module_shop.mall_restocked", restored)
                                 .withStyle(ChatFormatting.GREEN), false);
@@ -2382,10 +3405,15 @@ public final class ShopManager {
         }
     }
 
-    /** 把货架上卖掉的库存补回目标数量，返回补过的商品件数（{@link #tickMallRestock} 用）。 */
-    private static int restockMall(ShopSavedData data) {
+    /** 把货架上卖掉的库存补回目标数量，返回补过的商品件数（{@link #tickMallRestock} / {@link #tickMallRefresh} 用）。 */
+    public static int restockMall(ShopSavedData data) {
+        return restockMall(data, true);
+    }
+
+    private static int restockMall(ShopSavedData data, boolean useUnifiedAmount) {
+        int unified = useUnifiedAmount ? Config.mallRestockAmount() : 0;
         return cn.autoforged.module_shop.eco.ClearingHouse.restockMallEco(
-                data, Config.mallRestockAmount(), Config.mallStockPersonal());
+                data, unified, Config.mallStockPersonal());
     }
 
     /** 结算单个玩家的出货箱（由 ClearingHouse 统一执行原子结算）。 */
@@ -2399,6 +3427,22 @@ public final class ShopManager {
                         sendSnapshot(online, "shipping");
                     }
                 });
+    }
+
+    private static String formatShippingPayoutSummary(MinecraftServer server, long starAmount,
+                                                      Map<String, Long> physCounts) {
+        List<String> parts = new ArrayList<>();
+        if (starAmount > 0L) {
+            parts.add(starAmount + " " + currencyName(server));
+        }
+        if (physCounts != null) {
+            for (Map.Entry<String, Long> e : physCounts.entrySet()) {
+                if (e.getValue() != null && e.getValue() > 0L) {
+                    parts.add(e.getValue() + " " + CurrencySettlement.tierDisplayName(e.getKey(), server));
+                }
+            }
+        }
+        return parts.isEmpty() ? ("0 " + currencyName(server)) : String.join(" + ", parts);
     }
 
     /**
@@ -2419,13 +3463,21 @@ public final class ShopManager {
         menu.broadcastChanges();
     }
 
-    /** 出货箱当前能拿到多少钱（界面展示：所有可出售物品按规则计价，再按今日剩余额度截断）。 */
-    private static long shippingPendingValue(PlayerAccount account, long realDay) {
+    private record PendingShippingQuote(long starTotal, Map<String, Long> physCounts) {
+    }
+
+    /** 出货箱当前能拿到多少钱（双账本预估：按星币与各阶实体币分别汇总）。 */
+    private static PendingShippingQuote shippingPendingQuote(PlayerAccount account, long realDay,
+                                                             @Nullable HolderLookup.Provider regs) {
         ShippingBin bin = account.shipping;
         long limit = Config.shippingDailyLimit(bin.level);
         long soldToday = bin.soldDay == realDay ? bin.soldToday : 0L;
         long remaining = limit == Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(0L, limit - soldToday);
+        PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+        boolean physActive = physCfg.isActive();
+
         long total = 0L;
+        Map<String, Long> physTotals = new java.util.LinkedHashMap<>();
         Map<Integer, Integer> counted = new HashMap<>();
         for (ItemStack stack : bin.slots) {
             if (stack == null || stack.isEmpty()) {
@@ -2435,23 +3487,64 @@ public final class ShopManager {
             if (rule == null) {
                 continue;
             }
-            int perDay = rule.dailyMax();
-            int used = bin.soldDay == realDay ? bin.ruleUsed.getOrDefault(rule.line(), 0) : 0;
-            int allowed = perDay <= 0 ? stack.getCount() : Math.max(0, perDay - used - counted.getOrDefault(rule.line(), 0));
-            int count = Math.min(stack.getCount(), Math.max(0, allowed));
-            if (count <= 0) {
+            PriceSpec ruleSpec = rule.resolvePriceSpec();
+            if (!ruleSpec.isValid()) {
                 continue;
             }
-            if (perDay > 0) {
-                counted.merge(rule.line(), count, Integer::sum);
+            if (regs != null && CurrencySettlement.isBlockingBuybackAndShippingForSpec(
+                    stack, ruleSpec, regs, rule.kind() == ShippingRules.Kind.ITEM)) {
+                continue;
             }
-            long gain = safeMultiply(rule.price(), count);
-            total += gain;
+            int perDay = rule.dailyMax();
+            int used = bin.soldDay == realDay ? bin.ruleUsed.getOrDefault(rule.line(), 0) : 0;
+            int allowed = perDay <= 0 ? stack.getCount()
+                    : Math.max(0, perDay - used - counted.getOrDefault(rule.line(), 0));
+            int tryCount = Math.min(stack.getCount(), Math.max(0, allowed));
+            if (tryCount <= 0) {
+                continue;
+            }
+            boolean physReady = ruleSpec.supportsPhys() && physActive && regs != null
+                    && physCfg.findResolvedTier(ruleSpec.physTierKey, regs) != null;
+            String canonTierKey = physReady ? physCfg.canonicalTierKey(ruleSpec.physTierKey) : "";
+            if ((ruleSpec.mode == CurrencyMode.PHYS_ONLY || ruleSpec.mode == CurrencyMode.BOTH) && !physReady) {
+                continue;
+            }
+            int soldHere = 0;
+            for (int k = 0; k < tryCount; k++) {
+                if (ruleSpec.mode == CurrencyMode.PHYS_ONLY) {
+                    physTotals.merge(canonTierKey, ruleSpec.physCount, Long::sum);
+                    soldHere++;
+                    continue;
+                }
+                long unit = ruleSpec.supportsStar() ? ruleSpec.starPrice : 0L;
+                boolean starFit = unit > 0L && (remaining == Long.MAX_VALUE || total + unit <= remaining);
+                if (ruleSpec.mode == CurrencyMode.EITHER) {
+                    if (starFit) {
+                        total += unit;
+                        soldHere++;
+                        continue;
+                    }
+                    if (physReady) {
+                        physTotals.merge(canonTierKey, ruleSpec.physCount, Long::sum);
+                        soldHere++;
+                        continue;
+                    }
+                    break;
+                }
+                if (!starFit) {
+                    break;
+                }
+                total += unit;
+                if (ruleSpec.mode == CurrencyMode.BOTH) {
+                    physTotals.merge(canonTierKey, ruleSpec.physCount, Long::sum);
+                }
+                soldHere++;
+            }
+            if (perDay > 0 && soldHere > 0) {
+                counted.merge(rule.line(), soldHere, Integer::sum);
+            }
         }
-        if (remaining != Long.MAX_VALUE && total > remaining) {
-            return remaining;
-        }
-        return total;
+        return new PendingShippingQuote(total, physTotals);
     }
 
     private static void sendShippingInfo(ServerPlayer player, CompoundTag tag, ShopSavedData data) {
@@ -2464,17 +3557,49 @@ public final class ShopManager {
         long extraLimit = cn.autoforged.module_shop.eco.ShippingModifierRegistry.extraDailyLimit(player.getUUID(), baseLimit);
         long limit = baseLimit == Long.MAX_VALUE ? Long.MAX_VALUE
                 : (Math.min(Long.MAX_VALUE - baseLimit, extraLimit) + baseLimit);
+        int maxLevel = data.shippingMaxLevel();
         tag.putBoolean("shipEnabled", Config.INSTANCE.shippingEnabled.get());
         tag.putInt("shipLevel", bin.level);
-        tag.putInt("shipMaxLevel", Config.shippingLevels());
+        tag.putInt("shipMaxLevel", maxLevel);
         tag.putInt("shipSlots", slots);
         tag.putInt("shipItems", bin.itemCount());
-        tag.putLong("shipValue", cn.autoforged.module_shop.eco.ClearingHouse.previewShippingPendingValue(
-                player.server, data, player.getUUID(), account, realDay));
+        var pendingQuote = ClearingHouse.previewShippingPending(
+                player.server, data, player.getUUID(), account, realDay);
+        tag.putLong("shipValue", pendingQuote.starTotal());
+        CompoundTag shipPhysTag = new CompoundTag();
+        String firstPhysTier = "";
+        long firstPhysCount = 0L;
+        for (Map.Entry<String, Long> pe : pendingQuote.physCounts().entrySet()) {
+            if (pe.getKey() != null && !pe.getKey().isBlank() && pe.getValue() != null && pe.getValue() > 0L) {
+                shipPhysTag.putLong(pe.getKey(), pe.getValue());
+                if (firstPhysTier.isEmpty()) {
+                    firstPhysTier = pe.getKey();
+                    firstPhysCount = pe.getValue();
+                }
+            }
+        }
+        if (!shipPhysTag.isEmpty()) {
+            tag.put("shipPhysValue", shipPhysTag);
+        }
+        if (pendingQuote.starTotal() > 0L && firstPhysCount > 0L && pendingQuote.physCounts().size() == 1) {
+            tag.put("shipValueSpec", PriceSpec.both(pendingQuote.starTotal(), firstPhysTier, firstPhysCount).toTag());
+        } else if (pendingQuote.starTotal() > 0L) {
+            tag.put("shipValueSpec", PriceSpec.star(pendingQuote.starTotal()).toTag());
+        } else if (firstPhysCount > 0L && pendingQuote.physCounts().size() == 1) {
+            tag.put("shipValueSpec", PriceSpec.phys(firstPhysTier, firstPhysCount).toTag());
+        }
         tag.putLong("shipSoldToday", bin.soldDay == realDay ? bin.soldToday : 0L);
         tag.putLong("shipLimit", limit == Long.MAX_VALUE ? 0L : limit);
-        tag.putLong("shipUpgradeCost", Config.shippingUpgradeCost(bin.level));
+        List<PriceSpec> upgradeSpecs = data.resolveShippingUpgradeSpecs();
+        PriceSpec nextUpgrade = data.shippingUpgradeSpecFor(bin.level);
+        tag.putLong("shipUpgradeCost", nextUpgrade == null ? -1L
+                : (nextUpgrade.supportsStar() ? nextUpgrade.starPrice : 0L));
+        if (nextUpgrade != null) {
+            tag.put("shipUpgradeSpec", nextUpgrade.toTag());
+        }
+        tag.put("shippingUpgradeSpecs", writeSpecList(upgradeSpecs));
         tag.putInt("shipSettleTick", Config.INSTANCE.shippingSettleTick.get());
+        tag.putBoolean("shipUseGameTime", SHIPPING_CLOCK.isFallbackGameTime());
         tag.putString("shipResetTime", Config.INSTANCE.shippingResetTime.get());
         List<ShippingRules.Rule> rules = ShippingRules.rules();
         List<String> errors = ShippingRules.errors();
@@ -2484,13 +3609,22 @@ public final class ShopManager {
         // 下发按玩家职业与当前做市库存动态折算后的规则文本（管理员编辑走 adminShippingRaw 原文，互不污染）
         tag.putString("shipRulesText",
                 cn.autoforged.module_shop.eco.ClearingHouse.buildDynamicShipRulesText(player.server, player, data));
-        // 每个等级的每日上限（管理页「每日额度」弹窗回填）
-        long[] limits = new long[Config.shippingLevels()];
+        // 每个等级的每日上限（管理页「每日额度」弹窗回填；按动态最大等级下发，支持 4~5+ 任意级）
+        long[] limits = new long[maxLevel];
         for (int i = 0; i < limits.length; i++) {
             long value = Config.shippingDailyLimit(i + 1);
             limits[i] = value == Long.MAX_VALUE ? 0L : value;
         }
         tag.putLongArray("shipDailyLimits", limits);
+        CompoundTag usedTag = new CompoundTag();
+        if (bin.soldDay == realDay && !bin.ruleUsed.isEmpty()) {
+            for (Map.Entry<Integer, Integer> entry : bin.ruleUsed.entrySet()) {
+                if (entry.getKey() != null && entry.getValue() != null && entry.getValue() > 0) {
+                    usedTag.putInt(Integer.toString(entry.getKey()), entry.getValue());
+                }
+            }
+        }
+        tag.put("shipRuleUsed", usedTag);
     }
 
     /**
@@ -2498,11 +3632,13 @@ public final class ShopManager {
      * （出货箱管理页 → 「每日额度」按钮）。直接写回配置文件；额度 0 = 不限，时间格式 HH:mm。
      */
     private static void adminShippingLimits(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
+        ShopSavedData data = data(player.server);
+        int maxScan = Math.max(64, data.shippingMaxLevel());
         List<String> limits = new ArrayList<>();
-        for (int i = 1; i <= 8; i++) {
+        for (int i = 1; i <= maxScan; i++) {
             String key = "limit" + i;
             if (!tag.contains(key)) {
                 break;
@@ -2549,7 +3685,7 @@ public final class ShopManager {
         notifyPlayer(player, Component.translatable("msg.module_shop.shipping_limits_saved",
                 shown.toString(), Config.dayTickToClock(Config.INSTANCE.shippingSettleTick.get()),
                 Config.INSTANCE.shippingResetTime.get()).withStyle(ChatFormatting.GREEN));
-        sendSnapshot(player, "admin");
+        broadcastSnapshots(player.server);
     }
 
     /**
@@ -2557,7 +3693,7 @@ public final class ShopManager {
      * 直接写回配置文件，格式不对明确报错并且**不保存**（避免把配置写坏）。
      */
     private static void adminMallRestock(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         boolean enabled = "1".equals(tag.getString("restock_on").trim())
@@ -2603,7 +3739,7 @@ public final class ShopManager {
 
     /** 管理员：一键把某个模组在购物城里的**全部物品**下架（配合「导入模组」的误操作回滚）。 */
     private static void adminMallRemoveMod(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         String namespace = tag.getString("mod").trim();
@@ -2623,8 +3759,13 @@ public final class ShopManager {
                 .withStyle(ChatFormatting.GREEN));
     }
 
-    /** 需求 9：玩家可自行选择卖出数量，上限为该物品剩余的收购数量。 */
+    /** 需求 9：玩家可自行选择卖出数量（兼容入口，自动按默认账本通道结算）。 */
     public static void sellBuyback(ServerPlayer player, int index, int requested) {
+        sellBuyback(player, index, requested, "");
+    }
+
+    /** 每日收购：按所选账本通道结算（PHYS_ONLY 绕过星币上限；EITHER 支持指定通道）。 */
+    public static void sellBuyback(ServerPlayer player, int index, int requested, @Nullable String payChannel) {
         synchronized (LOCK) {
             PlayerAccount account = account(player);
             ShopSavedData data = data(player.server);
@@ -2633,29 +3774,94 @@ public final class ShopManager {
                 return;
             }
             DailyBuybackEntry entry = account.dailyBuyback.get(index);
+            PriceSpec entrySpec = entry.resolvePriceSpec();
+            if (!entrySpec.isValid()) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
+                return;
+            }
+            if (CurrencySettlement.isBlockingBuybackAndShippingForSpec(
+                    entry.stack, entrySpec, player.level().registryAccess(), true)) {
+                notifyPlayer(player, Component.translatableWithFallback(
+                        "msg.module_shop.phys_sell_blocked_arbitrage",
+                        "防套利保护：已启用的实体货币物品禁止通过每日收购卖出")
+                        .withStyle(ChatFormatting.RED));
+                return;
+            }
             if (entry.remaining() <= 0) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.buyback_full").withStyle(ChatFormatting.RED));
                 return;
             }
             long max = Config.maxBalanceLimit();
             long room = Math.max(0L, max - account.balance);
-            boolean eco = cn.autoforged.module_shop.eco.EcoPricing.isEcoActive();
+            boolean eco = EcoPricing.isEcoActive();
             long minFloor = Config.INSTANCE.treasuryMinFloor.get();
             long treasuryRoom = eco ? data.treasury.spendableAboveFloor(minFloor) : Long.MAX_VALUE;
 
-            // 结算期二次校验：实时满仓停收 + 实时 82% 官店卖价硬钳位，严防早间锁价在日内官店补货降价后反超套利
+            String ch = payChannel == null ? "" : payChannel.trim().toLowerCase(java.util.Locale.ROOT);
+            long liveUnit0 = entrySpec.supportsStar()
+                    ? (eco ? EcoPricing.clampLiveBuybackUnit(data, entry.stack, entrySpec.starPrice, 0) : entrySpec.starPrice)
+                    : 0L;
+
+            CurrencyMode targetMode;
+            switch (entrySpec.mode) {
+                case STAR_ONLY -> {
+                    if ("phys".equals(ch)) {
+                        CurrencySettlement.notifyPayFailure(player, CurrencySettlement.PayResult.fail(
+                                "msg.module_shop.channel_not_supported", "该收购项仅支持星币结算"));
+                        return;
+                    }
+                    targetMode = CurrencyMode.STAR_ONLY;
+                }
+                case PHYS_ONLY -> {
+                    if ("star".equals(ch)) {
+                        CurrencySettlement.notifyPayFailure(player, CurrencySettlement.PayResult.fail(
+                                "msg.module_shop.channel_not_supported", "该收购项仅支持实体货币结算"));
+                        return;
+                    }
+                    targetMode = CurrencyMode.PHYS_ONLY;
+                }
+                case BOTH -> targetMode = CurrencyMode.BOTH;
+                case EITHER -> {
+                    if ("phys".equals(ch)) {
+                        targetMode = CurrencyMode.PHYS_ONLY;
+                    } else if ("star".equals(ch)) {
+                        targetMode = CurrencyMode.STAR_ONLY;
+                    } else if (ch.isEmpty()) {
+                        boolean starViable = liveUnit0 > 0L && room >= liveUnit0 && (!eco || treasuryRoom >= liveUnit0);
+                        boolean physViable = PhysicalCurrencyConfig.get().isActive()
+                                && PhysicalCurrencyConfig.get().findTier(entrySpec.physTierKey) != null;
+                        targetMode = (!starViable && physViable) ? CurrencyMode.PHYS_ONLY : CurrencyMode.STAR_ONLY;
+                    } else {
+                        CurrencySettlement.notifyPayFailure(player, CurrencySettlement.PayResult.fail(
+                                "msg.module_shop.channel_not_supported", "无效的支付账本通道"));
+                        return;
+                    }
+                }
+                default -> targetMode = CurrencyMode.STAR_ONLY;
+            }
+
+            if (targetMode.includesPhys()) {
+                PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+                if (!physCfg.isActive() || physCfg.findTier(entrySpec.physTierKey) == null) {
+                    notifyPlayer(player, Component.translatableWithFallback(
+                            "msg.module_shop.phys_tier_unavailable", "所需的实体货币档位未启用或不存在")
+                            .withStyle(ChatFormatting.RED));
+                    return;
+                }
+            }
+
+            // 结算期二次校验：实时满仓停收
             int maxByWarehouse = entry.remaining();
             double toMallRatio = eco ? Math.max(0.0D, Math.min(1.0D, Config.INSTANCE.ecoBuybackToMallRatio.get())) : 0.0D;
             if (eco) {
-                int whRoom = cn.autoforged.module_shop.eco.EcoPricing.remainingWarehouseCapacity(
-                        data, entry.stack, entry.limit);
+                int whRoom = EcoPricing.remainingWarehouseCapacity(data, entry.stack, entry.limit);
                 if (whRoom <= 0) {
                     notifyPlayer(player, Component.translatable("msg.module_shop.warehouse_full")
                             .withStyle(ChatFormatting.YELLOW));
                     return;
                 }
                 if (toMallRatio > 0.0D) {
-                    while (maxByWarehouse > 0 && (int) Math.ceil(maxByWarehouse * toMallRatio - 1e-9) > whRoom) { // 按概率取整的最坏情况（向上取整）预留仓容
+                    while (maxByWarehouse > 0 && (int) Math.ceil(maxByWarehouse * toMallRatio - 1e-9) > whRoom) {
                         maxByWarehouse--;
                     }
                     if (maxByWarehouse <= 0) {
@@ -2666,24 +3872,27 @@ public final class ShopManager {
                 }
             }
 
-            long liveUnit0 = eco
-                    ? cn.autoforged.module_shop.eco.EcoPricing.clampLiveBuybackUnit(data, entry.stack, entry.price, 0)
-                    : entry.price;
-            if (liveUnit0 <= 0L) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
-                return;
-            }
-            if (room < liveUnit0) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.grant_cap_reached").withStyle(ChatFormatting.RED));
-                return;
-            }
-            if (eco && treasuryRoom < liveUnit0) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.treasury_capped").withStyle(ChatFormatting.YELLOW));
-                return;
+            int affordable;
+            if (targetMode.includesStar()) {
+                if (liveUnit0 <= 0L) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
+                    return;
+                }
+                if (room < liveUnit0) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.grant_cap_reached").withStyle(ChatFormatting.RED));
+                    return;
+                }
+                if (eco && treasuryRoom < liveUnit0) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.treasury_capped").withStyle(ChatFormatting.YELLOW));
+                    return;
+                }
+                affordable = (int) Math.min(Integer.MAX_VALUE, room / liveUnit0);
+            } else {
+                affordable = entrySpec.physCount <= 0L
+                        ? 0
+                        : (int) Math.min(Integer.MAX_VALUE, (Long.MAX_VALUE / 2L) / entrySpec.physCount);
             }
 
-            long capRoom = Math.min(room, treasuryRoom);
-            int affordable = (int) Math.min(Integer.MAX_VALUE, capRoom / liveUnit0);
             int wanted = Math.min(requested <= 0 ? 1 : requested, Math.min(maxByWarehouse, affordable));
             int taken = takeBuybackMatching(player, entry.stack, wanted);
             if (taken <= 0) {
@@ -2691,29 +3900,45 @@ public final class ShopManager {
                 return;
             }
 
-            int postInjectOffset = eco ? Math.max(0, (int) Math.ceil(taken * toMallRatio - 1e-9) - 1) : 0;
-            long effectiveUnit = eco
-                    ? cn.autoforged.module_shop.eco.EcoPricing.clampLiveBuybackUnit(data, entry.stack, liveUnit0, postInjectOffset)
-                    : liveUnit0;
-            if (effectiveUnit < entry.price && effectiveUnit > 0L) {
-                entry.price = effectiveUnit;
+            int postInjectOffset = (eco && targetMode.includesStar())
+                    ? Math.max(0, (int) Math.ceil(taken * toMallRatio - 1e-9) - 1) : 0;
+            long effectiveStarUnit = targetMode.includesStar()
+                    ? (eco ? EcoPricing.clampLiveBuybackUnit(data, entry.stack, liveUnit0, postInjectOffset) : liveUnit0)
+                    : 0L;
+            if (targetMode.includesStar() && effectiveStarUnit < entrySpec.starPrice && effectiveStarUnit > 0L) {
+                entry.setPriceSpec(entrySpec.withStarPrice(effectiveStarUnit));
             }
-            long total = safeMultiply(effectiveUnit, taken);
-            if (effectiveUnit <= 0L || total <= 0L) {
+            long starTotal = targetMode.includesStar() ? safeMultiply(effectiveStarUnit, taken) : 0L;
+            long physTotal = targetMode.includesPhys() ? safeMultiply(entrySpec.physCount, taken) : 0L;
+            if ((targetMode.includesStar() && (effectiveStarUnit <= 0L || starTotal <= 0L))
+                    || (targetMode.includesPhys() && physTotal <= 0L)) {
                 deliver(player, entry.stack, taken, SOURCE_ADMIN);
                 notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
                 return;
             }
-            long quotaDay = Config.shippingQuotaDay();
-            long paid = eco ? data.treasury.outflowUpTo(total, minFloor, quotaDay) : total;
-            long credited = credit(account, paid, max);
-            if (eco && paid > credited) {
-                data.treasury.refundOutflow(paid - credited, quotaDay);
+
+            long credited = 0L;
+            if (targetMode.includesStar()) {
+                credited = CurrencySettlement.payoutStarOnly(
+                        player.server, player.getUUID(), account, data, starTotal, true, false, SOURCE_ADMIN, null, null);
+                if (credited <= 0L) {
+                    deliver(player, entry.stack, taken, SOURCE_ADMIN);
+                    notifyPlayer(player, Component.translatable(
+                            eco && treasuryRoom < effectiveStarUnit
+                                    ? "msg.module_shop.treasury_capped" : "msg.module_shop.grant_cap_reached")
+                            .withStyle(ChatFormatting.YELLOW));
+                    return;
+                }
             }
+            if (targetMode.includesPhys()) {
+                CurrencySettlement.payoutPhysTier(
+                        player.server, player.getUUID(), entrySpec.physTierKey, physTotal, SOURCE_ADMIN);
+            }
+
             entry.sold += taken;
             if (eco) {
                 // 每日收购 30% 入购物城/黑市库存，其余 70% 直接销毁泄洪
-                cn.autoforged.module_shop.eco.ClearingHouse.injectSoldItemIntoMarket(
+                ClearingHouse.injectSoldItemIntoMarket(
                         data, entry.stack, taken, entry.limit, toMallRatio);
                 String profId = cn.autoforged.module_shop.eco.profession.ProfessionManager.matchProfessionForOutput(entry.stack);
                 if (!profId.isEmpty() && credited > 0L) {
@@ -2722,13 +3947,26 @@ public final class ShopManager {
                 }
             }
             data.setDirty();
+            PriceSpec paidSpec = switch (targetMode) {
+                case PHYS_ONLY -> PriceSpec.phys(entrySpec.physTierKey, physTotal);
+                case BOTH -> PriceSpec.both(credited, entrySpec.physTierKey, physTotal);
+                default -> PriceSpec.star(credited);
+            };
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.SELL, "模块商店",
-                    credited, account.balance, entry.stack.getHoverName().getString() + "×" + taken);
+                    credited, account.balance,
+                    entry.stack.getHoverName().getString() + "×" + taken
+                            + (targetMode.includesPhys() ? " [" + CurrencySettlement.formatSpec(paidSpec, player.server) + "]" : ""));
             cn.autoforged.module_shop.api.event.ApiEvents.post(
                     new cn.autoforged.module_shop.api.event.SellCompletedEvent(
                             player.getUUID(), "buyback", "buyback-" + index, entry.stack, taken, credited));
-            notifyPlayer(player, Component.translatable("msg.module_shop.sold_count", entry.stack.getHoverName(), taken, credited)
-                    .withStyle(ChatFormatting.GREEN));
+            if (targetMode.includesPhys()) {
+                notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.sold_count_spec",
+                        "已卖出 %s×%s，获得 %s", entry.stack.getHoverName(), taken,
+                        CurrencySettlement.formatSpec(paidSpec, player.server)).withStyle(ChatFormatting.GREEN));
+            } else {
+                notifyPlayer(player, Component.translatable("msg.module_shop.sold_count",
+                        entry.stack.getHoverName(), taken, credited).withStyle(ChatFormatting.GREEN));
+            }
             // 当日收购清单全部卖完 → 一次性奖励（在推送快照前结算，界面立刻能看到）。
             maybeGrantBuybackBonus(player, account, data);
             sendSnapshot(player, "buyback");
@@ -2814,53 +4052,100 @@ public final class ShopManager {
     // =========================================================== 摊位
 
     public static void stallSetPriceNew(ServerPlayer player, CompoundTag tag) {
-        ItemStack stack = PENDING_ITEM.remove(player.getUUID());
-        if (stack == null || stack.isEmpty()) {
-            return;
+        synchronized (LOCK) {
+            ItemStack stack = PENDING_ITEM.remove(player.getUUID());
+            if (stack == null || stack.isEmpty()) {
+                return;
+            }
+            PriceSpec spec = cn.autoforged.module_shop.shop.stall.StallService.parseStallSpecFromTag(tag);
+            // 需求 4：上架时可设置库存数量（单件价格），最大 64，且不能超过实际持有量。
+            int requested = parseInt(tag.getString("quantity"));
+            int total = Math.min(Config.INSTANCE.stallMaxStock.get(), requested <= 0 ? Math.max(1, stack.getCount()) : requested);
+            total = Math.min(total, Math.max(1, stack.getCount()));
+            PlayerAccount account = account(player);
+            ShopSavedData data = data(player.server);
+            if (spec == null || !spec.isValid()
+                    || (spec.mode != CurrencyMode.STAR_ONLY && spec.mode != CurrencyMode.PHYS_ONLY)) {
+                addItemOrMail(player, stack, SOURCE_ADMIN);
+                notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
+                return;
+            }
+            if (spec.mode == CurrencyMode.PHYS_ONLY) {
+                PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+                var tier = physCfg.findTier(spec.physTierKey);
+                if (!physCfg.isActive() || tier == null) {
+                    addItemOrMail(player, stack, SOURCE_ADMIN);
+                    notifyPlayer(player, Component.translatableWithFallback(
+                            "msg.module_shop.phys_tier_unavailable", "所需的实体货币档位未启用或不存在")
+                            .withStyle(ChatFormatting.RED));
+                    return;
+                }
+                spec = spec.withPhysTierKey(tier.tierKey());
+            } else {
+                long cap = Config.maxBalanceLimit();
+                if (cap != Long.MAX_VALUE && spec.starPrice > cap) {
+                    addItemOrMail(player, stack, SOURCE_ADMIN);
+                    notifyPlayer(player, Component.translatable("msg.module_shop.price_over_cap",
+                            Long.toString(cap)).withStyle(ChatFormatting.RED));
+                    return;
+                }
+            }
+            if (account.stall.size() >= Config.INSTANCE.stallSlots.get()) {
+                addItemOrMail(player, stack, SOURCE_ADMIN);
+                notifyPlayer(player, Component.translatable("msg.module_shop.stall_full").withStyle(ChatFormatting.RED));
+                return;
+            }
+            double feePercent = Config.INSTANCE.stallListingFeePercent.get();
+            if (spec.mode == CurrencyMode.PHYS_ONLY) {
+                long fee = feePercent <= 0.0D ? 0L : (long) Math.ceil(spec.physCount * feePercent / 100.0D);
+                if (fee > 0L) {
+                    var feePay = CurrencySettlement.payPhysTier(player, spec.physTierKey, fee, SOURCE_EXCHANGE);
+                    if (!feePay.ok()) {
+                        addItemOrMail(player, stack, SOURCE_ADMIN);
+                        CurrencySettlement.notifyPayFailure(player, feePay);
+                        return;
+                    }
+                }
+            } else {
+                long fee = feePercent <= 0.0D ? 0L : (long) Math.ceil(spec.starPrice * feePercent / 100.0D);
+                if (fee > 0L) {
+                    var feePay = CurrencySettlement.payStar(account, fee, "fee");
+                    if (!feePay.ok()) {
+                        addItemOrMail(player, stack, SOURCE_ADMIN);
+                        CurrencySettlement.notifyPayFailure(player, feePay);
+                        return;
+                    }
+                    if (EcoPricing.isEcoActive()) {
+                        data.treasury.inflow(fee, Config.shippingQuotaDay());
+                    }
+                }
+            }
+            // 超出上架数量的部分原路退还，避免物品丢失。
+            if (total < stack.getCount()) {
+                ItemStack leftover = stack.copy();
+                leftover.setCount(stack.getCount() - total);
+                addItemOrMail(player, leftover, SOURCE_STALL_UNSOLD);
+            }
+            ItemStack unit = stack.copy();
+            unit.setCount(1);
+            StallEntry fresh = new StallEntry(unit, spec, data.listingCounter++, total);
+            // 「商店设置 → 摊位下架时间」：记下上架时刻（游戏刻 + 现实毫秒各一份），限时到期由 tickStallExpire 下架。
+            fresh.listedGame = player.server.overworld().getGameTime();
+            fresh.listedReal = System.currentTimeMillis();
+            account.stall.add(fresh);
+            data.setDirty();
+            if (spec.mode == CurrencyMode.PHYS_ONLY) {
+                notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.stall_listed_spec",
+                        "已上架 %s，单价 %s，库存 %s",
+                        unit.getHoverName(), CurrencySettlement.formatSpec(spec, player.server), total)
+                        .withStyle(ChatFormatting.GREEN));
+            } else {
+                notifyPlayer(player, Component.translatable("msg.module_shop.stall_listed",
+                        unit.getHoverName(), spec.starPrice, total).withStyle(ChatFormatting.GREEN));
+            }
+            sendSnapshot(player, "stall");
+            broadcastSnapshots(player.server);
         }
-        long price = parsePrice(tag.getString("price"));
-        // 需求 4：上架时可设置库存数量（单件价格），最大 64，且不能超过实际持有量。
-        int requested = parseInt(tag.getString("quantity"));
-        int total = Math.min(Config.INSTANCE.stallMaxStock.get(), requested <= 0 ? Math.max(1, stack.getCount()) : requested);
-        total = Math.min(total, Math.max(1, stack.getCount()));
-        PlayerAccount account = account(player);
-        ShopSavedData data = data(player.server);
-        if (price <= 0) {
-            addItemOrMail(player, stack, SOURCE_ADMIN);
-            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
-            return;
-        }
-        if (account.stall.size() >= Config.INSTANCE.stallSlots.get()) {
-            addItemOrMail(player, stack, SOURCE_ADMIN);
-            notifyPlayer(player, Component.translatable("msg.module_shop.stall_full").withStyle(ChatFormatting.RED));
-            return;
-        }
-        double feePercent = Config.INSTANCE.stallListingFeePercent.get();
-        long fee = (long) Math.ceil(price * feePercent / 100.0D);
-        if (fee > 0 && account.balance < fee) {
-            addItemOrMail(player, stack, SOURCE_ADMIN);
-            notifyPlayer(player, Component.translatable("msg.module_shop.no_money").withStyle(ChatFormatting.RED));
-            return;
-        }
-        if (debit(account, fee, "fee") < 0L) { return; }
-        // 超出上架数量的部分原路退还，避免物品丢失。
-        if (total < stack.getCount()) {
-            ItemStack leftover = stack.copy();
-            leftover.setCount(stack.getCount() - total);
-            addItemOrMail(player, leftover, SOURCE_STALL_UNSOLD);
-        }
-        ItemStack unit = stack.copy();
-        unit.setCount(1);
-        StallEntry fresh = new StallEntry(unit, price, data.listingCounter++, total);
-        // 「商店设置 → 摊位下架时间」：记下上架时刻（游戏刻 + 现实毫秒各一份），限时到期由 tickStallExpire 下架。
-        fresh.listedGame = player.server.overworld().getGameTime();
-        fresh.listedReal = System.currentTimeMillis();
-        account.stall.add(fresh);
-        data.setDirty();
-        notifyPlayer(player, Component.translatable("msg.module_shop.stall_listed", unit.getHoverName(), price, total)
-                .withStyle(ChatFormatting.GREEN));
-        sendSnapshot(player, "stall");
-        broadcastSnapshots(player.server);
     }
 
     // =========================================================== 玩家求购（悬赏）
@@ -2915,18 +4200,8 @@ public final class ShopManager {
         }
         ShopSavedData data = data(server);
         PlayerAccount account = data.account(entry.requester);
-        if (entry.rewardMoney > 0L) {
-            long credited = credit(account, entry.rewardMoney, Config.maxBalanceLimit());
-            if (credited > 0L) {
-                TransactionLog.record(server, entry.requester, TransactionLog.TRANSFER_IN,
-                        "求购退款", credited, account.balance, "求购托管退回");
-            }
-            long rest = entry.rewardMoney - credited;
-            if (rest > 0L) {
-                addMoneyMail(server, entry.requester, rest, entry.rewardItem.copy(), SOURCE_DEMAND_REFUND,
-                        sender, null);
-            }
-        }
+        payoutDemandCurrency(server, entry.requester, account, entry, SOURCE_DEMAND_REFUND, sender,
+                "求购退款", "求购托管退回");
         if (entry.rewardItem != null && !entry.rewardItem.isEmpty()) {
             ItemStack refund = entry.rewardItem.copy();
             ServerPlayer online = server.getPlayerList().getPlayer(entry.requester);
@@ -2939,12 +4214,125 @@ public final class ShopManager {
         data.setDirty();
     }
 
+    private static void payoutDemandCurrency(MinecraftServer server, UUID targetId, PlayerAccount targetAccount,
+                                             DemandEntry entry, String mailSource, String senderName,
+                                             String txSource, String txNote) {
+        PriceSpec rSpec = entry.resolveRewardSpec();
+        if (rSpec.isZero()) {
+            return;
+        }
+        // 兼容旧存档遗留的混合实体托管字段
+        if (entry.physicalEscrow > 0L && rSpec.mode == CurrencyMode.STAR_ONLY) {
+            long physUnits = Math.min(rSpec.starPrice, entry.physicalEscrow);
+            long starPart = Math.max(0L, rSpec.starPrice - physUnits);
+            deliverLegacyPhysicalEscrow(server, targetId, physUnits, mailSource);
+            long starSettled = CurrencySettlement.payoutStarOnly(
+                    server, targetId, targetAccount, null, starPart, false, true,
+                    mailSource, senderName, entry.rewardItem);
+            if (starSettled + physUnits > 0L) {
+                TransactionLog.record(server, targetId, TransactionLog.TRANSFER_IN,
+                        txSource, starSettled, targetAccount.balance, txNote);
+            }
+            return;
+        }
+        var res = CurrencySettlement.payoutSpec(
+                server, targetId, targetAccount, null, rSpec, 1, null,
+                mailSource, senderName, entry.rewardItem, true, false);
+        if (res.starCredited() > 0L || res.physPaidCount() > 0L) {
+            String note = res.physPaidCount() > 0L
+                    ? txNote + " [" + CurrencySettlement.formatSpec(rSpec, server) + "]" : txNote;
+            TransactionLog.record(server, targetId, TransactionLog.TRANSFER_IN,
+                    txSource, res.starCredited(), targetAccount.balance, note);
+        }
+    }
+
+    private static void deliverLegacyPhysicalEscrow(MinecraftServer server, UUID targetId, long units, String source) {
+        if (server == null || targetId == null || units <= 0L) {
+            return;
+        }
+        HolderLookup.Provider regs = server.registryAccess();
+        PhysicalCurrencyConfig cfg = PhysicalCurrencyConfig.get();
+        List<PhysicalCurrencyConfig.ResolvedTier> tiers = cfg.resolveAllForDisplay(regs);
+        if (tiers.isEmpty()) {
+            return;
+        }
+        long[] vals = new long[tiers.size()];
+        for (int i = 0; i < tiers.size(); i++) {
+            vals[i] = tiers.get(i).template.isEmpty() ? 0L : tiers.get(i).spec.value;
+        }
+        var plan = PhysicalCurrencyEngine.decomposePayout(units, vals);
+        ServerPlayer online = server.getPlayerList().getPlayer(targetId);
+        for (int i = tiers.size() - 1; i >= 0; i--) {
+            int cnt = plan.counts()[i];
+            if (cnt > 0 && !tiers.get(i).template.isEmpty()) {
+                PhysicalCurrencyEngine.deliverPhysicalItems(server, targetId, online, tiers.get(i).template, cnt, source);
+            }
+        }
+    }
+
+    /** 解析求购单选账本赏金（支持 ZERO / STAR_ONLY / PHYS_ONLY）。返回 null 表示参数非法已拦截并提示。 */
+    private static @Nullable PriceSpec parseDemandRewardSpec(ServerPlayer player, CompoundTag tag) {
+        PriceSpec raw = null;
+        if (tag.contains("rewardSpec", Tag.TAG_COMPOUND)) {
+            raw = PriceSpec.fromTag(tag.getCompound("rewardSpec"), 0L);
+        } else if (tag.contains("priceSpec", Tag.TAG_COMPOUND)) {
+            raw = PriceSpec.fromTag(tag.getCompound("priceSpec"), 0L);
+        } else if (tag.contains("currencyMode", Tag.TAG_STRING) || tag.contains("physTier", Tag.TAG_STRING)) {
+            String modeId = tag.getString("currencyMode").trim();
+            String tier = tag.getString("physTier").trim();
+            long cnt = tag.contains("physCount", Tag.TAG_ANY_NUMERIC) ? tag.getLong("physCount")
+                    : parsePositive(tag.getString("reward_money"));
+            long star = tag.contains("starPrice", Tag.TAG_ANY_NUMERIC) ? tag.getLong("starPrice")
+                    : parsePositive(tag.getString("reward_money"));
+            if ("phys".equalsIgnoreCase(modeId) || (!tier.isEmpty() && !"star".equalsIgnoreCase(modeId))) {
+                raw = cnt <= 0L ? PriceSpec.ZERO : PriceSpec.phys(tier, cnt);
+            } else {
+                raw = star <= 0L ? PriceSpec.ZERO : PriceSpec.star(star);
+            }
+        } else {
+            String rawText = tag.getString("reward_money").trim();
+            if (rawText.isEmpty() || "0".equals(rawText)) {
+                raw = PriceSpec.ZERO;
+            } else {
+                raw = PriceSpec.parseRuleText(rawText);
+            }
+        }
+        if (raw == null) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
+            return null;
+        }
+        if (raw.isZero()) {
+            return PriceSpec.ZERO;
+        }
+        if (raw.mode != CurrencyMode.STAR_ONLY && raw.mode != CurrencyMode.PHYS_ONLY) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
+            return null;
+        }
+        if (raw.mode == CurrencyMode.STAR_ONLY) {
+            long star = raw.starPrice;
+            long maxReward = Config.demandMaxReward();
+            if (maxReward > 0L && star > maxReward) {
+                star = maxReward;
+            }
+            return PriceSpec.star(star);
+        }
+        PhysicalCurrencyConfig cfg = PhysicalCurrencyConfig.get();
+        var tier = cfg.findTier(raw.physTierKey);
+        if (!cfg.isActive() || tier == null) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.phys_tier_unavailable", "所需的实体货币档位未启用或不存在")
+                    .withStyle(ChatFormatting.RED));
+            return null;
+        }
+        if (raw.physCount <= 0L || raw.physCount > (long) Integer.MAX_VALUE * 64L) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
+            return null;
+        }
+        return PriceSpec.phys(tier.tierKey(), raw.physCount);
+    }
+
     /**
-     * 发布求购（悬赏）。
-     *
-     * <p>取物品方式**不需要额外的选物界面**：玩家**主手**拿「想要的物品」、**副手**放「愿意付出的物品」（可选），
-     * 弹窗里填「要几个」「悬赏多少金币」。发布时立刻把悬赏**托管**掉：
-     * 金币从余额扣、副手整叠收走 —— 这样交付的人一定拿得到报酬。
+     * 发布求购（悬赏）。支持星币或某阶实体货币×数量作为托管赏金。
      */
     public static void demandCreate(ServerPlayer player, CompoundTag tag) {
         if (!Config.demandEnabled()) {
@@ -2981,13 +4369,12 @@ public final class ShopManager {
                     .withStyle(ChatFormatting.RED));
             return;
         }
-        long money = parsePrice(tag.getString("reward_money"));
-        long maxReward = Config.demandMaxReward();
-        if (maxReward > 0L && money > maxReward) {
-            money = maxReward;
+        PriceSpec rewardSpec = parseDemandRewardSpec(player, tag);
+        if (rewardSpec == null) {
+            return;
         }
         ItemStack rewardItem = player.getOffhandItem().copy();
-        if (money <= 0L && rewardItem.isEmpty()) {
+        if (rewardSpec.isZero() && rewardItem.isEmpty()) {
             notifyPlayer(player, Component.translatable("msg.module_shop.demand_need_reward")
                     .withStyle(ChatFormatting.RED));
             return;
@@ -2999,11 +4386,32 @@ public final class ShopManager {
                     .withStyle(ChatFormatting.RED));
             return;
         }
-        long fee = (long) Math.ceil(money * Config.demandFeePercent() / 100.0D);
-        if (money + fee > account.balance) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.no_money")
-                    .withStyle(ChatFormatting.RED));
-            return;
+        double feePct = Config.demandFeePercent();
+        PriceSpec escrowTotalSpec = PriceSpec.ZERO;
+        if (!rewardSpec.isZero()) {
+            if (rewardSpec.mode == CurrencyMode.PHYS_ONLY) {
+                long fee = feePct <= 0.0D ? 0L : (long) Math.ceil(rewardSpec.physCount * feePct / 100.0D);
+                long sum = rewardSpec.physCount > Long.MAX_VALUE - fee ? 0L : rewardSpec.physCount + fee;
+                if (sum <= 0L) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
+                    return;
+                }
+                escrowTotalSpec = PriceSpec.phys(rewardSpec.physTierKey, sum);
+            } else {
+                long fee = feePct <= 0.0D ? 0L : (long) Math.ceil(rewardSpec.starPrice * feePct / 100.0D);
+                long sum = rewardSpec.starPrice > Long.MAX_VALUE - fee ? 0L : rewardSpec.starPrice + fee;
+                if (sum <= 0L) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
+                    return;
+                }
+                escrowTotalSpec = PriceSpec.star(sum);
+            }
+            var plan = CurrencySettlement.planSpec(player, account, escrowTotalSpec, 1, null);
+            if (!plan.ok()) {
+                CurrencySettlement.notifyPayFailure(player,
+                        CurrencySettlement.PayResult.fail(plan.failKey(), plan.failFallback()));
+                return;
+            }
         }
         // 先把「最新的那条上限」守住：超出时把最老的一条撤下并退款。
         while (data.demands.size() >= Config.demandMaxListed()) {
@@ -3023,8 +4431,16 @@ public final class ShopManager {
                 }
             }
         }
-        // 托管：扣金币（含手续费）、收走副手整叠悬赏物品。
-        if (debit(account, money + fee, "demand_escrow") < 0L) { return; }
+        // 托管：按所选账本扣货币（含手续费）、收走副手整叠悬赏物品。
+        if (!escrowTotalSpec.isZero()) {
+            var escrowPay = CurrencySettlement.paySpec(
+                    player, account, data, escrowTotalSpec, 1, null,
+                    "demand_escrow", SOURCE_DEMAND_REFUND, false);
+            if (!escrowPay.ok()) {
+                CurrencySettlement.notifyPayFailure(player, escrowPay);
+                return;
+            }
+        }
         if (!rewardItem.isEmpty()) {
             player.setItemInHand(net.minecraft.world.InteractionHand.OFF_HAND, ItemStack.EMPTY);
         }
@@ -3033,25 +4449,32 @@ public final class ShopManager {
         entry.requester = player.getUUID();
         entry.requesterName = player.getGameProfile().getName();
         entry.wants.addAll(wants);
-        entry.rewardMoney = money;
+        entry.setRewardSpec(rewardSpec);
+        entry.physicalEscrow = 0L;
         entry.rewardItem = rewardItem;
         entry.createdGame = player.server.overworld().getGameTime();
         entry.createdReal = System.currentTimeMillis();
         data.demands.add(entry);
         data.setDirty();
+        Component rewardText = demandRewardText(entry, player.server);
         notifyPlayer(player, Component.translatable("msg.module_shop.demand_created",
-                entry.summary(), demandRewardText(entry))
+                entry.summary(), rewardText)
                 .withStyle(ChatFormatting.GREEN));
         // 全服公告：让所有人都知道有人挂悬赏（发布者自己也会看到一条）。
         broadcastChat(player.server, Component.translatable("msg.module_shop.demand_broadcast",
-                player.getGameProfile().getName(), entry.summary(), demandRewardText(entry))
+                player.getGameProfile().getName(), entry.summary(), rewardText)
                 .withStyle(ChatFormatting.GOLD));
         broadcastSnapshots(player.server);
     }
 
-    /** 「悬赏内容」的可读文本（金币 + 物品，供聊天与界面复用）。 */
-    private static Component demandRewardText(DemandEntry entry) {
-        Component money = entry.rewardMoney > 0L ? Component.literal(Long.toString(entry.rewardMoney)) : null;
+    /** 「悬赏内容」的可读文本（星币或实体货币 + 物品，供聊天与界面复用）。 */
+    private static Component demandRewardText(DemandEntry entry, @Nullable MinecraftServer server) {
+        PriceSpec rSpec = entry.resolveRewardSpec();
+        Component money = !rSpec.isZero()
+                ? Component.literal(rSpec.mode == CurrencyMode.STAR_ONLY
+                        ? Long.toString(rSpec.starPrice)
+                        : CurrencySettlement.formatSpec(rSpec, server))
+                : null;
         Component item = entry.rewardItem != null && !entry.rewardItem.isEmpty()
                 ? Component.translatable("gui.module_shop.demand.reward_item",
                         entry.rewardItem.getHoverName(), entry.rewardItem.getCount())
@@ -3071,8 +4494,14 @@ public final class ShopManager {
                     .withStyle(ChatFormatting.RED));
             return;
         }
-        boolean admin = player.hasPermissions(2);
+        boolean admin = canEditAdmin(player);
         if (!admin && !player.getUUID().equals(entry.requester)) {
+            if (player != null && player.hasPermissions(2)) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.auth_required")
+                        .withStyle(ChatFormatting.RED));
+                promptAdminAuth(player);
+                return;
+            }
             notifyPlayer(player, Component.translatable("msg.module_shop.demand_not_yours")
                     .withStyle(ChatFormatting.RED));
             return;
@@ -3174,21 +4603,12 @@ public final class ShopManager {
             }
             addMailDraft(player.server, entry.requester, deliverDraft);
         }
-        // 付悬赏（金币按余额上限入账，装不下的转金钱邮件；悬赏物品进背包 / 邮箱）
+        // 付悬赏（严格走创建时选定的账本：星币或某阶实体货币；兼容历史混合托管存档）
         PlayerAccount account = account(player);
-        if (entry.rewardMoney > 0L) {
-            long credited = credit(account, entry.rewardMoney, Config.maxBalanceLimit());
-            long rest = entry.rewardMoney - credited;
-            if (credited > 0L) {
-                TransactionLog.record(player.server, player.getUUID(), TransactionLog.TRANSFER_IN,
-                        "求购:" + (entry.requesterName == null ? "?" : entry.requesterName),
-                        credited, account.balance, "交付 " + entry.summary().getString());
-            }
-            if (rest > 0L) {
-                addMoneyMail(player.server, player.getUUID(), rest, entry.rewardItem.copy(),
-                        SOURCE_DEMAND_REWARD, entry.requesterName, entry.requester);
-            }
-        }
+        payoutDemandCurrency(player.server, player.getUUID(), account, entry,
+                SOURCE_DEMAND_REWARD, entry.requesterName,
+                "求购:" + (entry.requesterName == null ? "?" : entry.requesterName),
+                "交付 " + entry.summary().getString());
         if (entry.rewardItem != null && !entry.rewardItem.isEmpty()) {
             addItemOrMail(player, entry.rewardItem.copy(), SOURCE_DEMAND_REWARD);
         }
@@ -3219,7 +4639,7 @@ public final class ShopManager {
 
     /** 管理员：求购基本设置（开关 / 每人条数 / 手续费 / 单笔上限）。 */
     private static void adminDemandSet(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         boolean enabled = "1".equals(tag.getString("enabled").trim())
@@ -3257,28 +4677,40 @@ public final class ShopManager {
 
     /** 管理员：求购自动下架时间（永久 / 游戏天数 / 现实小时）。 */
     private static void adminDemandExpire(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
-        String modeText = tag.getString("expire_mode").trim().toLowerCase(java.util.Locale.ROOT);
-        String mode = ("game".equals(modeText) || "real".equals(modeText)) ? modeText : "permanent";
-        int amount;
-        try {
-            amount = Integer.parseInt(tag.getString("expire_amount").trim());
-        } catch (NumberFormatException ex) {
+        String prevMode = Config.demandExpireMode();
+        int prevAmount = Config.demandExpireAmount();
+        String mode = ShopExpireSupport.normalizeExpireMode(tag.getString("expire_mode"));
+        Integer parsed = ShopExpireSupport.parseExpireAmount(mode, tag.getString("expire_amount"), prevAmount);
+        if (parsed == null) {
             notifyPlayer(player, Component.translatable("msg.module_shop.stall_expire_bad_amount")
                     .withStyle(ChatFormatting.RED));
             return;
         }
-        if (amount < 0 || amount > 100000) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.stall_expire_bad_amount")
-                    .withStyle(ChatFormatting.RED));
+        int amount = parsed;
+        if (!saveExpireConfig("demand", Config.INSTANCE.demandExpireMode, Config.INSTANCE.demandExpireAmount,
+                "demandExpireMode", mode, "demandExpireAmount", amount)) {
+            notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.config_save_failed",
+                    "配置写入磁盘失败，已恢复原设置，请检查配置文件权限").withStyle(ChatFormatting.RED));
             return;
         }
-        Config.INSTANCE.demandExpireMode.set(mode);
-        Config.INSTANCE.demandExpireAmount.set(amount);
-        Config.SPEC.save();
-        Component desc = "permanent".equals(mode) || amount <= 0
+        if (ShopExpireSupport.shouldResetExpireTimestamps(prevMode, prevAmount, mode, amount)) {
+            synchronized (LOCK) {
+                ShopSavedData data = data(player.server);
+                long nowGame = player.server.overworld().getGameTime();
+                long nowReal = System.currentTimeMillis();
+                if (!data.demands.isEmpty()) {
+                    for (DemandEntry entry : data.demands) {
+                        entry.createdGame = nowGame;
+                        entry.createdReal = nowReal;
+                    }
+                    data.setDirty();
+                }
+            }
+        }
+        Component desc = !ShopExpireSupport.isExpireActive(mode, amount)
                 ? Component.translatable("gui.module_shop.choice.expire_mode.permanent")
                 : Component.translatable("gui.module_shop.stall.expire_value",
                         Component.translatable("gui.module_shop.choice.expire_mode." + mode), amount);
@@ -3357,60 +4789,75 @@ public final class ShopManager {
         }
         long nowGame = server.overworld().getGameTime();
         long nowReal = System.currentTimeMillis();
-        ShopSavedData data = data(server);
-        boolean dirty = false;
+        List<ServerPlayer> affectedOnline = new ArrayList<>();
         boolean touched = false;
-        for (Map.Entry<UUID, PlayerAccount> pair : data.accounts().entrySet()) {
-            UUID owner = pair.getKey();
-            PlayerAccount account = pair.getValue();
-            if (account.stall.isEmpty()) {
-                continue;
-            }
-            ServerPlayer online = server.getPlayerList().getPlayer(owner);
-            boolean removed = false;
-            for (int i = account.stall.size() - 1; i >= 0; i--) {
-                StallEntry entry = account.stall.get(i);
-                // 老存档 / 老数据：先补打上架时刻，不立刻下架。
-                if (entry.listedGame <= 0L) {
-                    entry.listedGame = nowGame;
-                    dirty = true;
-                }
-                if (entry.listedReal <= 0L) {
-                    entry.listedReal = nowReal;
-                    dirty = true;
-                }
-                long age = byGame ? nowGame - entry.listedGame : nowReal - entry.listedReal;
-                if (age < limit) {
+        synchronized (LOCK) {
+            ShopSavedData data = data(server);
+            boolean dirty = false;
+            for (Map.Entry<UUID, PlayerAccount> pair : data.accounts().entrySet()) {
+                UUID owner = pair.getKey();
+                PlayerAccount account = pair.getValue();
+                if (account.stall.isEmpty()) {
                     continue;
                 }
-                account.stall.remove(i);
-                dirty = true;
-                touched = true;
-                removed = true;
-                int refundCount = Math.max(0, entry.stock);
-                ItemStack name = entry.stack.copy();
-                if (refundCount > 0) {
-                    ItemStack refund = entry.stack.copy();
-                    refund.setCount(refundCount);
-                    // 在线：直接进背包（满了自动转邮箱）；离线：直接进邮箱。
+                ServerPlayer online = server.getPlayerList().getPlayer(owner);
+                boolean removed = false;
+                for (int i = account.stall.size() - 1; i >= 0; i--) {
+                    StallEntry entry = account.stall.get(i);
+                    // 老存档 / 老数据：先补打上架时刻，不立刻下架。
+                    if (entry.listedGame <= 0L) {
+                        entry.listedGame = nowGame;
+                        dirty = true;
+                    }
+                    if (entry.listedReal <= 0L) {
+                        entry.listedReal = nowReal;
+                        dirty = true;
+                    }
+                    long age = byGame ? nowGame - entry.listedGame : nowReal - entry.listedReal;
+                    if (age < limit) {
+                        continue;
+                    }
+                    account.stall.remove(i);
+                    cn.autoforged.module_shop.shop.stall.StallService.evictItemCache(entry.order);
+                    dirty = true;
+                    touched = true;
+                    removed = true;
+                    int refundCount = Math.max(0, entry.stock);
+                    ItemStack name = entry.stack.copy();
+                    if (refundCount > 0) {
+                        // 按单叠上限拆分，防止高库存（>64/>99/受损装备）退件触发编解码崩溃或非法堆叠。
+                        if (online != null) {
+                            addItemsOrMail(online, entry.stack, refundCount, SOURCE_STALL_EXPIRED);
+                        } else {
+                            List<ItemStack> refundStacks = splitStacks(entry.stack, refundCount);
+                            addMailDraft(server, owner, MailTemplates.build(MailTemplates.Template.STALL_EXPIRED,
+                                            MailTemplates.map("player", nameOf(server, owner),
+                                                    "item", MailTemplates.itemText(name, false) + "×" + refundCount))
+                                    .source(SOURCE_STALL_EXPIRED)
+                                    .addItems(refundStacks));
+                        }
+                    }
                     if (online != null) {
-                        addItemOrMail(online, refund, SOURCE_STALL_EXPIRED);
-                    } else {
-                        addMail(server, owner, refund, SOURCE_STALL_EXPIRED, "系统");
+                        if (refundCount > 0) {
+                            notifyPlayer(online, Component.translatable("msg.module_shop.stall_expired",
+                                    name.getHoverName(), refundCount).withStyle(ChatFormatting.YELLOW));
+                        } else {
+                            notifyPlayer(online, Component.translatableWithFallback("msg.module_shop.stall_expired_empty",
+                                    "已售空的摊位商品「%s」已到期自动下架", name.getHoverName()).withStyle(ChatFormatting.YELLOW));
+                        }
                     }
                 }
-                if (online != null) {
-                    notifyPlayer(online, Component.translatable("msg.module_shop.stall_expired",
-                            name.getHoverName(), refundCount).withStyle(ChatFormatting.YELLOW));
+                if (removed && online != null) {
+                    affectedOnline.add(online);
                 }
             }
-            // 一个玩家可能有多个商品同时到期：这里只推一次快照，免得刷屏。
-            if (removed && online != null) {
-                sendSnapshot(online, "stall");
+            if (dirty) {
+                data.setDirty();
             }
         }
-        if (dirty) {
-            data.setDirty();
+        // 一个玩家可能有多个商品同时到期：在锁外只推一次快照，免得刷屏。
+        for (ServerPlayer online : affectedOnline) {
+            sendSnapshot(online, "stall");
         }
         if (touched) {
             broadcastSnapshots(server);
@@ -3430,20 +4877,46 @@ public final class ShopManager {
     }
 
     private static void stallApplyPrice(ServerPlayer player, CompoundTag tag) {
-        long price = parsePrice(tag.getString("price"));
+        PriceSpec spec = cn.autoforged.module_shop.shop.stall.StallService.parseStallSpecFromTag(tag);
+        if (spec != null && spec.mode == CurrencyMode.PHYS_ONLY) {
+            PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+            var tier = physCfg.findTier(spec.physTierKey);
+            if (!physCfg.isActive() || tier == null) {
+                notifyPlayer(player, Component.translatableWithFallback(
+                        "msg.module_shop.phys_tier_unavailable", "所需的实体货币档位未启用或不存在")
+                        .withStyle(ChatFormatting.RED));
+                return;
+            }
+            spec = spec.withPhysTierKey(tier.tierKey());
+        } else if (spec != null && spec.mode == CurrencyMode.STAR_ONLY) {
+            long cap = Config.maxBalanceLimit();
+            if (cap != Long.MAX_VALUE && spec.starPrice > cap) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.price_over_cap",
+                        Long.toString(cap)).withStyle(ChatFormatting.RED));
+                return;
+            }
+        }
         synchronized (LOCK) {
             PlayerAccount account = account(player);
             int index = stallIndex(account, tag);
-            if (index < 0 || price <= 0) {
-                notifyPlayer(player, Component.translatable(price <= 0 ? "msg.module_shop.invalid_price"
-                        : "msg.module_shop.stall.err_gone").withStyle(ChatFormatting.RED));
+            if (index < 0 || spec == null || !spec.isValid()
+                    || (spec.mode != CurrencyMode.STAR_ONLY && spec.mode != CurrencyMode.PHYS_ONLY)) {
+                notifyPlayer(player, Component.translatable(
+                        spec == null || !spec.isValid() ? "msg.module_shop.invalid_price"
+                                : "msg.module_shop.stall.err_gone").withStyle(ChatFormatting.RED));
                 return;
             }
             StallEntry entry = account.stall.get(index);
-            entry.price = price;
+            entry.setPriceSpec(spec);
             data(player.server).setDirty();
-            notifyPlayer(player, Component.translatable("msg.module_shop.stall.price_changed",
-                    entry.stack.getHoverName(), price).withStyle(ChatFormatting.GREEN));
+            if (spec.mode == CurrencyMode.PHYS_ONLY) {
+                notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.stall.price_changed_spec",
+                        "已修改 %s 单价为 %s", entry.stack.getHoverName(),
+                        CurrencySettlement.formatSpec(spec, player.server)).withStyle(ChatFormatting.GREEN));
+            } else {
+                notifyPlayer(player, Component.translatable("msg.module_shop.stall.price_changed",
+                        entry.stack.getHoverName(), spec.starPrice).withStyle(ChatFormatting.GREEN));
+            }
         }
         sendSnapshot(player, "stall");
         broadcastSnapshots(player.server);
@@ -3457,11 +4930,10 @@ public final class ShopManager {
                 return;
             }
             StallEntry entry = account.stall.remove(index);
-            // 需求 6：下架时把剩余库存（不是 1 件）全部退还（背包放不下的进邮箱，不丢不复制：先移出摊位再退）。
+            cn.autoforged.module_shop.shop.stall.StallService.evictItemCache(entry.order);
+            // 需求 6：下架时把剩余库存（不是 1 件）全部退还，按单叠上限拆份防止高库存超堆叠。
             if (entry.stock > 0) {
-                ItemStack refund = entry.stack.copy();
-                refund.setCount(entry.stock);
-                addItemOrMail(player, refund, SOURCE_STALL_UNSOLD);
+                addItemsOrMail(player, entry.stack, entry.stock, SOURCE_STALL_UNSOLD);
             }
             data(player.server).setDirty();
         }
@@ -3492,7 +4964,7 @@ public final class ShopManager {
         for (int i = 0; i < account.stall.size(); i++) {
             StallEntry entry = account.stall.get(i);
             CompoundTag c = ShopNbt.saveStack(entry.stack, regs);
-            c.putLong("price", entry.price);
+            entry.resolvePriceSpec().writeToParent(c, "priceSpec", "price");
             c.putInt("stock", entry.stock);
             // 需求 9：浏览摊位时也显示该商品已售出件数。
             c.putInt("sold", entry.sold);
@@ -3541,12 +5013,27 @@ public final class ShopManager {
                 return;
             }
             StallEntry entry = sellerAccount.stall.get(index);
-            // 卖家刚改过价：按买家看到的价格才成交，否则拒绝并刷新
-            if (tag.contains("expect") && tag.getLong("expect") != entry.price) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.stall.err_price_changed",
-                        entry.price).withStyle(ChatFormatting.RED));
-                openStallBrowse(player, owner.toString());
-                return;
+            PriceSpec unitSpec = entry.resolvePriceSpec();
+            // 卖家刚改过价：优先校验结构化 priceSpec（兼容 expectSpec / expectPriceSpec），其次校验 expect。
+            if (tag.contains("expectSpec", Tag.TAG_COMPOUND) || tag.contains("expectPriceSpec", Tag.TAG_COMPOUND)) {
+                CompoundTag expTag = tag.contains("expectSpec", Tag.TAG_COMPOUND)
+                        ? tag.getCompound("expectSpec") : tag.getCompound("expectPriceSpec");
+                PriceSpec expectedSpec = PriceSpec.fromTag(expTag, 0L);
+                if (!unitSpec.equals(expectedSpec)) {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.stall.err_price_changed_spec",
+                            "卖家刚刚修改了价格（现价 %s），请确认后重试",
+                            CurrencySettlement.formatSpec(unitSpec, player.server)).withStyle(ChatFormatting.RED));
+                    openStallBrowse(player, owner.toString());
+                    return;
+                }
+            } else if (tag.contains("expect")) {
+                long currentCmp = unitSpec.mode == CurrencyMode.PHYS_ONLY ? unitSpec.physCount : unitSpec.starPrice;
+                if (tag.getLong("expect") != currentCmp) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.stall.err_price_changed",
+                            currentCmp).withStyle(ChatFormatting.RED));
+                    openStallBrowse(player, owner.toString());
+                    return;
+                }
             }
             if (entry.stock <= 0) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.stall_sold_out").withStyle(ChatFormatting.RED));
@@ -3559,79 +5046,116 @@ public final class ShopManager {
                 return;
             }
             int buyCount = want;
-            // 摊位单价由玩家自己设置，同样必须做溢出保护（裸乘溢出为负 → 判定失效 + 给买家加钱）。
-            long total = safeMultiply(entry.price, buyCount);
-            if (total <= 0L) {
+            PriceSpec totalSpec = unitSpec.scale(buyCount);
+            if (!totalSpec.isValid()
+                    || (totalSpec.mode != CurrencyMode.STAR_ONLY && totalSpec.mode != CurrencyMode.PHYS_ONLY)) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price").withStyle(ChatFormatting.RED));
                 return;
             }
             PlayerAccount buyer = account(player);
-            if (buyer.balance < total) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.no_money").withStyle(ChatFormatting.RED));
+            var buyPay = CurrencySettlement.paySpec(
+                    player, buyer, data, unitSpec, buyCount, null, "stall_buy", SOURCE_STALL_BOUGHT, false);
+            if (!buyPay.ok()) {
+                CurrencySettlement.notifyPayFailure(player, buyPay);
                 return;
             }
-            if (debit(buyer, total, "stall_buy") < 0L) { return; }
             entry.stock -= buyCount;
             // 需求 9：记录该商品累计已售出件数（各商品分别统计）。
             entry.sold += buyCount;
-            // Eco 摊位成交税（默认 5%）：从卖家货款扣除并注入官方总钱箱
             double saleFeePct = Config.stallSaleFeePercent();
-            long saleFee = saleFeePct <= 0.0D ? 0L : Math.min(total - 1L, Math.max(0L, Math.round(total * saleFeePct / 100.0D)));
-            long sellerNet = Math.max(0L, total - saleFee);
-            if (saleFee > 0L && cn.autoforged.module_shop.eco.EcoPricing.isEcoActive()) {
-                data.treasury.inflow(saleFee, Config.shippingQuotaDay());
-            }
-            // 第七轮改动：卖家货款**直接进钱包**（饱和入账；只有余额上限装不下的部分才转金额邮件兜底，绝不销毁）。
             PlayerAccount stallSellerAcct = data.account(owner);
-            long credited = credit(stallSellerAcct, sellerNet, Config.maxBalanceLimit());
-            if (credited < sellerNet) {
-                addMoneyMail(player.server, owner, sellerNet - credited, entry.stack.copy(), SOURCE_STALL_SOLD,
-                        player.getGameProfile().getName(), player.getUUID());
-            }
             ServerPlayer onlineSeller = player.server.getPlayerList().getPlayer(owner);
-            if (onlineSeller != null) {
-                notifyPlayer(onlineSeller, Component.translatable("msg.module_shop.stall_sold_wallet",
-                        entry.stack.getHoverName(), buyCount, sellerNet).withStyle(ChatFormatting.GREEN));
-            }
-            // 售空提醒：该商品库存清零时给摊主一封提醒，替代原来的「每笔金币邮件」。
-            if (entry.stock <= 0) {
-                addMailDraft(player.server, owner, MailTemplates.build(MailTemplates.Template.STALL_DEPLETED,
-                                MailTemplates.map("player", nameOf(player.server, owner),
-                                        "item", MailTemplates.itemText(entry.stack, false),
-                                        "amount", Integer.toString(entry.sold),
-                                        "price", Long.toString(sellerNet)))
-                        .source(SOURCE_STALL_SOLD));
-            }
-            // 需求 5/10：保留 NBT；装不下的部分发到邮箱。
-            // 来源用“购买”而不是“上架未售出”，否则买家邮箱里会显示成“你上架的物品没卖出去，已退还”。
             Component rewardName = entry.stack.getHoverName();
             boolean mailed = deliver(player, entry.stack, buyCount, SOURCE_STALL_BOUGHT);
-            data.setDirty();
-            // 需求一：摘要统一为「花费 金额 星币 购买 物品名×数量」，金额字段在前。
-            notifyPlayer(player, Component.translatable("msg.module_shop.bought_count", total, rewardName, buyCount)
-                    .withStyle(ChatFormatting.GREEN));
-            if (mailed) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.inventory_full_mail").withStyle(ChatFormatting.RED));
-            }
-            ServerPlayer seller = player.server.getPlayerList().getPlayer(owner);
-            if (seller != null) {
-                notifyPlayer(seller, Component.translatable("msg.module_shop.stall_sold", rewardName, buyCount, sellerNet)
-                        .withStyle(ChatFormatting.GREEN));
-            }
-            // 需求 10：卖家摊位有物品被买走 → 提示红点。
-            NotificationManager.notify(player.server, owner, NotificationType.STALL);
             String sellerName = sellerAccount.name == null || sellerAccount.name.isEmpty() ? "摊位" : sellerAccount.name;
-            TransactionLog.record(player.server, player.getUUID(), TransactionLog.STALL_BUY, sellerName,
-                    -total, buyer.balance, rewardName.getString() + "×" + buyCount);
-            TransactionLog.record(player.server, owner, TransactionLog.STALL_SELL,
-                    player.getGameProfile().getName(), sellerNet, sellerAccount.balance,
-                    rewardName.getString() + "×" + buyCount + (saleFee > 0L ? "（税后进钱包）" : "（货款进钱包）"));
-            cn.autoforged.module_shop.api.event.ApiEvents.post(
-                    new cn.autoforged.module_shop.api.event.PurchaseCompletedEvent(
-                            player.getUUID(), "stall", "stall-" + entry.order, entry.stack, buyCount, total));
-            cn.autoforged.module_shop.api.event.ApiEvents.post(
-                    new cn.autoforged.module_shop.api.event.SellCompletedEvent(
-                            owner, "stall", "stall-" + entry.order, entry.stack, buyCount, sellerNet));
+
+            if (totalSpec.mode == CurrencyMode.PHYS_ONLY) {
+                long gross = totalSpec.physCount;
+                long saleFee = (saleFeePct <= 0.0D || gross <= 1L)
+                        ? 0L : Math.min(gross - 1L, Math.max(0L, (long) Math.floor(gross * saleFeePct / 100.0D)));
+                long sellerNet = Math.max(1L, gross - saleFee);
+                CurrencySettlement.payoutPhysTier(
+                        player.server, owner, totalSpec.physTierKey, sellerNet, SOURCE_STALL_SOLD);
+                PriceSpec paidSpec = PriceSpec.phys(totalSpec.physTierKey, gross);
+                PriceSpec netSpec = PriceSpec.phys(totalSpec.physTierKey, sellerNet);
+                String paidText = CurrencySettlement.formatSpec(paidSpec, player.server);
+                String netText = CurrencySettlement.formatSpec(netSpec, player.server);
+                if (onlineSeller != null) {
+                    notifyPlayer(onlineSeller, Component.translatableWithFallback("msg.module_shop.stall_sold_spec",
+                            "售出 %s×%s，实得 %s", rewardName, buyCount, netText).withStyle(ChatFormatting.GREEN));
+                }
+                if (entry.stock <= 0) {
+                    addMailDraft(player.server, owner, MailTemplates.build(MailTemplates.Template.STALL_DEPLETED,
+                                    MailTemplates.map("player", nameOf(player.server, owner),
+                                            "item", MailTemplates.itemText(entry.stack, false),
+                                            "amount", Integer.toString(entry.sold),
+                                            "price", netText))
+                            .source(SOURCE_STALL_SOLD));
+                }
+                data.setDirty();
+                notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.bought_count_spec",
+                        "花费 %s 购买 %s×%s", paidText, rewardName, buyCount).withStyle(ChatFormatting.GREEN));
+                if (mailed) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.inventory_full_mail").withStyle(ChatFormatting.RED));
+                }
+                NotificationManager.notify(player.server, owner, NotificationType.STALL);
+                TransactionLog.record(player.server, player.getUUID(), TransactionLog.STALL_BUY, sellerName,
+                        0L, buyer.balance, rewardName.getString() + "×" + buyCount + " [" + paidText + "]");
+                TransactionLog.record(player.server, owner, TransactionLog.STALL_SELL,
+                        player.getGameProfile().getName(), 0L, sellerAccount.balance,
+                        rewardName.getString() + "×" + buyCount + " [" + netText + "]");
+                cn.autoforged.module_shop.api.event.ApiEvents.post(
+                        new cn.autoforged.module_shop.api.event.PurchaseCompletedEvent(
+                                player.getUUID(), "stall", "stall-" + entry.order, entry.stack, buyCount, 0L));
+                cn.autoforged.module_shop.api.event.ApiEvents.post(
+                        new cn.autoforged.module_shop.api.event.SellCompletedEvent(
+                                owner, "stall", "stall-" + entry.order, entry.stack, buyCount, 0L));
+            } else {
+                long total = totalSpec.starPrice;
+                long saleFee = saleFeePct <= 0.0D
+                        ? 0L : Math.min(total - 1L, Math.max(0L, Math.round(total * saleFeePct / 100.0D)));
+                long sellerNet = Math.max(0L, total - saleFee);
+                if (saleFee > 0L && EcoPricing.isEcoActive()) {
+                    data.treasury.inflow(saleFee, Config.shippingQuotaDay());
+                }
+                CurrencySettlement.payoutStarOnly(
+                        player.server, owner, stallSellerAcct, null, sellerNet, false, true,
+                        SOURCE_STALL_SOLD, player.getGameProfile().getName(), entry.stack);
+                if (onlineSeller != null) {
+                    notifyPlayer(onlineSeller, Component.translatable("msg.module_shop.stall_sold_wallet",
+                            entry.stack.getHoverName(), buyCount, sellerNet).withStyle(ChatFormatting.GREEN));
+                    notifyPlayer(onlineSeller, Component.translatable("msg.module_shop.stall_sold",
+                            rewardName, buyCount, sellerNet).withStyle(ChatFormatting.GREEN));
+                }
+                // 售空提醒：该商品库存清零时给摊主一封提醒，替代原来的「每笔金币邮件」。
+                if (entry.stock <= 0) {
+                    addMailDraft(player.server, owner, MailTemplates.build(MailTemplates.Template.STALL_DEPLETED,
+                                    MailTemplates.map("player", nameOf(player.server, owner),
+                                            "item", MailTemplates.itemText(entry.stack, false),
+                                            "amount", Integer.toString(entry.sold),
+                                            "price", Long.toString(sellerNet)))
+                            .source(SOURCE_STALL_SOLD));
+                }
+                data.setDirty();
+                // 需求一：摘要统一为「花费 金额 星币 购买 物品名×数量」，金额字段在前。
+                notifyPlayer(player, Component.translatable("msg.module_shop.bought_count", total, rewardName, buyCount)
+                        .withStyle(ChatFormatting.GREEN));
+                if (mailed) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.inventory_full_mail").withStyle(ChatFormatting.RED));
+                }
+                NotificationManager.notify(player.server, owner, NotificationType.STALL);
+                TransactionLog.record(player.server, player.getUUID(), TransactionLog.STALL_BUY, sellerName,
+                        -total, buyer.balance, rewardName.getString() + "×" + buyCount);
+                TransactionLog.record(player.server, owner, TransactionLog.STALL_SELL,
+                        player.getGameProfile().getName(), sellerNet, sellerAccount.balance,
+                        rewardName.getString() + "×" + buyCount + (saleFee > 0L ? "（税后进钱包）" : "（货款进钱包）"));
+                cn.autoforged.module_shop.api.event.ApiEvents.post(
+                        new cn.autoforged.module_shop.api.event.PurchaseCompletedEvent(
+                                player.getUUID(), "stall", "stall-" + entry.order, entry.stack, buyCount, total));
+                cn.autoforged.module_shop.api.event.ApiEvents.post(
+                        new cn.autoforged.module_shop.api.event.SellCompletedEvent(
+                                owner, "stall", "stall-" + entry.order, entry.stack, buyCount, sellerNet));
+            }
         }
         // 静默刷新买家缓存，并把最新库存推回正在浏览的摊位界面（需求 5：买完还剩多少显示多少）。
         sendSnapshot(player, "stall", true);
@@ -3728,7 +5252,9 @@ public final class ShopManager {
                 return;
             }
             long amount = entry.currencyAmount;
-            long credited = credit(account, amount, Config.maxBalanceLimit());
+            long credited = CurrencySettlement.payoutStarOnly(
+                    player.server, player.getUUID(), account, null, amount, false, false,
+                    SOURCE_ADMIN, null, null);
             if (credited < amount) {
                 // 余额装不下：只领能装下的部分，剩下的留在邮件里（绝不静默销毁）。
                 entry.currencyAmount = amount - credited;
@@ -3763,7 +5289,9 @@ public final class ShopManager {
                 if (entry.type == MailType.MONEY) {
                     if (!entry.isViewed) {
                         long amount = entry.currencyAmount;
-                        long credited = credit(account, amount, Config.maxBalanceLimit());
+                        long credited = CurrencySettlement.payoutStarOnly(
+                                player.server, player.getUUID(), account, null, amount, false, false,
+                                SOURCE_ADMIN, null, null);
                         if (credited < amount) {
                             // 装不下的部分留在邮件里，等余额有空间再领。
                             entry.currencyAmount = amount - credited;
@@ -3888,19 +5416,25 @@ public final class ShopManager {
                 return;
             }
             if (from.balance < amount) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.no_money").withStyle(ChatFormatting.RED));
+                CurrencySettlement.notifyPayFailure(player,
+                        CurrencySettlement.PayResult.fail("msg.module_shop.no_money", "星币余额不足"));
                 return;
             }
             PlayerAccount to = account(target);
-            // 对方余额装不下这笔转账：整笔拒绝，避免“付款方已扣、收款方只收到一部分”。
             long room = Math.max(0L, Config.maxBalanceLimit() - to.balance);
             if (room < amount) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.target_balance_full",
                         target.getGameProfile().getName()).withStyle(ChatFormatting.RED));
                 return;
             }
-            if (debit(from, amount, "transfer") < 0L) { return; }
-            to.balance += amount;
+            var payRes = CurrencySettlement.payStar(from, amount, "transfer");
+            if (!payRes.ok()) {
+                CurrencySettlement.notifyPayFailure(player, payRes);
+                return;
+            }
+            CurrencySettlement.payoutStarOnly(
+                    player.server, target.getUUID(), to, null, amount, false, false,
+                    SOURCE_EXCHANGE, player.getGameProfile().getName(), ItemStack.EMPTY);
             from.lastTransferTick = now;
             data.setDirty();
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.TRANSFER_OUT,
@@ -3932,7 +5466,7 @@ public final class ShopManager {
     /** 设置页“交易记录”按钮：把某玩家的流水发给管理员本人。 */
     private static void sendHistory(ServerPlayer admin, String targetName, int page) {
         // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (admin == null || !admin.hasPermissions(2)) {
+        if (!canEditAdmin(admin)) {
             return;
         }
         List<Component> lines = historyLines(admin.server, targetName, page <= 0 ? 1 : page);
@@ -3947,8 +5481,8 @@ public final class ShopManager {
     }
 
     private static void adminSetPriceNew(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         // 需求 11：模板来自幽灵槽，不是 PENDING_ITEM。
@@ -3958,40 +5492,58 @@ public final class ShopManager {
         }
         // 幽灵槽只保存模板副本、原物已经退回管理员背包（见 ADMIN_TEMPLATE 注释），
         // 价格非法时直接中止，绝不能再把模板当真实物品发一次（否则输入非数字价格就能凭空复制物品）。
-        long price = parseAdminPrice(player, tag.getString("price"));
-        if (price <= 0) {
+        PriceSpec priceSpec = parseAdminSpec(player, tag);
+        if (priceSpec == null) {
             return;
         }
         AdminEditType type = editType(player, tag);
         ShopSavedData data = data(player.server);
-        Rarity rarity = parseRarity(tag.getString("rarity"), price);
+        long rarityHint = priceSpec.supportsStar() ? priceSpec.starPrice : Math.max(1L, priceSpec.physCount);
+        Rarity rarity = parseRarity(tag.getString("rarity"), rarityHint);
         // 需求 6/7：管理员可同时配置品质与数量（数量为空则退回默认上限）。
         if (type == AdminEditType.MALL) {
-            // 购物城：数量字段是**库存**（留空 / -1 = 无限，0 = 售罄）。
-            MallItem item = new MallItem(stack, price, rarity, parseMallStock(tag.getString("quantity")));
+            // 购物城：数量字段是**库存**（留空 / -1 = 无限，0 = 售罄）；开启「每人永久限购」时默认至少限购 1 次。
+            boolean permLimit = isTruthyFlag(tag.getString("permanent_limit"));
+            int stockVal = parseMallStock(tag.getString("quantity"));
+            if (permLimit && stockVal <= 0) {
+                stockVal = 1;
+            }
+            MallItem item = new MallItem(stack, priceSpec, rarity, stockVal);
+            item.permanentLimit = permLimit;
+            if (permLimit) {
+                item.supplyMode = SupplyMode.STATIC;
+            }
             item.sort = data.mallPool.size();
             data.mallPool.add(item);
         } else if (type == AdminEditType.SHIPPING) {
-            // 出货箱：这里是「兑换规则」——只需要物品 + 单价（每日份数由各等级的「每日额度」统一管）。
-            if (!ShippingRules.addRule(stack, price)) {
+            // 出货箱：支持物品 + 单价 + 每日出货上限（0 = 无限）。
+            int dailyMax = parseOptionalNonNegativeInt(player, tag, "daily_max");
+            if (dailyMax < 0) {
+                return;
+            }
+            if (!ShippingRules.addRule(stack, priceSpec, dailyMax)) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
                         .withStyle(ChatFormatting.RED));
                 return;
             }
+            String display = priceSpec.mode == CurrencyMode.STAR_ONLY
+                    ? priceSpec.starPrice + currencyName(player.server)
+                    : CurrencySettlement.formatSpec(priceSpec, player.server);
             notifyPlayer(player, Component.translatable("msg.module_shop.shipping_rule_added",
-                    stack.getHoverName(), price + currencyName(player.server)).withStyle(ChatFormatting.GREEN));
+                    stack.getHoverName(), display).withStyle(ChatFormatting.GREEN));
         } else if (type == AdminEditType.DAILY_SHOP) {
-            ConfiguredOffer offer = new ConfiguredOffer(stack, price, rarity);
+            ConfiguredOffer offer = new ConfiguredOffer(stack, priceSpec, rarity);
             offer.amount = parseInt(tag.getString("quantity"));
             data.shopPool.add(offer);
         } else {
-            ConfiguredOffer offer = new ConfiguredOffer(stack, price, rarity);
+            ConfiguredOffer offer = new ConfiguredOffer(stack, priceSpec, rarity);
             offer.amount = parseInt(tag.getString("quantity"));
             data.buybackPool.add(offer);
         }
         data.setDirty();
-        // 购物城加完物品直接回购物城页（马上就能看到新上架的那件）；商店/收购仍留在管理页。
+        // 购物城加完物品直接回购物城页（马上就能看到新上架的那件）；商店/收购仍留在管理页，并同步全服快照。
         sendSnapshot(player, type == AdminEditType.MALL ? "mall" : "admin");
+        broadcastSnapshots(player.server);
     }
 
     /** 购物城库存：留空 / 非数字 / 负数 = 无限库存（界面显示 ∞）。 */
@@ -4009,16 +5561,17 @@ public final class ShopManager {
     }
 
     private static void adminApplyPrice(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         int index = tag.getInt("index");
         // 确认后输入界面会立刻关闭：这里必须给一条**说明原因**的反馈，否则管理员会以为「确认没生效」。
-        long price = parseAdminPrice(player, tag.getString("price"));
-        if (price <= 0) {
+        PriceSpec priceSpec = parseAdminSpec(player, tag);
+        if (priceSpec == null) {
             return;
         }
+        long rarityHint = priceSpec.supportsStar() ? priceSpec.starPrice : Math.max(1L, priceSpec.physCount);
         AdminEditType type = editType(player, tag);
         ShopSavedData data = data(player.server);
         if (type == AdminEditType.MALL) {
@@ -4026,13 +5579,28 @@ public final class ShopManager {
                 return;
             }
             MallItem item = data.mallPool.get(index);
-            item.price = price;
-            item.rarity = parseRarity(tag.getString("rarity"), price);
+            item.setPriceSpec(priceSpec);
+            item.rarity = parseRarity(tag.getString("rarity"), rarityHint);
+            boolean permLimit = tag.contains("permanent_limit")
+                    ? isTruthyFlag(tag.getString("permanent_limit"))
+                    : item.permanentLimit;
+            int stockVal = parseMallStock(tag.getString("quantity"));
+            if (permLimit && stockVal <= 0) {
+                stockVal = 1;
+            }
+            item.permanentLimit = permLimit;
+            if (permLimit) {
+                item.supplyMode = SupplyMode.STATIC;
+            }
             // 改库存同时更新「补货目标」：管理员填多少，定时补货以后就补回多少。
-            item.setStock(parseMallStock(tag.getString("quantity")));
+            item.setStock(stockVal);
         } else if (type == AdminEditType.SHIPPING) {
-            // 出货箱的"条目"就是兑换规则：只改单价（格式错误的那几行不能改，只能右键删掉重写）。
-            if (!ShippingRules.updatePrice(index, price)) {
+            // 出货箱的"条目"就是兑换规则：同时支持改单价与每日出货上限（0 = 无限）。
+            int dailyMax = parseOptionalNonNegativeInt(player, tag, "daily_max");
+            if (dailyMax < 0) {
+                return;
+            }
+            if (!ShippingRules.updateRule(index, priceSpec, dailyMax)) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.shipping_rule_broken")
                         .withStyle(ChatFormatting.RED));
             }
@@ -4042,18 +5610,19 @@ public final class ShopManager {
                 return;
             }
             ConfiguredOffer offer = pool.get(index);
-            offer.price = price;
+            offer.setPriceSpec(priceSpec);
             // 需求 6/7：商店与收购都可单独设置品质、数量；品质留空时按价格推导。
-            offer.rarity = parseRarity(tag.getString("rarity"), price);
+            offer.rarity = parseRarity(tag.getString("rarity"), rarityHint);
             offer.amount = parseInt(tag.getString("quantity"));
         }
         data.setDirty();
         sendSnapshot(player, "admin");
+        broadcastSnapshots(player.server);
     }
 
     private static void adminRemove(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         int index = tag.getInt("index");
@@ -4077,6 +5646,7 @@ public final class ShopManager {
         }
         data.setDirty();
         sendSnapshot(player, "admin");
+        broadcastSnapshots(player.server);
     }
 
     // =========================================================== 货币兑换
@@ -4139,6 +5709,15 @@ public final class ShopManager {
                     .withStyle(ChatFormatting.RED));
             return;
         }
+        if (cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig.get().isBlockingBuybackAndShipping()
+                && cn.autoforged.module_shop.shop.currency.PhysicalCurrencyEngine.isCurrencyItem(
+                        entry.stack, player.level().registryAccess())) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.phys_exchange_blocked",
+                    "防套利保护：该物品已作为实体货币启用，请在个人主页「货币兑换」进行凑整/拆零")
+                    .withStyle(ChatFormatting.RED));
+            return;
+        }
         int owned = countMatching(player, entry.stack);
         if (owned <= 0) {
             notifyPlayer(player, Component.translatable("msg.module_shop.exchange_no_items")
@@ -4167,8 +5746,18 @@ public final class ShopManager {
                     .withStyle(ChatFormatting.RED));
             return;
         }
+        if (cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig.get().isBlockingBuybackAndShipping()
+                && cn.autoforged.module_shop.shop.currency.PhysicalCurrencyEngine.isCurrencyItem(
+                        entry.stack, player.level().registryAccess())) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.phys_exchange_blocked",
+                    "防套利保护：该物品已作为实体货币启用，请在个人主页「货币兑换」进行凑整/拆零")
+                    .withStyle(ChatFormatting.RED));
+            return;
+        }
         PlayerAccount account = account(player);
-        long affordable = account.balance / entry.value;
+        long spendable = Math.max(0L, account.balance);
+        long affordable = spendable / entry.value;
         if (affordable <= 0L) {
             notifyPlayer(player, Component.translatable("msg.module_shop.exchange_withdraw_no_money", entry.value)
                     .withStyle(ChatFormatting.RED));
@@ -4178,7 +5767,7 @@ public final class ShopManager {
         CompoundTag extra = new CompoundTag();
         extra.putInt("index", index);
         extra.putString("default_quantity", Integer.toString(Math.min(max, Math.max(1, entry.stack.getMaxStackSize()))));
-        extra.putLong("balance", account.balance);
+        extra.putLong("balance", spendable);
         extra.putBoolean("show_balance", true);
         // 让输入界面能实时判断“填的数量买不起”，并在右侧红字提示「余额不足」。
         extra.putLong("unit_price", entry.value);
@@ -4197,12 +5786,36 @@ public final class ShopManager {
                         .withStyle(ChatFormatting.RED));
                 return;
             }
+            if (PhysicalCurrencyConfig.get().isBlockingBuybackAndShipping()
+                    && PhysicalCurrencyEngine.isCurrencyItem(
+                            entry.stack, player.level().registryAccess())) {
+                notifyPlayer(player, Component.translatableWithFallback(
+                        "msg.module_shop.phys_exchange_blocked",
+                        "防套利保护：该物品已作为实体货币启用，请在个人主页「货币兑换」进行凑整/拆零")
+                        .withStyle(ChatFormatting.RED));
+                return;
+            }
             PlayerAccount account = account(player);
             ShopSavedData data = data(player.server);
             long quotaDay = Config.shippingQuotaDay();
             if (account.exchangeDay != quotaDay) {
                 account.exchangeDay = quotaDay;
                 account.exchangeToday = 0L;
+                account.exchangeEntryUsedToday.clear();
+            }
+
+            String entryLimitKey = entry.limitKey(player.level().registryAccess());
+            int entryDailyRoom = Integer.MAX_VALUE;
+            if (entry.dailyLimit > 0) {
+                int entryUsed = Math.max(0, account.exchangeEntryUsedToday.getOrDefault(entryLimitKey, 0));
+                entryDailyRoom = Math.max(0, entry.dailyLimit - entryUsed);
+                if (entryDailyRoom <= 0) {
+                    notifyPlayer(player, Component.translatableWithFallback(
+                            "msg.module_shop.exchange_entry_limit_reached",
+                            "%s 今日个人兑换件数已达上限（%s 个）",
+                            entry.stack.getHoverName(), entry.dailyLimit).withStyle(ChatFormatting.YELLOW));
+                    return;
+                }
             }
 
             long max = Config.maxBalanceLimit();
@@ -4213,13 +5826,13 @@ public final class ShopManager {
                 return;
             }
 
-            boolean eco = cn.autoforged.module_shop.eco.EcoPricing.isEcoActive();
+            boolean eco = EcoPricing.isEcoActive();
             long minFloor = Config.INSTANCE.treasuryMinFloor.get();
             long treasurySpendable = eco ? data.treasury.spendableAboveFloor(minFloor) : Long.MAX_VALUE;
-            long personalCap = cn.autoforged.module_shop.eco.ClearingHouse.computePersonalExchangeCap(account);
+            long personalCap = ClearingHouse.computePersonalExchangeCap(account);
             long personalRoom = personalCap == Long.MAX_VALUE ? Long.MAX_VALUE
                     : Math.max(0L, personalCap - account.exchangeToday);
-            long globalFxRoom = cn.autoforged.module_shop.eco.ClearingHouse.computeGlobalExchangeRoom(data, quotaDay);
+            long globalFxRoom = ClearingHouse.computeGlobalExchangeRoom(data, quotaDay);
 
             if (personalRoom < entry.value) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.exchange_daily_cap_reached", personalCap)
@@ -4240,6 +5853,7 @@ public final class ShopManager {
             }
             int requested = parseInt(tag.getString("quantity"));
             int wanted = Math.min(requested <= 0 ? owned : requested, owned);
+            wanted = Math.min(wanted, entryDailyRoom);
             long allowedStarCoins = Math.min(Math.min(walletRoom, treasurySpendable), Math.min(personalRoom, globalFxRoom));
             int affordable = (int) Math.min(Integer.MAX_VALUE, allowedStarCoins / entry.value);
             wanted = Math.min(wanted, affordable);
@@ -4260,7 +5874,10 @@ public final class ShopManager {
                     : gain;
             // 防御性兜底：确保仅按单件汇率的整数倍入账，任何未入账差额 100% 原路冲正退回总钱箱，未兑付物品原样退还玩家
             long usablePaid = (paid / entry.value) * entry.value;
-            long added = (credit(account, usablePaid, max) / entry.value) * entry.value;
+            long rawAdded = CurrencySettlement.payoutStarOnly(
+                    player.server, player.getUUID(), account, null, usablePaid, false, false,
+                    SOURCE_EXCHANGE, null, null);
+            long added = (rawAdded / entry.value) * entry.value;
             if (eco && paid > added) {
                 data.treasury.refundOutflow(paid - added, quotaDay);
             }
@@ -4275,6 +5892,9 @@ public final class ShopManager {
                 return;
             }
             account.exchangeToday += added;
+            if (entry.dailyLimit > 0 && !entryLimitKey.isEmpty()) {
+                account.exchangeEntryUsedToday.merge(entryLimitKey, actualConverted, Integer::sum);
+            }
             if (eco) {
                 data.treasury.fxPaidToday += added;
             }
@@ -4301,18 +5921,32 @@ public final class ShopManager {
                         .withStyle(ChatFormatting.RED));
                 return;
             }
+            if (PhysicalCurrencyConfig.get().isBlockingBuybackAndShipping()
+                    && PhysicalCurrencyEngine.isCurrencyItem(
+                            entry.stack, player.level().registryAccess())) {
+                notifyPlayer(player, Component.translatableWithFallback(
+                        "msg.module_shop.phys_exchange_blocked",
+                        "防套利保护：该物品已作为实体货币启用，请在个人主页「货币兑换」进行凑整/拆零")
+                        .withStyle(ChatFormatting.RED));
+                return;
+            }
             PlayerAccount account = account(player);
             ShopSavedData data = data(player.server);
             int requested = parseInt(tag.getString("quantity"));
-            int affordable = (int) Math.min(Integer.MAX_VALUE, account.balance / entry.value);
+            long spendable = Math.max(0L, account.balance);
+            int affordable = (int) Math.min(Integer.MAX_VALUE, spendable / entry.value);
             int wanted = Math.min(requested <= 0 ? 1 : requested, affordable);
             long cost = safeMultiply(entry.value, wanted);
-            if (wanted <= 0 || cost <= 0L || cost > account.balance) {
+            if (wanted <= 0 || cost <= 0L) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.exchange_withdraw_no_money",
                         Math.max(entry.value, cost)).withStyle(ChatFormatting.RED));
                 return;
             }
-            if (debit(account, cost, "purchase") < 0L) { return; }
+            var payRes = CurrencySettlement.payStar(account, cost, "purchase");
+            if (!payRes.ok()) {
+                CurrencySettlement.notifyPayFailure(player, payRes);
+                return;
+            }
             boolean mailed = deliver(player, entry.stack, wanted, SOURCE_EXCHANGE);
             data.setDirty();
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.EXCHANGE_WITHDRAW, "货币兑换",
@@ -4329,8 +5963,8 @@ public final class ShopManager {
 
     /** 管理员：新增兑换货币（模板来自幽灵槽，价格来自输入框）；同一物品重复添加视为改价。 */
     private static void adminExchangeSet(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ItemStack stack = ADMIN_TEMPLATE.remove(player.getUUID());
@@ -4343,14 +5977,16 @@ public final class ShopManager {
                     .withStyle(ChatFormatting.RED));
             return;
         }
+        int dailyLimit = parseOptionalLimitInt(tag.getString("daily_limit"));
         ShopSavedData data = data(player.server);
-        ExchangeEntry entry = new ExchangeEntry(stack, value);
+        ExchangeEntry entry = new ExchangeEntry(stack, value, dailyLimit);
         entry.normalize();
         for (ExchangeEntry existing : data.exchangePool) {
             if (ItemStack.isSameItemSameComponents(existing.stack, entry.stack)) {
                 existing.value = value;
+                existing.dailyLimit = dailyLimit;
                 data.setDirty();
-                sendSnapshot(player, "exchange");
+                broadcastSnapshots(player.server);
                 notifyPlayer(player, Component.translatable("msg.module_shop.exchange_updated",
                         entry.stack.getHoverName(), value).withStyle(ChatFormatting.GREEN));
                 return;
@@ -4358,15 +5994,15 @@ public final class ShopManager {
         }
         data.exchangePool.add(entry);
         data.setDirty();
-        sendSnapshot(player, "exchange");
+        broadcastSnapshots(player.server);
         notifyPlayer(player, Component.translatable("msg.module_shop.exchange_added",
                 entry.stack.getHoverName(), value).withStyle(ChatFormatting.GREEN));
     }
 
-    /** 管理员：改汇率（界面左键点击条目）。 */
+    /** 管理员：改汇率与单品每日兑换上限（界面左键点击条目）。 */
     private static void adminExchangeEdit(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         int index = tag.getInt("index");
@@ -4379,16 +6015,19 @@ public final class ShopManager {
             return;
         }
         entry.value = value;
+        if (tag.contains("daily_limit")) {
+            entry.dailyLimit = parseOptionalLimitInt(tag.getString("daily_limit"));
+        }
         data.setDirty();
-        sendSnapshot(player, "exchange");
+        broadcastSnapshots(player.server);
         notifyPlayer(player, Component.translatable("msg.module_shop.exchange_updated",
                 entry.stack.getHoverName(), value).withStyle(ChatFormatting.GREEN));
     }
 
     /** 管理员：移除兑换货币（模板不退还，原因同商品池：退还会复制物品）。 */
     private static void adminExchangeRemove(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -4428,19 +6067,57 @@ public final class ShopManager {
 
     /** 连续签到到某天数时，每天额外多拿多少星币（累计加成，关闭时返回 0）。 */
     private static long cumulativeBonus(ShopSavedData data, int streak) {
-        if (!data.signInCumulative) {
-            return 0L;
-        }
-        long bonus = 0L;
-        for (int i = 0; i < data.signInTierDays.length && i < data.signInTierBonus.length; i++) {
-            if (streak >= data.signInTierDays[i]) {
-                bonus = Math.max(bonus, data.signInTierBonus[i]);
-            }
-        }
-        return bonus;
+        PriceSpec spec = cumulativeBonusSpec(data, streak);
+        return spec.supportsStar() ? spec.starPrice : 0L;
     }
 
-    /** 真正结算一次签到（玩家点击或登录自动）。 */
+    private static PriceSpec cumulativeBonusSpec(ShopSavedData data, int streak) {
+        if (!data.signInCumulative) {
+            return PriceSpec.ZERO;
+        }
+        int bestDay = -1;
+        PriceSpec best = PriceSpec.ZERO;
+        for (int i = 0; i < data.signInTierDays.length && i < data.signInTierBonusSpecs.length; i++) {
+            int reqDay = data.signInTierDays[i];
+            if (streak >= reqDay) {
+                PriceSpec candidate = data.resolveSignInTierSpec(i);
+                if (candidate.isZero()) {
+                    continue;
+                }
+                if (best.isZero()) {
+                    best = candidate;
+                    bestDay = reqDay;
+                } else if (best.mode == CurrencyMode.STAR_ONLY && candidate.mode == CurrencyMode.STAR_ONLY) {
+                    if (candidate.starPrice >= best.starPrice) {
+                        best = candidate;
+                        bestDay = reqDay;
+                    }
+                } else if (reqDay >= bestDay) {
+                    best = candidate;
+                    bestDay = reqDay;
+                }
+            }
+        }
+        return best;
+    }
+
+    private static String formatSignSummary(long starAmount, Map<String, Long> physTotals, @Nullable MinecraftServer server) {
+        StringBuilder sb = new StringBuilder();
+        if (starAmount > 0L) {
+            sb.append(starAmount).append(" ").append(currencyName(server));
+        }
+        for (Map.Entry<String, Long> e : physTotals.entrySet()) {
+            if (e.getValue() != null && e.getValue() > 0L) {
+                if (sb.length() > 0) {
+                    sb.append(" + ");
+                }
+                sb.append(CurrencySettlement.formatSpec(PriceSpec.phys(e.getKey(), e.getValue()), server));
+            }
+        }
+        return sb.length() == 0 ? ("0 " + currencyName(server)) : sb.toString();
+    }
+
+    /** 真正结算一次签到（玩家点击或登录自动），支持双独立账本。 */
     private static void doSignIn(ServerPlayer player) {
         synchronized (LOCK) {
             ShopSavedData data = data(player.server);
@@ -4470,79 +6147,145 @@ public final class ShopManager {
             }
             PlayerAccount account = account(player);
             long max = Config.maxBalanceLimit();
-            long walletRoom = Math.max(0L, max - account.balance);
-            long reward = Math.max(0L, data.signInBaseDaily) + cumulativeBonus(data, sign.streak);
-            boolean eco = cn.autoforged.module_shop.eco.EcoPricing.isEcoActive();
-            long quotaDay = Config.shippingQuotaDay();
+            boolean eco = EcoPricing.isEcoActive();
             long minFloor = Config.INSTANCE.treasuryMinFloor.get();
 
-            long wantReward = Math.min(reward, walletRoom);
-            long payReward = (wantReward > 0L)
-                    ? (eco ? data.treasury.outflowUpTo(wantReward, minFloor, quotaDay) : wantReward)
-                    : 0L;
-            long added = payReward > 0L ? credit(account, payReward, max) : 0L;
-            if (eco && payReward > added) {
-                data.treasury.refundOutflow(payReward - added, quotaDay);
-            }
-            boolean treasuryBlocked = eco && wantReward > 0L && added <= 0L;
+            long added = 0L;
+            Map<String, Long> dailyPhys = new java.util.LinkedHashMap<>();
+            boolean treasuryBlocked = false;
+            boolean walletBlocked = false;
 
-            // 里程奖励：**每轮**连续签到达到配置天数时发一次（同一轮只发一次，下一轮可再领）。
-            // 严格保证：仅在实际到账 > 0 后才标记 claimedMilestones，差额原路退回总钱箱，防止钱箱见底或钱包满时白吞里程大奖！
-            int roundDay = signInRoundDay(sign.streak);
-            long remainWalletRoom = Math.max(0L, max - account.balance);
-            long mileAdded = 0L;
-            boolean walletBlocked = (reward > 0L && walletRoom <= 0L);
-            for (int i = 0; i < data.signInMileDays.length && i < data.signInMileMoney.length; i++) {
-                int need = data.signInMileDays[i];
-                // 档位天数不能超过一轮的长度，否则永远到不了（例如每轮 7 天却配了 14 天档）。
-                if (need <= 0 || need > SIGNIN_CYCLE_DAYS) {
+            PriceSpec[] baseAndCum = {data.resolveSignInBaseSpec(), cumulativeBonusSpec(data, sign.streak)};
+            for (PriceSpec spec : baseAndCum) {
+                if (spec == null || spec.isZero() || !spec.isValid()) {
                     continue;
                 }
-                if (roundDay >= need && !sign.claimedMilestones.contains(need)) {
-                    long mAmt = Math.max(0L, data.signInMileMoney[i]);
-                    if (mAmt <= 0L) {
-                        sign.claimedMilestones.add(need);
-                        continue;
-                    }
-                    long wantM = Math.min(mAmt, remainWalletRoom);
-                    if (wantM <= 0L) {
-                        walletBlocked = true;
-                        continue;
-                    }
-                    long payM = eco ? data.treasury.outflowUpTo(wantM, minFloor, quotaDay) : wantM;
-                    if (payM <= 0L) {
-                        treasuryBlocked = true;
-                        continue;
-                    }
-                    long mCredited = credit(account, payM, max);
-                    if (eco && payM > mCredited) {
-                        data.treasury.refundOutflow(payM - mCredited, quotaDay);
-                    }
-                    if (mCredited > 0L) {
-                        sign.claimedMilestones.add(need);
-                        mileAdded += mCredited;
-                        remainWalletRoom = Math.max(0L, max - account.balance);
+                long room = Math.max(0L, max - account.balance);
+                long tRoom = eco ? data.treasury.spendableAboveFloor(minFloor) : Long.MAX_VALUE;
+                boolean wantStar = spec.mode.includesStar();
+                boolean wantPhys = spec.mode.includesPhys();
+                if (spec.mode == CurrencyMode.EITHER) {
+                    boolean starPossible = spec.starPrice > 0L && room > 0L && tRoom > 0L;
+                    if (!starPossible && spec.supportsPhys() && PhysicalCurrencyConfig.get().isActive()) {
+                        wantStar = false;
+                        wantPhys = true;
+                    } else {
+                        wantStar = true;
+                        wantPhys = false;
                     }
                 }
+                if (wantStar && spec.starPrice > 0L) {
+                    if (room <= 0L) {
+                        walletBlocked = true;
+                    } else {
+                        long got = CurrencySettlement.payoutStarOnly(
+                                player.server, player.getUUID(), account, data,
+                                Math.min(spec.starPrice, room), true, false, SOURCE_ADMIN, null, null);
+                        if (got > 0L) {
+                            added += got;
+                        } else if (eco) {
+                            treasuryBlocked = true;
+                        }
+                    }
+                }
+                if (wantPhys && spec.supportsPhys()) {
+                    CurrencySettlement.payoutPhysTier(
+                            player.server, player.getUUID(), spec.physTierKey, spec.physCount, SOURCE_ADMIN);
+                    dailyPhys.merge(spec.physTierKey, spec.physCount, Long::sum);
+                }
             }
+
+            // 里程奖励：**每轮**连续签到达到配置天数时发一次（同一轮只发一次，下一轮可再领）。
+            int roundDay = signInRoundDay(sign.streak);
+            long mileAdded = 0L;
+            Map<String, Long> milePhys = new java.util.LinkedHashMap<>();
+            for (int i = 0; i < data.signInMileDays.length && i < data.signInMileSpecs.length; i++) {
+                int need = data.signInMileDays[i];
+                if (need <= 0 || need > SIGNIN_CYCLE_DAYS || roundDay < need || sign.claimedMilestones.contains(need)) {
+                    continue;
+                }
+                PriceSpec mSpec = data.resolveSignInMileSpec(i);
+                if (mSpec.isZero() || !mSpec.isValid()) {
+                    sign.claimedMilestones.add(need);
+                    continue;
+                }
+                long room = Math.max(0L, max - account.balance);
+                long tRoom = eco ? data.treasury.spendableAboveFloor(minFloor) : Long.MAX_VALUE;
+                boolean wantStar = mSpec.mode.includesStar();
+                boolean wantPhys = mSpec.mode.includesPhys();
+                if (mSpec.mode == CurrencyMode.EITHER) {
+                    boolean starPossible = mSpec.starPrice > 0L && room > 0L && tRoom > 0L;
+                    if (!starPossible && mSpec.supportsPhys() && PhysicalCurrencyConfig.get().isActive()) {
+                        wantStar = false;
+                        wantPhys = true;
+                    } else {
+                        wantStar = true;
+                        wantPhys = false;
+                    }
+                }
+                long mCredited = 0L;
+                long mPhysPaid = 0L;
+                if (wantStar && mSpec.starPrice > 0L) {
+                    if (room <= 0L) {
+                        walletBlocked = true;
+                    } else if (eco && tRoom <= 0L) {
+                        treasuryBlocked = true;
+                    } else {
+                        mCredited = CurrencySettlement.payoutStarOnly(
+                                player.server, player.getUUID(), account, data,
+                                Math.min(mSpec.starPrice, room), true, false, SOURCE_ADMIN, null, null);
+                        if (mCredited <= 0L && eco) {
+                            treasuryBlocked = true;
+                        }
+                    }
+                }
+                if (wantPhys && mSpec.supportsPhys()) {
+                    CurrencySettlement.payoutPhysTier(
+                            player.server, player.getUUID(), mSpec.physTierKey, mSpec.physCount, SOURCE_ADMIN);
+                    milePhys.merge(mSpec.physTierKey, mSpec.physCount, Long::sum);
+                    mPhysPaid = mSpec.physCount;
+                }
+                if (mCredited > 0L || mPhysPaid > 0L) {
+                    sign.claimedMilestones.add(need);
+                    mileAdded += mCredited;
+                }
+            }
+
             data.setDirty();
+            Map<String, Long> totalPhys = new java.util.LinkedHashMap<>(dailyPhys);
+            milePhys.forEach((k, v) -> totalPhys.merge(k, v, Long::sum));
+            String logDetail = Component.translatable("msg.module_shop.signin_note", sign.streak).getString()
+                    + (totalPhys.isEmpty() ? "" : " [" + formatSignSummary(0L, totalPhys, player.server) + "]");
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.SIGN_IN, "每日签到",
-                    added + mileAdded, account.balance, Component.translatable("msg.module_shop.signin_note",
-                            sign.streak).getString());
+                    added + mileAdded, account.balance, logDetail);
             // 事件：签到完成（成功后发布）
             cn.autoforged.module_shop.api.event.ApiEvents.post(
                     new cn.autoforged.module_shop.api.event.SignInCompletedEvent(
                             player.getUUID(), ShopManager.realDay(), sign.streak, added + mileAdded));
-            notifyPlayer(player, Component.translatable("msg.module_shop.signin_ok",
-                    added, sign.streak).withStyle(ChatFormatting.GREEN));
-            if (mileAdded > 0L) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.signin_milestone", mileAdded)
-                        .withStyle(ChatFormatting.GOLD));
+            if (dailyPhys.isEmpty()) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.signin_ok",
+                        added, sign.streak).withStyle(ChatFormatting.GREEN));
+            } else {
+                notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.signin_ok_spec",
+                        "签到成功！获得 %s（已连续签到 %s 天）",
+                        formatSignSummary(added, dailyPhys, player.server), sign.streak)
+                        .withStyle(ChatFormatting.GREEN));
+            }
+            if (mileAdded > 0L || !milePhys.isEmpty()) {
+                if (milePhys.isEmpty()) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.signin_milestone", mileAdded)
+                            .withStyle(ChatFormatting.GOLD));
+                } else {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.signin_milestone_spec",
+                            "达成连签里程碑！额外获得 %s",
+                            formatSignSummary(mileAdded, milePhys, player.server))
+                            .withStyle(ChatFormatting.GOLD));
+                }
             }
             if (treasuryBlocked) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.treasury_capped")
                         .withStyle(ChatFormatting.YELLOW));
-            } else if (walletBlocked && added + mileAdded <= 0L) {
+            } else if (walletBlocked && added + mileAdded <= 0L && totalPhys.isEmpty()) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.grant_cap_reached")
                         .withStyle(ChatFormatting.RED));
             }
@@ -4571,8 +6314,12 @@ public final class ShopManager {
         return streak;
     }
 
-    /** 补签：花星币把过去某一天补成已签到，并**重算连续天数**（补上缺口后连续签到加成立即生效）。 */
+    /** 补签：花星币/实体货币把过去某一天补成已签到，并**重算连续天数**（补上缺口后连续签到加成立即生效）。 */
     private static void doMakeupSign(ServerPlayer player, long day) {
+        doMakeupSign(player, day, "");
+    }
+
+    private static void doMakeupSign(ServerPlayer player, long day, @Nullable String payChannel) {
         synchronized (LOCK) {
             ShopSavedData data = data(player.server);
             long today = realDay();
@@ -4583,15 +6330,17 @@ public final class ShopManager {
                 return;
             }
             PlayerAccount account = account(player);
-            long cost = Math.max(0L, data.signInMakeupCost);
-            if (account.balance < cost) {
-                notifyPlayer(player, Component.translatable("msg.module_shop.signin_makeup_no_money", cost)
-                        .withStyle(ChatFormatting.RED));
+            PriceSpec costSpec = data.resolveSignInMakeupSpec();
+            var payRes = CurrencySettlement.paySpec(
+                    player, account, data, costSpec, 1, payChannel, "purchase", SOURCE_EXCHANGE, true);
+            if (!payRes.ok()) {
+                if ("msg.module_shop.no_money".equals(payRes.failKey()) && costSpec.supportsStar()) {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.signin_makeup_no_money",
+                            costSpec.starPrice).withStyle(ChatFormatting.RED));
+                } else {
+                    CurrencySettlement.notifyPayFailure(player, payRes);
+                }
                 return;
-            }
-            if (debit(account, cost, "purchase") < 0L) { return; }
-            if (cn.autoforged.module_shop.eco.EcoPricing.isEcoActive() && cost > 0L) {
-                data.treasury.inflow(cost, Config.shippingQuotaDay());
             }
             sign.signedDays.add(day);
             // 补签后重算连续天数（只增不减，避免把原本更高的记录改小）：
@@ -4604,18 +6353,27 @@ public final class ShopManager {
                 sign.bestStreak = sign.streak;
             }
             data.setDirty();
+            PriceSpec paidSpec = paidSpecOf(payRes, costSpec);
             TransactionLog.record(player.server, player.getUUID(), TransactionLog.SIGN_MAKEUP, "补签",
-                    -cost, account.balance, "补签 " + day);
-            notifyPlayer(player, Component.translatable("msg.module_shop.signin_makeup_ok_streak",
-                    cost, sign.streak).withStyle(ChatFormatting.GREEN));
+                    -payRes.starPaid(), account.balance,
+                    "补签 " + day + (payRes.paidPhys() ? " [" + CurrencySettlement.formatSpec(paidSpec, player.server) + "]" : ""));
+            if (payRes.paidPhys()) {
+                notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.signin_makeup_ok_streak_spec",
+                        "补签成功！花费 %s（当前连续签到 %s 天）",
+                        CurrencySettlement.formatSpec(paidSpec, player.server), sign.streak)
+                        .withStyle(ChatFormatting.GREEN));
+            } else {
+                notifyPlayer(player, Component.translatable("msg.module_shop.signin_makeup_ok_streak",
+                        payRes.starPaid(), sign.streak).withStyle(ChatFormatting.GREEN));
+            }
             sendSnapshot(player, "signin");
         }
     }
 
     /** 管理员：登录自动签到开关。 */
     private static void adminSignInAutoToggle(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -4629,8 +6387,8 @@ public final class ShopManager {
 
     /** 管理员：累计签到加成开关（关闭时界面不显示里程进度条）。 */
     private static void adminSignInCumulativeToggle(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -4643,42 +6401,70 @@ public final class ShopManager {
     }
 
     /**
-     * 管理员：一次性修改签到设置。
-     * fields：base=每日基础奖励，makeupCost=补签花费，makeupDays=可补签天数，
-     * tiers=「天数:每日加成」逗号分隔（如 3:5,5:7,7:10），miles=「天数:一次性奖励」逗号分隔。
+     * 管理员：一次性修改签到设置（支持四态 PriceSpec）。
+     * fields：baseSpec / base=每日基础奖励，makeupSpec / makeupCost=补签花费，makeupDays=可补签天数，
+     * tiers=「天数:每日加成」逗号分隔（如 3:5,5:phys:copper*2,7:10），miles=「天数:一次性奖励」逗号分隔。
      */
     private static void adminSignInSet(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
-        long base = parsePositive(tag.getString("base"));
-        long cost = parsePositive(tag.getString("makeupCost"));
+        PriceSpec baseSpec = parseSpecField(player, tag, "baseSpec", "base", true);
+        if (baseSpec == null) {
+            return;
+        }
+        String makeupSpecKey = tag.contains("makeupSpec", Tag.TAG_COMPOUND) ? "makeupSpec" : "makeupCostSpec";
+        PriceSpec makeupSpec = parseSpecField(player, tag, makeupSpecKey, "makeupCost", true);
+        if (makeupSpec == null) {
+            return;
+        }
         int days = parseInt(tag.getString("makeupDays"));
         int[] tiers = parsePairs(tag.getString("tiers"), data.signInTierDays);
-        long[] bonuses = parsePairValues(tag.getString("tiers"), data.signInTierBonus);
-        int[] miles = parsePairs(tag.getString("miles"), data.signInMileDays);
-        long[] money = parsePairValues(tag.getString("miles"), data.signInMileMoney);
-        if (base >= 0L) {
-            data.signInBaseDaily = base;
+        PriceSpec[] currentTierSpecs = new PriceSpec[data.signInTierBonusSpecs.length];
+        for (int i = 0; i < currentTierSpecs.length; i++) {
+            currentTierSpecs[i] = data.resolveSignInTierSpec(i);
         }
-        data.signInMakeupCost = cost;
+        PriceSpec[] tierSpecs = parsePairSpecs(player, tag.getString("tiers"), currentTierSpecs);
+        if (tierSpecs == null) {
+            return;
+        }
+        int[] miles = parsePairs(tag.getString("miles"), data.signInMileDays);
+        PriceSpec[] currentMileSpecs = new PriceSpec[data.signInMileSpecs.length];
+        for (int i = 0; i < currentMileSpecs.length; i++) {
+            currentMileSpecs[i] = data.resolveSignInMileSpec(i);
+        }
+        PriceSpec[] mileSpecs = parsePairSpecs(player, tag.getString("miles"), currentMileSpecs);
+        if (mileSpecs == null) {
+            return;
+        }
+        if (tag.contains("baseSpec", Tag.TAG_COMPOUND) || tag.contains("base")) {
+            data.setSignInBaseSpec(baseSpec);
+        }
+        if (tag.contains("makeupSpec", Tag.TAG_COMPOUND) || tag.contains("makeupCostSpec", Tag.TAG_COMPOUND)
+                || tag.contains("makeupCost")) {
+            data.setSignInMakeupSpec(makeupSpec);
+        }
         if (days > 0) {
             data.signInMakeupDays = Math.min(30, days);
         }
         System.arraycopy(tiers, 0, data.signInTierDays, 0, Math.min(tiers.length, data.signInTierDays.length));
-        System.arraycopy(bonuses, 0, data.signInTierBonus, 0, Math.min(bonuses.length, data.signInTierBonus.length));
+        for (int i = 0; i < Math.min(tierSpecs.length, data.signInTierBonusSpecs.length); i++) {
+            data.setSignInTierSpec(i, tierSpecs[i]);
+        }
         System.arraycopy(miles, 0, data.signInMileDays, 0, Math.min(miles.length, data.signInMileDays.length));
-        System.arraycopy(money, 0, data.signInMileMoney, 0, Math.min(money.length, data.signInMileMoney.length));
-        data.signInEnabled = data.signInBaseDaily > 0L || data.signInMileMoney[0] > 0L;
+        for (int i = 0; i < Math.min(mileSpecs.length, data.signInMileSpecs.length); i++) {
+            data.setSignInMileSpec(i, mileSpecs[i]);
+        }
+        data.signInEnabled = !data.resolveSignInBaseSpec().isZero() || !data.resolveSignInMileSpec(0).isZero();
         data.setDirty();
         sendSnapshot(player, "signin");
         notifyPlayer(player, Component.translatable("msg.module_shop.signin_set_ok")
                 .withStyle(ChatFormatting.GREEN));
     }
 
-    /** 解析「3:5,5:7,7:10」里的天数部分；解析失败时保留原值。 */
+    /** 解析「3:5,5:7,7:10」或「3:phys:copper*2,...」里的天数部分；解析失败时保留原值。 */
     private static int[] parsePairs(String text, int[] fallback) {
         int[] out = fallback.clone();
         if (text == null || text.isBlank()) {
@@ -4686,7 +6472,7 @@ public final class ShopManager {
         }
         String[] parts = text.split(",");
         for (int i = 0; i < parts.length && i < out.length; i++) {
-            String[] kv = parts[i].split(":");
+            String[] kv = parts[i].split(":", 2);
             if (kv.length == 2) {
                 int v = parseInt(kv[0]);
                 if (v > 0) {
@@ -4697,18 +6483,29 @@ public final class ShopManager {
         return out;
     }
 
-    /** 解析「3:5,5:7,7:10」里的数值部分；解析失败时保留原值。 */
-    private static long[] parsePairValues(String text, long[] fallback) {
-        long[] out = fallback.clone();
+    private static @Nullable PriceSpec[] parsePairSpecs(ServerPlayer player, String text, PriceSpec[] fallback) {
+        PriceSpec[] out = fallback.clone();
         if (text == null || text.isBlank()) {
             return out;
         }
         String[] parts = text.split(",");
         for (int i = 0; i < parts.length && i < out.length; i++) {
-            String[] kv = parts[i].split(":");
-            if (kv.length == 2) {
-                out[i] = parsePositive(kv[1]);
+            String[] kv = parts[i].split(":", 2);
+            if (kv.length != 2) {
+                continue;
             }
+            String val = kv[1].trim();
+            PriceSpec parsed = val.isEmpty() || "0".equals(val) ? PriceSpec.ZERO : PriceSpec.parseRuleText(val);
+            if (parsed == null) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
+                        .withStyle(ChatFormatting.RED));
+                return null;
+            }
+            PriceSpec validated = validateAdminSpec(player, parsed, true);
+            if (validated == null) {
+                return null;
+            }
+            out[i] = validated;
         }
         return out;
     }
@@ -4729,8 +6526,8 @@ public final class ShopManager {
      * 不填标题且金额为 0 视为取消该活动日。
      */
     private static void adminActivityDaySet(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -4744,16 +6541,24 @@ public final class ShopManager {
         // 每个界面只写自己负责的字段，**未携带的键一律保持原值**，避免被别的界面的空值覆盖
         // （此前奖励界面会用它打开时捕获的标题回写，标题就丢了）。
         ActivityDay existing = data.activityDay(day);
-        if (!tag.contains("title") && !tag.contains("note") && !tag.contains("money")
+        boolean hasMoney = tag.contains("moneySpec", Tag.TAG_COMPOUND) || tag.contains("money");
+        if (!tag.contains("title") && !tag.contains("note") && !hasMoney
                 && !tag.contains("color") && !tag.contains("hour")
                 && !tag.contains("offline") && !tag.contains("catchUp")) {
             // 什么都没带：只推一次快照，不动数据。
             sendSnapshot(player, "signin");
             return;
         }
-        long money = tag.contains("money")
-                ? parsePositive(tag.getString("money"))
-                : (existing == null ? 0L : existing.money);
+        PriceSpec moneySpec = existing == null ? PriceSpec.ZERO : existing.resolveMoneySpec();
+        if (hasMoney) {
+            moneySpec = parseSpecField(player, tag, "moneySpec", "money", true);
+            if (moneySpec == null) {
+                return;
+            }
+            if (moneySpec.supportsStar() && moneySpec.starPrice > Config.maxBalanceLimit()) {
+                moneySpec = moneySpec.withStarPrice(Config.maxBalanceLimit());
+            }
+        }
         boolean offline = tag.contains("offline")
                 ? ("true".equalsIgnoreCase(tag.getString("offline").trim())
                         || "1".equals(tag.getString("offline").trim()))
@@ -4764,11 +6569,11 @@ public final class ShopManager {
         boolean hasItems = (existing != null && !existing.rewardStacks().isEmpty())
                 || (draftMatch && !pending.items.isEmpty());
         if (draftMatch) {
-            money = pending.money;
+            moneySpec = pending.moneySpec;
             offline = pending.offline;
         }
-        // 清空条件：界面明确提交了空标题，且没有金额、没有物品奖励。
-        if (tag.contains("title") && title.isEmpty() && money <= 0L && !hasItems) {
+        // 清空条件：界面明确提交了空标题，且没有金额/实体货币、没有物品奖励。
+        if (tag.contains("title") && title.isEmpty() && moneySpec.isZero() && !hasItems) {
             data.activityDays.remove(day);
             ACTIVITY_DRAFTS.remove(player.getUUID());
             data.setDirty();
@@ -4784,8 +6589,8 @@ public final class ShopManager {
             if (tag.contains("note")) {
                 act.note = note;
             }
-            if (tag.contains("money")) {
-                act.money = money;
+            if (hasMoney) {
+                act.setMoneySpec(moneySpec);
             }
             if (tag.contains("offline")) {
                 act.forOffline = offline;
@@ -4816,7 +6621,7 @@ public final class ShopManager {
                 act.hour = draft.hour;
                 act.forOffline = draft.offline;
                 act.catchUp = draft.catchUp;
-                act.money = draft.money;
+                act.setMoneySpec(draft.moneySpec);
                 if (!sameRewards(act.rewards, draft.items)) {
                     act.rewards.clear();
                     act.rewards.addAll(draft.items);
@@ -4857,8 +6662,8 @@ public final class ShopManager {
 
     /** 管理员：取消某天的活动日。 */
     private static void adminActivityDayClear(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -4897,7 +6702,7 @@ public final class ShopManager {
         int hour = -1;
         boolean offline;
         boolean catchUp = true;
-        long money;
+        PriceSpec moneySpec = PriceSpec.ZERO;
         final List<ItemStack> items = new ArrayList<>();
     }
 
@@ -4919,7 +6724,7 @@ public final class ShopManager {
             draft.hour = act.hour;
             draft.offline = act.forOffline;
             draft.catchUp = act.catchUp;
-            draft.money = act.money;
+            draft.moneySpec = act.resolveMoneySpec();
             for (ItemStack stack : act.rewardStacks()) {
                 draft.items.add(stack.copy());
             }
@@ -4939,7 +6744,7 @@ public final class ShopManager {
             tag.putLong("day", draft.day);
             tag.putString("title", draft.title);
             tag.putString("note", draft.note);
-            tag.putLong("money", draft.money);
+            draft.moneySpec.writeToParent(tag, "moneySpec", "money");
             tag.putBoolean("forOffline", draft.offline);
             tag.putBoolean("catchUp", draft.catchUp);
             tag.putString("item", MailTemplates.itemsText(draft.items));
@@ -4965,7 +6770,7 @@ public final class ShopManager {
 
     /** 打开日程编辑：建一份草稿（从正式日程复制）并推回客户端。 */
     private static void adminActivityDraftOpen(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         long day = tag.getLong("day");
@@ -4980,7 +6785,7 @@ public final class ShopManager {
 
     /** 日程奖励界面「保存」：只改草稿里的发放规则，**不发布**。 */
     private static void adminActivityDraftSet(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         long day = tag.getLong("day");
@@ -5014,8 +6819,8 @@ public final class ShopManager {
 
     /** 编辑界面「取消」：丢掉草稿，正式日程保持不变。 */
     private static void adminActivityDraftDiscard(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ACTIVITY_DRAFTS.remove(player.getUUID());
@@ -5031,7 +6836,7 @@ public final class ShopManager {
      * {@link #adminActivityRewardCancel}），所以既不会丢东西也不会复制物品。
      */
     private static void adminActivityRewardOpen(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         long day = tag.getLong("day");
@@ -5065,7 +6870,7 @@ public final class ShopManager {
 
     /** 管理员：保存「日程奖励」界面里的物品与金额到该日程。 */
     private static void adminActivityRewardSave(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         RewardEdit edit = REWARD_EDIT.remove(player.getUUID());
@@ -5086,12 +6891,18 @@ public final class ShopManager {
                 items.add(stack.copy());
             }
         }
-        long money = Math.min(parsePositive(tag.getString("money")), Config.maxBalanceLimit());
+        PriceSpec moneySpec = parseSpecField(player, tag, "moneySpec", "money", true);
+        if (moneySpec == null) {
+            return;
+        }
+        if (moneySpec.supportsStar() && moneySpec.starPrice > Config.maxBalanceLimit()) {
+            moneySpec = moneySpec.withStarPrice(Config.maxBalanceLimit());
+        }
         ShopSavedData data = data(player.server);
         synchronized (LOCK) {
             ActivityDraft draft = draftOf(data, player, day);
-            if (draft.items.isEmpty() && items.isEmpty() && money <= 0L) {
-                // 既没有物品也没有金额：不要凭空建出一个空日程。
+            if (draft.items.isEmpty() && items.isEmpty() && moneySpec.isZero()) {
+                // 既没有物品也没有金额/实体货币：不要凭空建出一个空日程。
                 clearContainer(container);
                 notifyPlayer(player, Component.translatable("msg.module_shop.grant_nothing")
                         .withStyle(ChatFormatting.RED));
@@ -5103,12 +6914,15 @@ public final class ShopManager {
             // 只写草稿：正式日程要等编辑界面点「保存」才更新（否则一进奖励界面玩家就看到了）。
             draft.items.clear();
             draft.items.addAll(items);
-            draft.money = money;
+            draft.moneySpec = moneySpec;
             sendActivityDraft(player);
         }
+        String rewardLabel = moneySpec.mode == CurrencyMode.STAR_ONLY
+                ? moneySpec.starPrice + currencyName(player.server)
+                : CurrencySettlement.formatSpec(moneySpec, player.server);
         notifyPlayer(player, Component.translatable("msg.module_shop.activity_reward_set",
-                LocalDate.ofEpochDay(day).toString(), items.size(),
-                money + currencyName(player.server)).withStyle(ChatFormatting.GREEN));
+                LocalDate.ofEpochDay(day).toString(), items.size(), rewardLabel)
+                .withStyle(ChatFormatting.GREEN));
     }
 
     /**
@@ -5118,7 +6932,7 @@ public final class ShopManager {
      * 槽位内容与打开时一致 → 不退还；只是数量变多 → 退还多出来的部分；换成别的东西 → 退还新的那件。
      */
     private static void adminActivityRewardCancel(ServerPlayer player) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         RewardEdit edit = REWARD_EDIT.remove(player.getUUID());
@@ -5185,7 +6999,7 @@ public final class ShopManager {
     }
 
     /** 兑换码奖励草稿：管理员在「奖励配置」界面里配好的物品 / 星币 / 指定玩家。 */
-    private record RedeemDraft(List<ItemStack> items, long money, List<UUID> players) {
+    private record RedeemDraft(List<ItemStack> items, PriceSpec moneySpec, List<UUID> players) {
     }
 
     private static final Map<UUID, RedeemRewardEdit> REDEEM_REWARD_EDIT =
@@ -5195,12 +7009,12 @@ public final class ShopManager {
     private static final Map<UUID, String> REDEEM_EDIT_TARGET = new java.util.concurrent.ConcurrentHashMap<>();
 
     private static RedeemDraft redeemDraft(ServerPlayer player) {
-        return REDEEM_DRAFT.getOrDefault(player.getUUID(), new RedeemDraft(List.of(), 0L, List.of()));
+        return REDEEM_DRAFT.getOrDefault(player.getUUID(), new RedeemDraft(List.of(), PriceSpec.ZERO, List.of()));
     }
 
     /** 管理员：放弃本次兑换码编辑（关闭编辑器时调用）——草稿丢掉，兑换码本身一点没改。 */
     private static void adminRedeemDraftDiscard(ServerPlayer player) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         REDEEM_DRAFT.remove(player.getUUID());
@@ -5208,17 +7022,17 @@ public final class ShopManager {
         sendRedeemDraft(player);
     }
 
-    /** 把草稿推给客户端：生成器显示「物品 / 星币 / 玩家」摘要，编辑界面据此回填。 */
+    /** 把草稿推给客户端：生成器显示「物品 / 货币 / 玩家」摘要，编辑界面据此回填。 */
     private static void sendRedeemDraft(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         RedeemDraft draft = redeemDraft(player);
         CompoundTag tag = new CompoundTag();
         tag.putString("kind", "redeem_draft");
         tag.putString("items", MailTemplates.itemsText(draft.items()));
-        tag.putLong("money", draft.money());
+        (draft.moneySpec() == null ? PriceSpec.ZERO : draft.moneySpec()).writeToParent(tag, "moneySpec", "money");
         ListTag names = new ListTag();
         for (UUID id : draft.players()) {
             names.add(StringTag.valueOf(playerName(player.server, id)));
@@ -5248,12 +7062,12 @@ public final class ShopManager {
      * 管理员看到的/改的就是现配置；关闭时只退还他自己加进去的那部分。
      */
     private static void adminRedeemRewardOpen(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         // 玩家列表与草稿都先推一次，保证界面一打开就有数据（不依赖网络时序）。
         GrantManager.sendTargets(player);
-        // 带 code = 改这个已有兑换码（预填它的物品/星币/玩家列表）；不带 = 配新兑换码的草稿。
+        // 带 code = 改这个已有兑换码（预填它的物品/货币/玩家列表）；不带 = 配新兑换码的草稿。
         String target = tag.getString("code").trim().toUpperCase(java.util.Locale.ROOT);
         List<ItemStack> source;
         if (!target.isEmpty()) {
@@ -5267,11 +7081,12 @@ public final class ShopManager {
             source = new ArrayList<>(existing.items);
             // 草稿先镜像这个码**当前**的奖励：之后在奖励界面里的改动只改草稿，
             // 点编辑界面的「保存」才落到兑换码上（和「生成」是同一套语义，不会改一半就生效）。
+            PriceSpec existingSpec = existing.resolveMoneySpec();
             REDEEM_DRAFT.put(player.getUUID(), new RedeemDraft(
-                    new ArrayList<>(existing.items), existing.money,
+                    new ArrayList<>(existing.items), existingSpec,
                     existing.global ? new ArrayList<>() : new ArrayList<>(existing.players)));
             // 全体可兑换的码不推玩家名单（界面上"一个都没勾"就是全体玩家）。
-            sendRedeemDraftFor(player, existing.items, existing.money,
+            sendRedeemDraftFor(player, existing.items, existingSpec,
                     existing.global ? new ArrayList<>() : new ArrayList<>(existing.players));
         } else {
             REDEEM_EDIT_TARGET.remove(player.getUUID());
@@ -5302,12 +7117,12 @@ public final class ShopManager {
     }
 
     /** 把「某个兑换码当前的内容」推给客户端（编辑界面回填用）。 */
-    private static void sendRedeemDraftFor(ServerPlayer player, List<ItemStack> items, long money,
+    private static void sendRedeemDraftFor(ServerPlayer player, List<ItemStack> items, PriceSpec moneySpec,
             List<UUID> players) {
         CompoundTag tag = new CompoundTag();
         tag.putString("kind", "redeem_draft");
         tag.putString("items", MailTemplates.itemsText(items));
-        tag.putLong("money", money);
+        (moneySpec == null ? PriceSpec.ZERO : moneySpec).writeToParent(tag, "moneySpec", "money");
         ListTag names = new ListTag();
         for (UUID id : players) {
             names.add(StringTag.valueOf(playerName(player.server, id)));
@@ -5317,15 +7132,10 @@ public final class ShopManager {
     }
 
     /**
-     * 管理员：保存「兑换码奖励配置」界面里的物品 + 星币 + 玩家。
-     * <p>
-     * 两种情况都只写**服务端草稿**：从生成器进来时，草稿在「生成」时变成兑换码；
-     * 从「编辑兑换码」进来时，草稿在编辑界面点「保存」时落到那个兑换码上
-     * （已领取记录 {@code usedBy} 原样保留，已领过的玩家不受影响）。
-     * 这样「改一半就生效」不会发生：取消编辑 = 兑换码完全没变。
+     * 管理员：保存「兑换码奖励配置」界面里的物品 + 货币（星币/实体币） + 玩家。
      */
     private static void adminRedeemRewardSave(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         REDEEM_REWARD_EDIT.remove(player.getUUID());
@@ -5334,6 +7144,13 @@ public final class ShopManager {
             notifyPlayer(player, Component.translatable("msg.module_shop.grant_no_menu")
                     .withStyle(ChatFormatting.RED));
             return;
+        }
+        PriceSpec moneySpec = parseSpecField(player, tag, "moneySpec", "money", true);
+        if (moneySpec == null) {
+            return;
+        }
+        if (moneySpec.supportsStar() && moneySpec.starPrice > Config.maxBalanceLimit()) {
+            moneySpec = moneySpec.withStarPrice(Config.maxBalanceLimit());
         }
         Container container = menu.grant();
         List<ItemStack> items = new ArrayList<>();
@@ -5354,25 +7171,26 @@ public final class ShopManager {
                 // 非法 UUID 直接跳过，服务端以自己解析出来的列表为准。
             }
         }
-        // 勾选名单可以是空的：**空 = 全体玩家都能兑换**（默认），非空 = 只有名单里的玩家能兑换。
-        long money = Math.min(parsePositive(tag.getString("money")), Config.maxBalanceLimit());
         // 两种情况都只写**草稿**：新码等「生成」、改已有码等「保存」才真正生效。
-        REDEEM_DRAFT.put(player.getUUID(), new RedeemDraft(items, money, players));
+        REDEEM_DRAFT.put(player.getUUID(), new RedeemDraft(items, moneySpec, players));
         if (!target.isEmpty()) {
             sendRedeemList(player);
         }
         Component scope = players.isEmpty()
                 ? Component.translatable("msg.module_shop.redeem_all_players")
                 : Component.literal(Integer.toString(players.size()));
+        String rewardLabel = moneySpec.mode == CurrencyMode.STAR_ONLY
+                ? moneySpec.starPrice + currencyName(player.server)
+                : CurrencySettlement.formatSpec(moneySpec, player.server);
         notifyPlayer(player, Component.translatable("msg.module_shop.redeem_reward_set",
-                items.size(), money + currencyName(player.server), scope)
+                items.size(), rewardLabel, scope)
                 .withStyle(ChatFormatting.GREEN));
         sendRedeemDraft(player);
     }
 
     /** 管理员：取消「兑换码奖励配置」（只退还自己加进去的物品，草稿/兑换码保持原样）。 */
     private static void adminRedeemRewardCancel(ServerPlayer player) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         RedeemRewardEdit edit = REDEEM_REWARD_EDIT.remove(player.getUUID());
@@ -5404,7 +7222,7 @@ public final class ShopManager {
         String target = REDEEM_EDIT_TARGET.getOrDefault(player.getUUID(), "");
         RedeemCode rc = target.isEmpty() ? null : data(player.server).redeemCodes.get(target);
         if (rc != null) {
-            sendRedeemDraftFor(player, rc.items, rc.money,
+            sendRedeemDraftFor(player, rc.items, rc.resolveMoneySpec(),
                     rc.global ? new ArrayList<>() : new ArrayList<>(rc.players));
         } else {
             sendRedeemDraft(player);
@@ -5425,8 +7243,8 @@ public final class ShopManager {
      * fields：weights=「传说,史诗,稀有,普通」权重，guarantee=「稀有,史诗,传说」保底，slots=条目/牌数上限。
      */
     private static void adminShopGenSet(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -5448,10 +7266,27 @@ public final class ShopManager {
             }
         }
         data.setDirty();
-        // 只重抽当前正在设置的那个列表（改商店参数不动收购，反之亦然）。
-        refreshDaily(player, shop);
+        // 全服所有玩家（含离线）重抽当前正在设置的那个列表（改商店参数不动收购，反之亦然）。
+        rerollDailyForAll(player.server, data, shop, !shop);
         sendSnapshot(player, "admin");
         notifyPlayer(player, Component.translatable("msg.module_shop.gen_set_ok")
+                .withStyle(ChatFormatting.GREEN));
+    }
+
+    /** 管理员一键全服重抽当前模块（每日商店 / 每日收购），覆盖在线与离线玩家。 */
+    private static void adminRerollDaily(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player)) {
+            return;
+        }
+        ShopSavedData data = data(player.server);
+        boolean shop = isShopMode(player, tag);
+        rerollDailyForAll(player.server, data, shop, !shop);
+        sendSnapshot(player, "admin");
+        Component modName = Component.translatable(shop
+                ? "gui.module_shop.admin_shop" : "gui.module_shop.admin_buyback");
+        notifyPlayer(player, Component.translatableWithFallback(
+                "msg.module_shop.admin_rerolled_all",
+                "已按当前商品池为全服玩家重新抽取今日「%s」清单", modName)
                 .withStyle(ChatFormatting.GREEN));
     }
 
@@ -5557,17 +7392,26 @@ public final class ShopManager {
             if (moneyDone && itemsDone) {
                 return;
             }
-            // 定时发放：还没到设定的时间点、且该日程不允许离线领取 → 等在线到点由 tick 发放。
-            if (act.hour >= 0 && java.time.LocalTime.now().getHour() < act.hour && !act.forOffline && !act.catchUp) {
+            // 定时发放：未到设定的时间点一律等待；超过设定时间点仅当开启 catchUp 或 forOffline 时补发。
+            if (!ShopExpireSupport.canGrantActivityDayAtHour(act.hour, java.time.LocalTime.now().getHour(),
+                    act.catchUp, act.forOffline)) {
                 return;
             }
-            if (act.money <= 0L && dayItems.isEmpty()) {
+            PriceSpec moneySpec = act.resolveMoneySpec();
+            if (moneySpec.isZero() && dayItems.isEmpty()) {
                 return;
             }
             PlayerAccount account = account(player);
             long added = 0L;
-            if (!moneyDone && act.money > 0L) {
-                added = credit(account, act.money, Config.maxBalanceLimit());
+            long physPaid = 0L;
+            String physTier = "";
+            if (!moneyDone && !moneySpec.isZero()) {
+                var payRes = CurrencySettlement.payoutSpec(
+                        player.server, player.getUUID(), account, data, moneySpec, 1, null,
+                        SOURCE_ADMIN, act.title, ItemStack.EMPTY, false, false);
+                added = payRes.starCredited();
+                physPaid = payRes.physPaidCount();
+                physTier = payRes.physTierKey();
                 act.granted.add(player.getUUID());
             }
             if (!itemsDone) {
@@ -5581,20 +7425,26 @@ public final class ShopManager {
                         .addItems(dayItems));
             }
             data.setDirty();
-            if (added > 0L) {
+            if (added > 0L || physPaid > 0L) {
+                String grantedText = CurrencySettlement.formatSpec(
+                        physPaid > 0L && added > 0L ? PriceSpec.both(added, physTier, physPaid)
+                                : (physPaid > 0L ? PriceSpec.phys(physTier, physPaid) : PriceSpec.star(added)),
+                        player.server);
                 TransactionLog.record(player.server, player.getUUID(), TransactionLog.SIGN_IN, "活动日",
-                        added, account.balance, act.title);
-                notifyPlayer(player, Component.translatable("msg.module_shop.activity_granted",
-                        act.title, added).withStyle(ChatFormatting.GOLD));
+                        added, account.balance,
+                        physPaid > 0L ? act.title + " [" + grantedText + "]" : act.title);
+                if (physPaid > 0L) {
+                    notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.activity_granted_spec",
+                            "活动日「%s」奖励已发放：%s", act.title, grantedText).withStyle(ChatFormatting.GOLD));
+                } else {
+                    notifyPlayer(player, Component.translatable("msg.module_shop.activity_granted",
+                            act.title, added).withStyle(ChatFormatting.GOLD));
+                }
             }
             sendSnapshot(player, "signin");
         }
     }
 
-    /** 上一次做活动日离线补发的现实日期（每个日期只跑一次）。 */
-    private static long lastOfflineGrantDay = Long.MIN_VALUE;
-
-    /** 每日检查（挂在服务器 tick 上）：活动日离线补发，每个现实日期只执行一次。 */
     /** 定时发放：日程到了设定的现实时间点时，给当时在线的玩家发物品/星币（每人只发一次）。 */
     private static void tickActivitySchedules(MinecraftServer server) {
         ShopSavedData data = data(server);
@@ -5605,20 +7455,42 @@ public final class ShopManager {
         if (java.time.LocalTime.now().getHour() != act.hour) {
             return;
         }
+        boolean hasMoney = !act.resolveMoneySpec().isZero();
+        boolean hasItems = !act.rewardStacks().isEmpty();
+        if (!hasMoney && !hasItems) {
+            return;
+        }
         for (ServerPlayer online : server.getPlayerList().getPlayers()) {
-            if (!act.granted.contains(online.getUUID()) || !act.giftGranted.contains(online.getUUID())) {
+            UUID id = online.getUUID();
+            boolean needMoney = hasMoney && !act.granted.contains(id);
+            boolean needItems = hasItems && !act.itemsGrantedTo(id);
+            if (needMoney || needItems) {
                 grantActivityDay(online);
             }
         }
     }
 
+    /** 每日检查（挂在服务器 tick 上）：活动日定时在线发放 + 到点后给配置了离线补发的活动日补发。 */
     public static void tickActivityDayOffline(MinecraftServer server) {
         tickActivitySchedules(server);
+        ShopSavedData data = data(server);
         long today = realDay();
-        if (lastOfflineGrantDay == today) {
+        ActivityDay act = data.activityDay(today);
+        if (act == null || !act.forOffline) {
             return;
         }
-        lastOfflineGrantDay = today;
+        int nowHour = java.time.LocalTime.now().getHour();
+        if (!ShopExpireSupport.canGrantActivityOfflineAtHour(act.hour, nowHour)) {
+            return;
+        }
+        int sig = 31 * act.resolveMoneySpec().hashCode() + act.rewardStacks().size();
+        sig = 31 * sig + act.hour;
+        sig = 31 * sig + data.accounts().size();
+        if (data.lastOfflineGrantDay == today && data.lastOfflineGrantSig == sig) {
+            return;
+        }
+        data.lastOfflineGrantDay = today;
+        data.lastOfflineGrantSig = sig;
         grantActivityDayOffline(server);
     }
 
@@ -5628,7 +7500,14 @@ public final class ShopManager {
             ShopSavedData data = data(server);
             long today = realDay();
             ActivityDay act = data.activityDay(today);
-            if (act == null || !act.forOffline || (act.money <= 0L && act.rewardStacks().isEmpty())) {
+            if (act == null || !act.forOffline) {
+                return;
+            }
+            if (!ShopExpireSupport.canGrantActivityOfflineAtHour(act.hour, java.time.LocalTime.now().getHour())) {
+                return;
+            }
+            PriceSpec moneySpec = act.resolveMoneySpec();
+            if (moneySpec.isZero() && act.rewardStacks().isEmpty()) {
                 return;
             }
             boolean changed = false;
@@ -5641,8 +7520,15 @@ public final class ShopManager {
                     continue;
                 }
                 long added = 0L;
-                if (!moneyDone && act.money > 0L) {
-                    added = credit(entry.getValue(), act.money, Config.maxBalanceLimit());
+                long physPaid = 0L;
+                String physTier = "";
+                if (!moneyDone && !moneySpec.isZero()) {
+                    var res = CurrencySettlement.payoutSpec(
+                            server, entry.getKey(), entry.getValue(), data, moneySpec, 1, null,
+                            SOURCE_ADMIN, act.title, ItemStack.EMPTY, false, false);
+                    added = res.starCredited();
+                    physPaid = res.physPaidCount();
+                    physTier = res.physTierKey();
                     act.granted.add(entry.getKey());
                 }
                 if (!itemsDone) {
@@ -5655,9 +7541,14 @@ public final class ShopManager {
                             .addItems(dayItems));
                 }
                 changed = true;
-                if (added > 0L) {
+                if (added > 0L || physPaid > 0L) {
+                    String note = physPaid > 0L
+                            ? act.title + " [" + CurrencySettlement.formatSpec(
+                                    added > 0L ? PriceSpec.both(added, physTier, physPaid) : PriceSpec.phys(physTier, physPaid),
+                                    server) + "]"
+                            : act.title;
                     TransactionLog.record(server, entry.getKey(), TransactionLog.SIGN_IN, "活动日（离线补发）",
-                            added, entry.getValue().balance, act.title);
+                            added, entry.getValue().balance, note);
                 }
             }
             if (changed) {
@@ -5672,17 +7563,23 @@ public final class ShopManager {
      * 收购全清奖励的实际金额：管理员覆盖值优先；关闭时返回 0，
      * 于是界面不再显示提示行、maybeGrantBuybackBonus 里的「奖励为 0 就跳过」逻辑也不会发钱。
      */
-    public static long buybackBonusAmount(ShopSavedData data) {
+    public static PriceSpec buybackBonusSpec(ShopSavedData data) {
         if (data == null || !data.buybackBonusEnabled) {
-            return 0L;
+            return PriceSpec.ZERO;
         }
-        return data.buybackBonusOverride >= 0L ? data.buybackBonusOverride : Config.INSTANCE.buybackAllBonus.get();
+        PriceSpec resolved = data.resolveBuybackBonusSpec();
+        return resolved == null ? PriceSpec.ZERO : resolved;
+    }
+
+    public static long buybackBonusAmount(ShopSavedData data) {
+        PriceSpec spec = buybackBonusSpec(data);
+        return spec.supportsStar() ? spec.starPrice : 0L;
     }
 
     /** 管理员：开关收购全清奖励。 */
     private static void adminBuybackBonusToggle(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -5694,25 +7591,28 @@ public final class ShopManager {
                 .withStyle(ChatFormatting.GREEN));
     }
 
-    /** 管理员：修改收购全清奖励金额（0 = 关闭奖励）。 */
+    /** 管理员：修改收购全清奖励（支持星币 / 实体货币 / 双通道；0 = 关闭奖励）。 */
     private static void adminBuybackBonusSet(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
-        long amount = parsePrice(tag.getString("amount"));
+        PriceSpec spec = parseSpecField(player, tag, "priceSpec", "amount", true);
+        if (spec == null) {
+            return;
+        }
         ShopSavedData data = data(player.server);
-        if (amount < 0L) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
-                    .withStyle(ChatFormatting.RED));
-            return;
-        }
-        data.buybackBonusOverride = amount;
-        data.buybackBonusEnabled = amount > 0L;
+        data.setBuybackBonusSpec(spec);
         data.setDirty();
         sendSnapshot(player, "buyback");
-        notifyPlayer(player, Component.translatable("msg.module_shop.buyback_bonus_set", amount)
-                .withStyle(ChatFormatting.GREEN));
+        if (spec.isZero() || spec.mode == CurrencyMode.STAR_ONLY) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.buyback_bonus_set",
+                    spec.isZero() ? 0L : spec.starPrice).withStyle(ChatFormatting.GREEN));
+        } else {
+            notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.buyback_bonus_set_spec",
+                    "已设置每日收购全清奖励：%s", CurrencySettlement.formatSpec(spec, player.server))
+                    .withStyle(ChatFormatting.GREEN));
+        }
     }
 
     // =========================================================== 兑换码（第七轮）
@@ -5754,11 +7654,20 @@ public final class ShopManager {
             sendRedeemResult(player, false, code, "noreward");
             return;
         }
+        PriceSpec rewardSpec = entry.resolveMoneySpec();
+        long starReward = rewardSpec.supportsStar() ? rewardSpec.starPrice : 0L;
+        List<ItemStack> physCoinStacks = (rewardSpec.mode == CurrencyMode.PHYS_ONLY || rewardSpec.mode == CurrencyMode.BOTH)
+                ? PhysicalCurrencyEngine.buildPhysicalTierStacks(
+                        player.level().registryAccess(), rewardSpec.physTierKey, rewardSpec.physCount)
+                : List.of();
         MailTemplates.DraftMail draft = MailTemplates.build(MailTemplates.Template.REDEEM_OK,
                         MailTemplates.map("player", player.getGameProfile().getName(), "code", code))
                 .source(SOURCE_ADMIN)
-                .money(entry.money)
+                .money(starReward)
                 .addItems(entry.items);
+        if (!physCoinStacks.isEmpty()) {
+            draft.addItems(physCoinStacks);
+        }
         if (entry.title != null && !entry.title.isEmpty()) {
             draft.title(entry.title);
         }
@@ -5769,16 +7678,19 @@ public final class ShopManager {
         entry.usedCount++;
         entry.usedBy.merge(player.getUUID(), 1, Integer::sum);
         data.setDirty();
+        String physDetail = physCoinStacks.isEmpty() ? ""
+                : " [" + CurrencySettlement.formatSpec(PriceSpec.phys(rewardSpec.physTierKey, rewardSpec.physCount),
+                        player.server) + "]";
         TransactionLog.record(player.server, player.getUUID(), TransactionLog.REDEEM, "兑换码",
-                entry.money, account(player).balance, code + " " + MailTemplates.itemsText(entry.items));
+                starReward, account(player).balance, code + " " + MailTemplates.itemsText(entry.items) + physDetail);
         sendRedeemResult(player, true, code, "ok");
         sendSnapshot(player, "mail");
     }
 
     /** 管理员生成兑换码：码必填且不可重复、必须有奖励；指定玩家模式会把名字解析成 UUID。 */
     private static void adminRedeemCreate(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -5805,14 +7717,15 @@ public final class ShopManager {
         if (draft != null) {
             // 草稿里没勾人 = 全体玩家可兑换（默认）；勾了人才是"指定玩家"。
             rc.global = draft.players().isEmpty();
-            rc.money = draft.money();
+            rc.setMoneySpec(draft.moneySpec());
             rc.items.addAll(draft.items());
             if (!rc.global) {
                 rc.players.addAll(draft.players());
             }
         } else {
             rc.global = !"false".equalsIgnoreCase(tag.getString("global").trim());
-            rc.money = parsePrice(tag.getString("money"));
+            PriceSpec fallbackSpec = parseSpecField(player, tag, "moneySpec", "money", true);
+            rc.setMoneySpec(fallbackSpec == null ? PriceSpec.ZERO : fallbackSpec);
             rc.items.addAll(parseItemList(tag.getString("items")));
             if (!rc.global) {
                 for (String piece : tag.getString("players").split(",")) {
@@ -5849,7 +7762,7 @@ public final class ShopManager {
 
     /** 管理员：把某个兑换码当前的奖励内容推给客户端（编辑界面摘要显示用，不打开任何容器）。 */
     private static void adminRedeemPreview(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         String code = tag.getString("code").trim().toUpperCase(java.util.Locale.ROOT);
@@ -5862,13 +7775,13 @@ public final class ShopManager {
             sendRedeemDraft(player);
             return;
         }
-        sendRedeemDraftFor(player, rc.items, rc.money, new ArrayList<>(rc.players));
+        sendRedeemDraftFor(player, rc.items, rc.resolveMoneySpec(), new ArrayList<>(rc.players));
     }
 
     /** 管理员：下发已生成的兑换码列表（客户端列表界面展示与删除）。 */
     private static void sendRedeemList(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -5884,7 +7797,7 @@ public final class ShopManager {
             c.putInt("used", rc.usedCount);
             c.putInt("total", rc.totalLimit);
             c.putInt("perPlayer", rc.perPlayerLimit);
-            c.putLong("money", rc.money);
+            rc.resolveMoneySpec().writeToParent(c, "moneySpec", "money");
             c.putString("items", MailTemplates.itemsText(rc.items));
             c.putString("creator", rc.creator);
             // 第八轮：编辑界面要回填标题/备注/指定玩家，列表页也直接显示它们。
@@ -5903,8 +7816,8 @@ public final class ShopManager {
 
     /** 管理员：修改已有兑换码的基础设置（时效 / 限领 / 总上限 / 标题 / 备注）。 */
     private static void adminRedeemUpdate(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -5929,7 +7842,7 @@ public final class ShopManager {
             if (draft != null && code.equals(editTarget)) {
                 rc.items.clear();
                 rc.items.addAll(draft.items());
-                rc.money = draft.money();
+                rc.setMoneySpec(draft.moneySpec());
                 rc.global = draft.players().isEmpty();
                 rc.players.clear();
                 if (!rc.global) {
@@ -5946,8 +7859,8 @@ public final class ShopManager {
 
     /** 管理员：查看某个兑换码「谁领过、各领了几次」。 */
     private static void sendRedeemClaimed(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -5971,8 +7884,8 @@ public final class ShopManager {
 
     /** 管理员删除兑换码。 */
     private static void adminRedeemDelete(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -6252,6 +8165,7 @@ public final class ShopManager {
     }
 
     public static void onLogin(ServerPlayer player) {
+        LAST_SENT_MALL_HASH.remove(player.getUUID());
         // 签到（需求 7）：开启「自动签到」时登录即签到。
         autoSignInIfNeeded(player);
         // 活动日奖励（需求 7）：当天登录即可领取管理员配置的星币。
@@ -6260,6 +8174,7 @@ public final class ShopManager {
         PlayerAccount account = account(player);
         // 「右键重命名模块」已删除：把旧存档里改过的模块名一次性清掉，回到语言文件里的默认名。
         clearLegacyModuleNames(data(player.server));
+        loadBrandDefaultIfBlank(data(player.server).sidebarLayout);
         // 需求 13：惰性刷新——登录时检查时间戳，过期才重新生成每日商店/收购，不做全局 tick 遍历。
         ensureDaily(player, account, data(player.server));
         // 需求 10：登录时把持久化的未读数量同步给客户端，红点不会因为重连丢失。
@@ -6273,9 +8188,18 @@ public final class ShopManager {
         // 出货箱：离线期间结算过 → 登录时补一条提示。
         if (account.shipping.pendingNotice) {
             account.shipping.pendingNotice = false;
-            notifyPlayer(player, Component.translatable("msg.module_shop.shipping_sold_offline",
-                    account.shipping.lastCount, account.shipping.lastPayout)
-                    .withStyle(ChatFormatting.GREEN));
+            if (!account.shipping.lastPhysPayout.isEmpty()
+                    && account.shipping.lastPayoutSummary != null
+                    && !account.shipping.lastPayoutSummary.isBlank()) {
+                notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.shipping_sold_offline_spec",
+                        "离线期间出货箱已结算 %s 件物品，获得 %s",
+                        account.shipping.lastCount, account.shipping.lastPayoutSummary)
+                        .withStyle(ChatFormatting.GREEN));
+            } else {
+                notifyPlayer(player, Component.translatable("msg.module_shop.shipping_sold_offline",
+                        account.shipping.lastCount, account.shipping.lastPayout)
+                        .withStyle(ChatFormatting.GREEN));
+            }
         }
     }
 
@@ -6310,9 +8234,11 @@ public final class ShopManager {
     }
 
     public static void onLogout(ServerPlayer player) {
+        LAST_SENT_MALL_HASH.remove(player.getUUID());
         returnPending(player);
         TradeManager.onLogout(player);
         cn.autoforged.module_shop.shop.auction.AuctionService.onLogout(player);
+        AdminAuthService.onLogout(player.getUUID());
         DEPOSIT_CONTEXT.remove(player.getUUID());
         ADMIN_EDIT_TYPE.remove(player.getUUID());
         ADMIN_TEMPLATE.remove(player.getUUID());
@@ -6385,8 +8311,8 @@ public final class ShopManager {
 
     /** 管理员：开始编辑布局（拉一份草稿，之后只改草稿）。 */
     private static void adminLayoutBegin(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -6396,8 +8322,8 @@ public final class ShopManager {
 
     /** 管理员：点「完成」→ 把草稿一次性写进正式存档并广播给所有人。 */
     private static void adminLayoutCommit(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         LayoutDraft draft = LAYOUT_DRAFTS.remove(player.getUUID());
@@ -6415,15 +8341,17 @@ public final class ShopManager {
             data.sidebarLayout.setName(entry.getKey(), entry.getValue());
         }
         data.sidebarLayout.setShopTitle(src.shopTitle());
+        data.sidebarLayout.setBrandIconId(src.brandIconId());
         data.setDirty();
+        saveBrandDefault(data.sidebarLayout);
         broadcastSidebarLayout(player.server);
         notifyPlayer(player, Component.translatable("msg.module_shop.sidebar_saved")
                 .withStyle(ChatFormatting.GREEN));
     }
 
     private static void adminSidebarOrder(ServerPlayer player, CompoundTag tag) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ListTag list = tag.getList("order", 8);
@@ -6434,7 +8362,8 @@ public final class ShopManager {
                 ids.add(id);
             }
         }
-        // 被移除的模块（不在 order 里的那些）。
+        // 被移除的模块（不在 order 里的那些）：只有报文字段显式包含 hidden 时才覆盖，防止拖拽排序误清空。
+        boolean hasHidden = tag.contains("hidden", Tag.TAG_LIST);
         ListTag hiddenList = tag.getList("hidden", 8);
         List<String> hidden = new ArrayList<>();
         for (int i = 0; i < hiddenList.size() && hidden.size() < 32; i++) {
@@ -6454,7 +8383,9 @@ public final class ShopManager {
         // 编辑中只改草稿：正式存档要等「完成」才动，否则别人下一条快照就看到了。
         SidebarLayout target = editing ? layoutDraft(data, player).layout : data.sidebarLayout;
         target.setOrder(ids);
-        target.setHidden(hidden);
+        if (hasHidden) {
+            target.setHidden(hidden);
+        }
         if (!editing) {
             data.setDirty();
         }
@@ -6488,28 +8419,44 @@ public final class ShopManager {
      * {@code expire_amount}: game 按**游戏天数**、real 按**现实小时**（0 或 permanent = 永不自动下架）。
      */
     private static void adminStallExpire(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
-        String modeText = tag.getString("expire_mode").trim().toLowerCase(java.util.Locale.ROOT);
-        String mode = ("game".equals(modeText) || "real".equals(modeText)) ? modeText : "permanent";
-        int amount;
-        try {
-            amount = Integer.parseInt(tag.getString("expire_amount").trim());
-        } catch (NumberFormatException ex) {
+        String prevMode = Config.stallExpireMode();
+        int prevAmount = Config.stallExpireAmount();
+        String mode = ShopExpireSupport.normalizeExpireMode(tag.getString("expire_mode"));
+        Integer parsed = ShopExpireSupport.parseExpireAmount(mode, tag.getString("expire_amount"), prevAmount);
+        if (parsed == null) {
             notifyPlayer(player, Component.translatable("msg.module_shop.stall_expire_bad_amount")
                     .withStyle(ChatFormatting.RED));
             return;
         }
-        if (amount < 0 || amount > 100000) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.stall_expire_bad_amount")
-                    .withStyle(ChatFormatting.RED));
+        int amount = parsed;
+        if (!saveExpireConfig("stall", Config.INSTANCE.stallExpireMode, Config.INSTANCE.stallExpireAmount,
+                "stallExpireMode", mode, "stallExpireAmount", amount)) {
+            notifyPlayer(player, Component.translatableWithFallback("msg.module_shop.config_save_failed",
+                    "配置写入磁盘失败，已恢复原设置，请检查配置文件权限").withStyle(ChatFormatting.RED));
             return;
         }
-        Config.INSTANCE.stallExpireMode.set(mode);
-        Config.INSTANCE.stallExpireAmount.set(amount);
-        Config.SPEC.save();
-        Component desc = "permanent".equals(mode) || amount <= 0
+        if (ShopExpireSupport.shouldResetExpireTimestamps(prevMode, prevAmount, mode, amount)) {
+            synchronized (LOCK) {
+                ShopSavedData data = data(player.server);
+                long nowGame = player.server.overworld().getGameTime();
+                long nowReal = System.currentTimeMillis();
+                boolean resetAny = false;
+                for (PlayerAccount account : data.accounts().values()) {
+                    for (StallEntry entry : account.stall) {
+                        entry.listedGame = nowGame;
+                        entry.listedReal = nowReal;
+                        resetAny = true;
+                    }
+                }
+                if (resetAny) {
+                    data.setDirty();
+                }
+            }
+        }
+        Component desc = !ShopExpireSupport.isExpireActive(mode, amount)
                 ? Component.translatable("gui.module_shop.choice.expire_mode.permanent")
                 : Component.translatable("gui.module_shop.stall.expire_value",
                         Component.translatable("gui.module_shop.choice.expire_mode." + mode), amount);
@@ -6519,10 +8466,61 @@ public final class ShopManager {
         broadcastSnapshots(player.server);
     }
 
+    /** 持久化摊位 / 求购下架配置：跳过无变化字段，异常或重载竞态时自动走 TOML 原子回写兜底，彻底失败时回滚内存值。 */
+    private static boolean saveExpireConfig(String section,
+            net.neoforged.neoforge.common.ModConfigSpec.ConfigValue<String> modeVal,
+            net.neoforged.neoforge.common.ModConfigSpec.IntValue amountVal,
+            String modeKey, String mode, String amountKey, int amount) {
+        synchronized (LOCK) {
+            String prevMode = modeVal.get();
+            int prevAmount = amountVal.get();
+            boolean saved = false;
+            try {
+                if (!mode.equals(prevMode)) {
+                    modeVal.set(mode);
+                }
+                if (amount != prevAmount) {
+                    amountVal.set(amount);
+                }
+                Config.SPEC.save();
+                saved = true;
+            } catch (Throwable ex) {
+                org.slf4j.LoggerFactory.getLogger("module_shop")
+                        .warn("[模块商店] 保存 [{}] 下架配置失败，尝试原子回写 TOML：{}", section, ex.toString());
+            }
+            boolean memoryMatches = mode.equals(modeVal.get()) && amount == amountVal.get();
+            if (!saved || !memoryMatches) {
+                Map<String, String> patch = new java.util.LinkedHashMap<>();
+                patch.put(modeKey, "\"" + mode + "\"");
+                patch.put(amountKey, Integer.toString(amount));
+                Path cfgPath = net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get().resolve("module_shop_eco-common.toml");
+                if (ShopExpireSupport.writeTomlSectionAtomic(cfgPath, section, patch)) {
+                    try {
+                        if (!mode.equals(modeVal.get())) {
+                            modeVal.set(mode);
+                        }
+                        if (amount != amountVal.get()) {
+                            amountVal.set(amount);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    return true;
+                }
+                try {
+                    modeVal.set(prevMode);
+                    amountVal.set(prevAmount);
+                } catch (Throwable ignored) {
+                }
+                return false;
+            }
+            return true;
+        }
+    }
+
     /** 管理员：把所有页签位置恢复默认（编辑中同样只改草稿，点「完成」才广播）。 */
     private static void adminSidebarReset(ServerPlayer player) {
-        // 只有管理员（权限等级 2）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
-        if (player == null || !player.hasPermissions(2)) {
+        // 只有管理员（权限等级 2 且已解锁密码锁）能改商店设置：客户端隐藏按钮不算数，报文也必须校验。
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -6531,144 +8529,32 @@ public final class ShopManager {
         target.clear();
         if (!editing) {
             data.setDirty();
+            saveBrandDefault(data.sidebarLayout);
         }
         pushLayoutTo(player);
         notifyPlayer(player, Component.translatable("msg.module_shop.sidebar_reset")
                 .withStyle(ChatFormatting.YELLOW));
     }
 
-    /** 布局变了：给所有在线玩家推一份静默快照（只更新缓存、不打断他们的界面）。 */
-    /**
-     * 管理员：**改商店主标题**（左上角那个名字，全服生效）。
-     *
-     * <p>只改显示名：空字符串 = 恢复 lang 默认（模块商店）。最多 {@link SidebarLayout#MAX_TITLE} 个字。
-     */
-    // =========================================================== 商店模板（导出 / 导入 / 默认）
-    /** 只有管理员能碰模板（客户端按钮只是显示开关，服务端必须再校验一次）。 */
+    // =========================================================== 商店模板（委托至 TemplateTransferManager）
+
+    /** 只有已解锁的管理员能碰模板。 */
     private static boolean requireAdmin(ServerPlayer player) {
-        return player != null && player.hasPermissions(2);
+        return requireUnlockedAdmin(player);
     }
 
-    /** 导出当前世界模板：服务端生成 JSON，交给**客户端**写进 config/moduleshop/exports/。 */
-    private static void cfgExport(ServerPlayer player, CompoundTag tag) {
+    /** 打开「配置管理」界面：客户端自己 setScreen 在某些绘制路径下会被覆盖，保留服务端下发指令兜底。 */
+    private static void cfgOpenUi(ServerPlayer player) {
         if (!requireAdmin(player)) {
             return;
         }
-        ShopSavedData data = data(player.server);
-        String name = tag.getString("name");
-        cn.autoforged.module_shop.config.ShopTemplate template =
-                cn.autoforged.module_shop.shop.TemplateService.extract(data, name);
         CompoundTag out = new CompoundTag();
-        out.putString("kind", "cfg_export");
-        out.putString("json", template.toJson().toString());
-        out.putString("name", template.name);
+        out.putString("kind", "cfg_open_ui");
         cn.autoforged.module_shop.network.payload.ClientboundShopSyncPayload.send(player, out);
-    }
-
-    /** 把当前世界模板保存为默认模板（客户端 config/moduleshop/shop_config.json）。 */
-    private static void cfgSaveDefault(ServerPlayer player, CompoundTag tag) {
-        if (!requireAdmin(player)) {
-            return;
-        }
-        ShopSavedData data = data(player.server);
-        String name = tag.getString("name");
-        cn.autoforged.module_shop.config.ShopTemplate template =
-                cn.autoforged.module_shop.shop.TemplateService.extract(data, name);
-        CompoundTag out = new CompoundTag();
-        out.putString("kind", "cfg_save_default");
-        out.putString("json", template.toJson().toString());
-        out.putString("name", template.name);
-        cn.autoforged.module_shop.network.payload.ClientboundShopSyncPayload.send(player, out);
-    }
-
-    /** 预览导入：客户端把文件 JSON 发上来，服务端校验后回一条统计（不改世界）。 */
-    private static void cfgImportPreview(ServerPlayer player, CompoundTag tag) {
-        if (!requireAdmin(player)) {
-            return;
-        }
-        String json = tag.getString("json");
-        if (json == null || json.isBlank() || json.length() > 8 * 1024 * 1024) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.cfg_bad_file")
-                    .withStyle(ChatFormatting.RED));
-            return;
-        }
-        cn.autoforged.module_shop.config.ShopTemplate template =
-                cn.autoforged.module_shop.config.ShopTemplate.fromJson(json);
-        if (template == null) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.cfg_bad_json")
-                    .withStyle(ChatFormatting.RED));
-            return;
-        }
-        ShopSavedData data = data(player.server);
-        cn.autoforged.module_shop.shop.TemplateService.Preview preview =
-                cn.autoforged.module_shop.shop.TemplateService.preview(template, data);
-        CompoundTag out = new CompoundTag();
-        out.putString("kind", "cfg_preview");
-        out.putString("json", json);
-        out.putString("name", preview.name());
-        out.putInt("total", preview.total());
-        out.putInt("valid", preview.valid());
-        out.putInt("invalid", preview.invalid());
-        out.putInt("conflicts", preview.conflicts());
-        cn.autoforged.module_shop.network.payload.ClientboundShopSyncPayload.send(player, out);
-    }
-
-    /** 应用导入（replace / merge），成功后广播快照。 */
-    private static void cfgImportApply(ServerPlayer player, CompoundTag tag) {
-        if (!requireAdmin(player)) {
-            return;
-        }
-        String json = tag.getString("json");
-        cn.autoforged.module_shop.config.ShopTemplate template =
-                cn.autoforged.module_shop.config.ShopTemplate.fromJson(json);
-        if (template == null) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.cfg_bad_json")
-                    .withStyle(ChatFormatting.RED));
-            return;
-        }
-        cn.autoforged.module_shop.shop.TemplateService.Mode mode = "merge".equals(tag.getString("mode"))
-                ? cn.autoforged.module_shop.shop.TemplateService.Mode.MERGE
-                : cn.autoforged.module_shop.shop.TemplateService.Mode.REPLACE;
-        ShopSavedData data = data(player.server);
-        cn.autoforged.module_shop.shop.TemplateService.ApplyResult result =
-                cn.autoforged.module_shop.shop.TemplateService.apply(template, data, mode);
-        data.setDirty();
-        broadcastSnapshots(player.server);
-        notifyPlayer(player, Component.translatable("msg.module_shop.cfg_applied",
-                        result.applied(), result.invalid(), result.duplicates())
-                .withStyle(result.invalid() > 0 ? ChatFormatting.YELLOW : ChatFormatting.GREEN));
-        org.slf4j.LoggerFactory.getLogger("module_shop").info(
-                "管理员 {} 导入商店模板（{}）：{}", player.getGameProfile().getName(), mode, result.summary());
-    }
-
-    /** 手动用默认模板初始化（已初始化过的世界也允许，等于"用模板重置商店"）。 */
-    private static void cfgInitFromDefault(ServerPlayer player) {
-        if (!requireAdmin(player)) {
-            return;
-        }
-        ShopSavedData data = data(player.server);
-        java.nio.file.Path dir = net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get();
-        cn.autoforged.module_shop.config.ShopTemplateStore.ReadResult read =
-                cn.autoforged.module_shop.config.ShopTemplateStore.read(
-                        cn.autoforged.module_shop.config.ShopTemplateStore.defaultFile(dir));
-        if (!read.ok()) {
-            notifyPlayer(player, Component.translatable("msg.module_shop.cfg_no_default")
-                    .withStyle(ChatFormatting.RED));
-            return;
-        }
-        cn.autoforged.module_shop.shop.TemplateService.ApplyResult result =
-                cn.autoforged.module_shop.shop.TemplateService.apply(read.template(), data,
-                        cn.autoforged.module_shop.shop.TemplateService.Mode.REPLACE);
-        data.templateInitDone = true;
-        data.setDirty();
-        broadcastSnapshots(player.server);
-        notifyPlayer(player, Component.translatable("msg.module_shop.cfg_applied",
-                        result.applied(), result.invalid(), result.duplicates())
-                .withStyle(ChatFormatting.GREEN));
     }
 
     private static void adminShopTitleSet(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -6680,9 +8566,10 @@ public final class ShopManager {
         if (target.setShopTitle(raw)) {
             if (!editing) {
                 data.setDirty();
+                saveBrandDefault(data.sidebarLayout);
             }
             pushLayoutTo(player);
-            String now = data.sidebarLayout.shopTitle();
+            String now = target.shopTitle();
             if (now == null) {
                 notifyPlayer(player, Component.translatable("msg.module_shop.shop_title_reset")
                         .withStyle(ChatFormatting.YELLOW));
@@ -6707,7 +8594,7 @@ public final class ShopManager {
      * 货币名只有这一条路径能改，别的任何操作都不会写它。
      */
     private static void adminCurrencySet(ServerPlayer player, CompoundTag tag) {
-        if (!player.hasPermissions(2)) {
+        if (!canEditAdmin(player)) {
             return;
         }
         ShopSavedData data = data(player.server);
@@ -6843,23 +8730,52 @@ public final class ShopManager {
         }
     }
 
-    public static void addItemOrMail(ServerPlayer player, ItemStack stack, String source) {
-        // Inventory.add 会把传入栈原地 shrink 成“没塞进去的剩余量”，必须保留剩余量，否则半组同类物品时会丢物品。
-        ItemStack remaining = stack.copy();
-        player.getInventory().add(remaining);
-        if (remaining.isEmpty()) {
-            // 需求一：物品获取日志模板「获得 物品名×数量」，物品名可为纯数字，数量单独作字段。
-            notifyPlayer(player, Component.translatable("msg.module_shop.received",
-                    stack.getHoverName(), stack.getCount()).withStyle(ChatFormatting.GREEN));
+    /** 按物品最大堆叠拆成合法单叠列表，避免超堆叠（>64/>99/受损装备）引发存档编码崩溃或非法堆叠。 */
+    public static List<ItemStack> splitStacks(ItemStack template, int totalCount) {
+        List<ItemStack> out = new ArrayList<>();
+        if (template == null || template.isEmpty() || totalCount <= 0) {
+            return out;
+        }
+        int[] counts = ShopExpireSupport.splitStackCounts(totalCount, template.getMaxStackSize());
+        for (int c : counts) {
+            out.add(template.copyWithCount(c));
+        }
+        return out;
+    }
+
+    /** 将指定数量的同种物品按单叠上限拆份后发给在线玩家：能塞背包的进背包，放不下的合并进一封背包已满邮件。 */
+    public static void addItemsOrMail(ServerPlayer player, ItemStack template, int totalCount, String source) {
+        List<ItemStack> parts = splitStacks(template, totalCount);
+        if (parts.isEmpty()) {
             return;
         }
-        // 第七轮：背包放不下的部分进邮箱，并用「背包已满」模板（正文含「背包物品已达限额提醒」）。
+        List<ItemStack> leftovers = new ArrayList<>();
+        int leftoverTotal = 0;
+        for (ItemStack part : parts) {
+            player.getInventory().add(part);
+            if (!part.isEmpty()) {
+                leftovers.add(part);
+                leftoverTotal += part.getCount();
+            }
+        }
+        if (leftovers.isEmpty()) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.received",
+                    template.getHoverName(), totalCount).withStyle(ChatFormatting.GREEN));
+            return;
+        }
         addMailDraft(player.server, player.getUUID(), MailTemplates.build(
                         MailTemplates.Template.BAG_FULL, MailTemplates.map(
                                 "player", player.getGameProfile().getName(),
-                                "item", MailTemplates.itemText(remaining, true)))
+                                "item", MailTemplates.itemText(template, false) + "×" + leftoverTotal))
                 .source(source)
-                .addItem(remaining));
+                .addItems(leftovers));
+    }
+
+    public static void addItemOrMail(ServerPlayer player, ItemStack stack, String source) {
+        if (stack == null || stack.isEmpty()) {
+            return;
+        }
+        addItemsOrMail(player, stack, stack.getCount(), source);
     }
 
     public static void addMail(MinecraftServer server, @Nullable UUID owner, ItemStack stack, String source) {
@@ -6868,34 +8784,44 @@ public final class ShopManager {
 
     /** 需求：带发送者与发送者 UUID 的物品类邮件。 */
     public static void addMail(MinecraftServer server, @Nullable UUID owner, ItemStack stack, String source, String sender) {
-        if (owner == null || stack.isEmpty()) {
+        if (owner == null || stack == null || stack.isEmpty()) {
+            return;
+        }
+        List<ItemStack> parts = splitStacks(stack, stack.getCount());
+        if (parts.isEmpty()) {
             return;
         }
         ShopSavedData data = data(server);
         PlayerAccount account = data.account(owner);
         ServerPlayer online = server.getPlayerList().getPlayer(owner);
         int max = Config.INSTANCE.maxMailboxSize.get();
-        // 同样要处理 Inventory.add 的“部分放入”，只把真正剩下的部分继续进邮箱，避免丢物品。
-        ItemStack remaining = stack.copy();
         if (account.mailbox.size() >= max && !ensureMailRoom(server, account, online)) {
-            // 邮箱已满且没有已读邮件可清理：优先塞背包，仍放不下的直接掉落在玩家脚下。
+            // 邮箱已满且没有已读邮件可清理：按合法单叠优先塞背包，仍放不下的直接掉落在玩家脚下。
             if (online != null) {
-                online.getInventory().add(remaining);
-                if (remaining.isEmpty()) {
+                boolean dropped = false;
+                for (ItemStack part : parts) {
+                    online.getInventory().add(part);
+                    if (!part.isEmpty()) {
+                        online.drop(part, false);
+                        dropped = true;
+                    }
+                }
+                if (!dropped) {
                     notifyPlayer(online, Component.translatable("msg.module_shop.received",
                             stack.getHoverName(), stack.getCount()).withStyle(ChatFormatting.GREEN));
-                    data.setDirty();
-                    return;
+                } else {
+                    notifyPlayer(online, Component.translatable("msg.module_shop.mailbox_full")
+                            .withStyle(ChatFormatting.RED));
                 }
-                online.drop(remaining, false);
-                notifyPlayer(online, Component.translatable("msg.module_shop.mailbox_full")
-                        .withStyle(ChatFormatting.RED));
                 data.setDirty();
                 return;
             }
             // 离线玩家无法掉落，为避免系统返还的物品彻底丢失，仍然保留在邮箱（超出上限仅限系统资产）。
         }
-        MailEntry newEntry = MailEntry.item(remaining, source, sender, null, currentDay(server.overworld()));
+        MailEntry newEntry = MailEntry.item(parts.get(0), source, sender, null, currentDay(server.overworld()));
+        for (int i = 1; i < parts.size(); i++) {
+            newEntry.addStack(parts.get(i));
+        }
         // 第七轮：全服物品发放（admin_grant）保留 30 天有效期；其余邮件默认永久。
         if ("admin_grant".equals(source)) {
             newEntry.expireAt = System.currentTimeMillis() + GRANT_EXPIRE_DAYS * 86_400_000L;
@@ -6951,7 +8877,7 @@ public final class ShopManager {
         }
     }
 
-    private static void notifyPlayer(ServerPlayer player, Component message) {
+    public static void notifyPlayer(ServerPlayer player, Component message) {
         player.displayClientMessage(message, false);
     }
 
@@ -7039,6 +8965,93 @@ public final class ShopManager {
         return raw;
     }
 
+    private static @Nullable PriceSpec parseAdminSpec(ServerPlayer player, CompoundTag tag) {
+        return parseSpecField(player, tag, "priceSpec", "price", false);
+    }
+
+    private static @Nullable PriceSpec parseSpecField(ServerPlayer player, CompoundTag tag,
+                                                      String specKey, String textKey, boolean allowZero) {
+        if (tag == null) {
+            return allowZero ? PriceSpec.ZERO : null;
+        }
+        PriceSpec raw = null;
+        if (tag.contains(specKey, Tag.TAG_COMPOUND)) {
+            raw = PriceSpec.fromTag(tag.getCompound(specKey), 0L);
+        } else if (tag.contains("currencyMode", Tag.TAG_STRING) || tag.contains("physTier", Tag.TAG_STRING)) {
+            CurrencyMode mode = CurrencyMode.fromId(tag.getString("currencyMode"));
+            long star = tag.contains("starPrice", Tag.TAG_ANY_NUMERIC)
+                    ? tag.getLong("starPrice") : parsePositive(tag.getString(textKey));
+            String tier = tag.getString("physTier").trim();
+            long physCnt = tag.contains("physCount", Tag.TAG_ANY_NUMERIC)
+                    ? tag.getLong("physCount") : parsePositive(tag.getString(textKey));
+            if (allowZero && star <= 0L && physCnt <= 0L && (mode == CurrencyMode.STAR_ONLY || tier.isEmpty())) {
+                raw = PriceSpec.ZERO;
+            } else {
+                raw = PriceSpec.of(mode, star, tier, physCnt);
+            }
+        } else {
+            String text = tag.getString(textKey).trim();
+            if (allowZero && (text.isEmpty() || "0".equals(text))) {
+                raw = PriceSpec.ZERO;
+            } else {
+                raw = PriceSpec.parseRuleText(text);
+            }
+        }
+        if (raw == null) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
+                    .withStyle(ChatFormatting.RED));
+            return null;
+        }
+        return validateAdminSpec(player, raw, allowZero);
+    }
+
+    private static @Nullable PriceSpec validateAdminSpec(ServerPlayer player, @Nullable PriceSpec spec,
+                                                         boolean allowZero) {
+        if (spec == null) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
+                    .withStyle(ChatFormatting.RED));
+            return null;
+        }
+        if (spec.isZero()) {
+            if (allowZero) {
+                return PriceSpec.ZERO;
+            }
+            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
+                    .withStyle(ChatFormatting.RED));
+            return null;
+        }
+        if (!spec.isValid()) {
+            notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
+                    .withStyle(ChatFormatting.RED));
+            return null;
+        }
+        if (spec.supportsStar()) {
+            long cap = Config.maxBalanceLimit();
+            if (cap != Long.MAX_VALUE && spec.starPrice > cap) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.price_over_cap",
+                        Long.toString(cap)).withStyle(ChatFormatting.RED));
+                return null;
+            }
+        }
+        if (spec.supportsPhys()) {
+            PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+            var tier = physCfg.findTier(spec.physTierKey);
+            if (!physCfg.isActive() || tier == null) {
+                notifyPlayer(player, Component.translatableWithFallback(
+                        "msg.module_shop.phys_tier_unavailable", "所需的实体货币档位未启用或不存在")
+                        .withStyle(ChatFormatting.RED));
+                return null;
+            }
+            if (spec.physCount > (long) Integer.MAX_VALUE * 64L) {
+                notifyPlayer(player, Component.translatable("msg.module_shop.invalid_price")
+                        .withStyle(ChatFormatting.RED));
+                return null;
+            }
+            return spec.withPhysTierKey(tier.tierKey());
+        }
+        return spec;
+    }
+
     /** 乘法溢出保护：溢出或非正数统一返回 0，调用方按“价格非法”处理。 */
     private static long safeMultiply(long price, int count) {
         if (price <= 0L || count <= 0) {
@@ -7086,6 +9099,366 @@ public final class ShopManager {
 
     public static ResourceLocation id(String path) {
         return ResourceLocation.fromNamespaceAndPath(ModuleShopMod.MODID, path);
+    }
+
+    /** 管理员保存服务器个人主页公告配置并热更新全服在线玩家快照。 */
+    private static void adminAnnouncementsSave(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player)) {
+            return;
+        }
+        ListTag list = tag.getList("announcements", net.minecraft.nbt.Tag.TAG_COMPOUND);
+        boolean ok = cn.autoforged.module_shop.shop.home.AnnouncementConfig.saveFromTag(list);
+        if (!ok) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.announcements_save_failed", "保存公告配置失败，请检查服务端日志")
+                    .withStyle(ChatFormatting.RED));
+            return;
+        }
+        notifyPlayer(player, Component.translatableWithFallback(
+                "msg.module_shop.announcements_saved", "公告已保存并热更新同步至全服")
+                .withStyle(ChatFormatting.GREEN));
+        broadcastSnapshots(player.server);
+    }
+
+    /** 管理员保存分层实体货币配置并热更新全服在线玩家快照。 */
+    private static void adminPhysCurrencySave(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player)) {
+            return;
+        }
+        HolderLookup.Provider regs = player.level().registryAccess();
+        var parsed = cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig.parseAndValidateFromTag(tag, regs);
+        if (!parsed.ok() || parsed.config() == null) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.phys_save_invalid",
+                    "实体货币配置无效：%s",
+                    parsed.errorMessage()).withStyle(ChatFormatting.RED));
+            return;
+        }
+        if (!cn.autoforged.module_shop.shop.currency.PhysicalCurrencyConfig.replaceAndSave(parsed.config())) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.phys_save_failed", "写入 physical_currency.json 失败，请检查文件权限")
+                    .withStyle(ChatFormatting.RED));
+            return;
+        }
+        // 检查当前商品池/收购池是否存在与新实体货币碰撞的情况，给出贴心安全提示
+        if (parsed.config().isActive()) {
+            ShopSavedData data = data(player.server);
+            int lowPricedOffers = 0;
+            for (ConfiguredOffer offer : data.shopPool) {
+                if (PhysicalCurrencyEngine.isBuyPhysBelowCurrencyValue(
+                        offer.stack, 1, offer.resolvePriceSpec(), regs)) {
+                    lowPricedOffers++;
+                }
+            }
+            for (MallItem mallItem : data.mallPool) {
+                if (PhysicalCurrencyEngine.isBuyPhysBelowCurrencyValue(
+                        mallItem.stack, 1, mallItem.resolvePriceSpec(), regs)) {
+                    lowPricedOffers++;
+                }
+            }
+            if (lowPricedOffers > 0) {
+                notifyPlayer(player, Component.translatableWithFallback(
+                        "msg.module_shop.phys_arbitrage_warn",
+                        "提示：检测到 %s 条商品池价格低于对应实体货币面值，运行时防套利锁已自动拦截低价买币。",
+                        lowPricedOffers).withStyle(ChatFormatting.YELLOW));
+            }
+        }
+        notifyPlayer(player, Component.translatableWithFallback(
+                "msg.module_shop.phys_saved",
+                parsed.config().isActive()
+                        ? "实体货币配置已保存并热启用（全服已同步）"
+                        : "实体货币配置已保存（当前开关：关闭）")
+                .withStyle(ChatFormatting.GREEN));
+        broadcastSnapshots(player.server);
+    }
+
+    /**
+     * 管理员配置系统定额费用（每日商店刷新费 / 每日收购刷新费 / 出货箱升级费）。
+     * 客户端发送 {@code ListTag<CompoundTag>}；空列表表示清空覆盖、回退使用 {@link Config} 默认配置。
+     */
+    private static void adminSystemCostsSet(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player) || tag == null) {
+            return;
+        }
+        ShopSavedData data = data(player.server);
+        boolean anyApplied = false;
+
+        if (tag.contains("dailyRefreshSpecs", Tag.TAG_LIST)) {
+            List<PriceSpec> parsed = parseAdminSpecListTag(player, tag.getList("dailyRefreshSpecs", Tag.TAG_COMPOUND));
+            if (parsed == null) {
+                return;
+            }
+            data.dailyRefreshSpecs.clear();
+            data.dailyRefreshSpecs.addAll(parsed);
+            anyApplied = true;
+        } else if (tag.contains("dailyRefreshText", Tag.TAG_STRING)) {
+            List<PriceSpec> parsed = parseAdminSpecTextList(player, tag.getString("dailyRefreshText"));
+            if (parsed == null) {
+                return;
+            }
+            data.dailyRefreshSpecs.clear();
+            data.dailyRefreshSpecs.addAll(parsed);
+            anyApplied = true;
+        }
+
+        if (tag.contains("buybackRefreshSpecs", Tag.TAG_LIST)) {
+            List<PriceSpec> parsed = parseAdminSpecListTag(player, tag.getList("buybackRefreshSpecs", Tag.TAG_COMPOUND));
+            if (parsed == null) {
+                return;
+            }
+            data.buybackRefreshSpecs.clear();
+            data.buybackRefreshSpecs.addAll(parsed);
+            anyApplied = true;
+        } else if (tag.contains("buybackRefreshText", Tag.TAG_STRING)) {
+            List<PriceSpec> parsed = parseAdminSpecTextList(player, tag.getString("buybackRefreshText"));
+            if (parsed == null) {
+                return;
+            }
+            data.buybackRefreshSpecs.clear();
+            data.buybackRefreshSpecs.addAll(parsed);
+            anyApplied = true;
+        }
+
+        if (tag.contains("shippingUpgradeSpecs", Tag.TAG_LIST)) {
+            List<PriceSpec> parsed = parseAdminSpecListTag(player, tag.getList("shippingUpgradeSpecs", Tag.TAG_COMPOUND));
+            if (parsed == null) {
+                return;
+            }
+            data.shippingUpgradeSpecs.clear();
+            data.shippingUpgradeSpecs.addAll(parsed);
+            syncShippingLevelConfigs(parsed);
+            anyApplied = true;
+        } else if (tag.contains("shippingUpgradeText", Tag.TAG_STRING)) {
+            List<PriceSpec> parsed = parseAdminSpecTextList(player, tag.getString("shippingUpgradeText"));
+            if (parsed == null) {
+                return;
+            }
+            data.shippingUpgradeSpecs.clear();
+            data.shippingUpgradeSpecs.addAll(parsed);
+            syncShippingLevelConfigs(parsed);
+            anyApplied = true;
+        }
+
+        if (!anyApplied) {
+            return;
+        }
+        data.setDirty();
+        notifyPlayer(player, Component.translatableWithFallback(
+                "msg.module_shop.system_costs_saved", "系统定额费用设置已保存并热同步全服")
+                .withStyle(ChatFormatting.GREEN));
+        broadcastSnapshots(player.server);
+    }
+
+    /**
+     * 同步出货箱等级配置：管理员在系统费用台增删升级档位（如新增 Lv.4 / Lv.5）时，
+     * 同步扩展 {@code shippingUpgradeCosts}、{@code shippingLevelSlots} 与 {@code shippingDailyLimits}
+     * 并落盘，彻底消除 3 级硬上限与新增等级每日额度不生效问题。
+     */
+    private static void syncShippingLevelConfigs(List<PriceSpec> upgradeSpecs) {
+        int targetLevels = Math.max(1, (upgradeSpecs == null ? 0 : upgradeSpecs.size()) + 1);
+        List<String> costTexts = new ArrayList<>();
+        if (upgradeSpecs != null) {
+            for (PriceSpec spec : upgradeSpecs) {
+                costTexts.add(spec == null ? "0" : spec.toRuleText());
+            }
+        }
+        Config.INSTANCE.shippingUpgradeCosts.set(List.copyOf(costTexts));
+
+        List<String> nextSlots = new ArrayList<>();
+        List<? extends String> curSlots = Config.INSTANCE.shippingLevelSlots.get();
+        int lastSlots = 9;
+        for (int i = 0; i < targetLevels; i++) {
+            if (i < curSlots.size()) {
+                int parsed = parseInt(curSlots.get(i));
+                lastSlots = Math.max(1, Math.min(54, parsed <= 0 ? 9 : parsed));
+            } else {
+                lastSlots = Math.min(54, lastSlots + 9);
+            }
+            nextSlots.add(Integer.toString(lastSlots));
+        }
+        Config.INSTANCE.shippingLevelSlots.set(List.copyOf(nextSlots));
+
+        List<String> nextLimits = new ArrayList<>();
+        List<? extends String> curLimits = Config.INSTANCE.shippingDailyLimits.get();
+        long lastLimit = 0L;
+        for (int i = 0; i < targetLevels; i++) {
+            if (i < curLimits.size()) {
+                long parsed = parseNonNegativeLong(curLimits.get(i), 0L);
+                lastLimit = Math.max(0L, parsed);
+                nextLimits.add(Long.toString(lastLimit));
+            } else {
+                long extended = lastLimit <= 0L ? 0L : (lastLimit + Math.max(1000L, lastLimit / 2L));
+                lastLimit = extended;
+                nextLimits.add(Long.toString(extended));
+            }
+        }
+        Config.INSTANCE.shippingDailyLimits.set(List.copyOf(nextLimits));
+        Config.SPEC.save();
+    }
+
+    private static boolean isTruthyFlag(@Nullable String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String s = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        return "1".equals(s) || "true".equals(s) || "yes".equals(s) || "on".equals(s);
+    }
+
+    private static int parseOptionalLimitInt(@Nullable String raw) {
+        if (raw == null || raw.isBlank()) {
+            return 0;
+        }
+        try {
+            int parsed = Integer.parseInt(raw.trim());
+            return Math.max(0, parsed);
+        } catch (NumberFormatException ex) {
+            return 0;
+        }
+    }
+
+    private static long parseNonNegativeLong(@Nullable String raw, long fallback) {
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        try {
+            long parsed = Long.parseLong(raw.trim());
+            return Math.max(0L, parsed);
+        } catch (NumberFormatException ex) {
+            return fallback;
+        }
+    }
+
+    /** 管理员：配置货币兑换每日上限（单人每日基础星币上限、全服每日总额上限、双向取款开关），0 或负数 = 不限。 */
+    private static void adminExchangeLimits(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player)) {
+            return;
+        }
+        long personalCap = parseNonNegativeLong(tag.getString("exchange_personal_cap"), 0L);
+        long globalCap = parseNonNegativeLong(tag.getString("exchange_global_cap"), 0L);
+        boolean allowWithdraw = tag.contains("exchange_allow_withdraw")
+                ? isTruthyFlag(tag.getString("exchange_allow_withdraw"))
+                : Config.INSTANCE.exchangeAllowWithdraw.get();
+
+        Config.INSTANCE.playerDailyExchangeCap.set(personalCap);
+        Config.INSTANCE.globalDailyFxCap.set(globalCap);
+        Config.INSTANCE.exchangeAllowWithdraw.set(allowWithdraw);
+        Config.SPEC.save();
+
+        String pText = personalCap <= 0L ? "不限" : Long.toString(personalCap);
+        String gText = globalCap <= 0L ? "不限" : Long.toString(globalCap);
+        notifyPlayer(player, Component.translatableWithFallback(
+                "msg.module_shop.exchange_limits_saved",
+                "货币兑换上限已保存并同步（单人日上限：%s，全服日上限：%s，取款：%s）",
+                pText, gText, allowWithdraw ? "开启" : "关闭").withStyle(ChatFormatting.GREEN));
+        broadcastSnapshots(player.server);
+    }
+
+    /** 管理员：保存职业专精配置（最大等级、每级升级所需经验、每级加价限制及专注参数）并即时同步全服。 */
+    private static void adminProfessionConfigSave(ServerPlayer player, CompoundTag tag) {
+        if (!canEditAdmin(player)) {
+            return;
+        }
+        int maxLevel = Math.max(2, Math.min(500, tag.getInt("maxLevel")));
+        double starterBonus = Math.max(0.0D, Math.min(5.0D, tag.getDouble("starterBonus")));
+        double maxBonus = Math.max(starterBonus, Math.min(5.0D, tag.getDouble("maxBonus")));
+        int dailyFocus = Math.max(0, Math.min(1_000_000, tag.getInt("dailyFocus")));
+        int maxFocus = Math.max(100, Math.min(10_000_000, tag.getInt("maxFocus")));
+        double baseFocusCost = Math.max(0.5D, Math.min(10_000.0D, tag.getDouble("baseFocusCost")));
+        double scarcityBonusMax = Math.max(0.0D, Math.min(2.0D, tag.getDouble("scarcityBonusMax")));
+        long xpBase = Math.max(0L, tag.getLong("xpBase"));
+        long xpLinear = Math.max(0L, tag.getLong("xpLinear"));
+        double xpQuad = Math.max(0.0D, tag.getDouble("xpQuad"));
+
+        long[] xpArr = tag.getLongArray("levelXp");
+        int[] bonusBpsArr = tag.getIntArray("levelBonusBps");
+
+        cn.autoforged.module_shop.eco.profession.ProfessionConfig cfg =
+                cn.autoforged.module_shop.eco.profession.ProfessionConfig.get();
+        cfg.maxLevel = maxLevel;
+        cfg.starterPriceBonus = starterBonus;
+        cfg.maxPriceBonus = maxBonus;
+        cfg.xpBase = xpBase;
+        cfg.xpLinear = xpLinear;
+        cfg.xpQuad = xpQuad;
+
+        List<Long> nextXp = new ArrayList<>(Math.max(0, maxLevel - 1));
+        for (int i = 0; i < maxLevel - 1; i++) {
+            long val = (i < xpArr.length && xpArr[i] > 0L)
+                    ? xpArr[i]
+                    : cn.autoforged.module_shop.eco.profession.ProfessionConfig.formulaXp(i + 1, xpBase, xpLinear, xpQuad);
+            nextXp.add(Math.max(1L, val));
+        }
+        cfg.levelXpTable = nextXp;
+
+        List<Double> nextCaps = new ArrayList<>(maxLevel);
+        for (int i = 0; i < maxLevel; i++) {
+            double ratio;
+            if (i < bonusBpsArr.length && bonusBpsArr[i] >= 0) {
+                ratio = Math.min(5.0D, bonusBpsArr[i] / 10000.0D);
+            } else {
+                ratio = starterBonus + (maxBonus - starterBonus) * (i / (double) Math.max(1, maxLevel - 1));
+            }
+            nextCaps.add(ratio);
+        }
+        cfg.levelBonusCaps = nextCaps;
+        cfg.sanitizeProgression();
+
+        boolean savedJson = cn.autoforged.module_shop.eco.profession.ProfessionConfig.saveCurrent();
+        Config.INSTANCE.dailyFocusRestore.set(dailyFocus);
+        Config.INSTANCE.maxFocusCap.set(maxFocus);
+        Config.INSTANCE.baseFocusCostPerItem.set(baseFocusCost);
+        Config.INSTANCE.maxProfessionPriceBonus.set(maxBonus);
+        Config.INSTANCE.scarcityBonusMax.set(scarcityBonusMax);
+        Config.SPEC.save();
+
+        if (!savedJson) {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.profession_config_save_warn",
+                    "职业参数已热生效，但写入 professions.json 失败，请检查文件权限")
+                    .withStyle(ChatFormatting.YELLOW));
+        } else {
+            notifyPlayer(player, Component.translatableWithFallback(
+                    "msg.module_shop.profession_config_saved",
+                    "职业专精配置已保存并全服生效（最大 Lv.%s，满级加价 +%.1f%%）",
+                    maxLevel, maxBonus * 100.0D).withStyle(ChatFormatting.GREEN));
+        }
+        broadcastSnapshots(player.server);
+    }
+
+    private static @Nullable List<PriceSpec> parseAdminSpecListTag(ServerPlayer player, ListTag list) {
+        List<PriceSpec> out = new ArrayList<>();
+        if (list == null || list.isEmpty()) {
+            return out;
+        }
+        for (int i = 0; i < list.size(); i++) {
+            PriceSpec validated = validateAdminSpec(player, PriceSpec.fromTag(list.getCompound(i), 0L), true);
+            if (validated == null) {
+                return null;
+            }
+            out.add(validated);
+        }
+        return out;
+    }
+
+    private static @Nullable List<PriceSpec> parseAdminSpecTextList(ServerPlayer player, String rawText) {
+        List<PriceSpec> out = new ArrayList<>();
+        String clean = rawText == null ? "" : rawText.trim();
+        if (clean.isEmpty()) {
+            return out;
+        }
+        for (String piece : clean.split(",")) {
+            String token = piece.trim();
+            if (token.isEmpty()) {
+                continue;
+            }
+            PriceSpec parsed = "0".equals(token) ? PriceSpec.ZERO : PriceSpec.parseRuleText(token);
+            PriceSpec validated = validateAdminSpec(player, parsed, true);
+            if (validated == null) {
+                return null;
+            }
+            out.add(validated);
+        }
+        return out;
     }
 
     /** 玩家在界面一键切换「出货启用专注点精销」开关。 */

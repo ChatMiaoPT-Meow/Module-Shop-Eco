@@ -1,9 +1,19 @@
 package cn.autoforged.module_shop.client.screen;
 
+import cn.autoforged.module_shop.client.ClientHomeCurrencyState;
+import cn.autoforged.module_shop.client.ClientHomeCurrencyState.PhysTierView;
+import cn.autoforged.module_shop.client.ClientShopData;
+import cn.autoforged.module_shop.client.ui.render.SkiaFrame;
+import cn.autoforged.module_shop.client.ui.render.Text;
+import cn.autoforged.module_shop.client.ui.v2.PriceDisplay;
+import cn.autoforged.module_shop.client.ui.widget.PriceSpecEditor;
+import cn.autoforged.module_shop.data.PriceSpec;
+import cn.autoforged.module_shop.data.PriceSpec.CurrencyMode;
 import cn.autoforged.module_shop.network.payload.ServerboundShopActionPayload;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import javax.annotation.Nullable;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
@@ -143,12 +153,9 @@ public class DemandCreateScreen extends SkiaDialog {
         if (this.filter.isEmpty()) {
             return this.allItems;
         }
-        String needle = this.filter.toLowerCase(Locale.ROOT);
         List<ItemStack> out = new ArrayList<>();
         for (ItemStack stack : this.allItems) {
-            String name = stack.getHoverName().getString().toLowerCase(Locale.ROOT);
-            String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString().toLowerCase(Locale.ROOT);
-            if (name.contains(needle) || id.contains(needle)) {
+            if (cn.autoforged.module_shop.client.screen.shop.PageKit.matchesItemQuery(stack, this.filter)) {
                 out.add(stack);
             }
         }
@@ -289,6 +296,106 @@ public class DemandCreateScreen extends SkiaDialog {
         selectPick(this.picked.size() - 1, false);
     }
 
+    private boolean hasOffhandReward() {
+        return this.minecraft != null && this.minecraft.player != null
+                && !this.minecraft.player.getOffhandItem().isEmpty();
+    }
+
+    private static long feeOf(long rewardAmount) {
+        if (ClientShopData.demandFeePercent <= 0.0D || rewardAmount <= 0L) {
+            return 0L;
+        }
+        return (long) Math.ceil(rewardAmount * ClientShopData.demandFeePercent / 100.0D);
+    }
+
+    private static long safeAdd(long a, long b) {
+        if (a <= 0L) {
+            return Math.max(0L, b);
+        }
+        if (b <= 0L) {
+            return a;
+        }
+        return a > Long.MAX_VALUE - b ? Long.MAX_VALUE : a + b;
+    }
+
+    private static PriceSpec feeSpecOf(@Nullable PriceSpec rewardSpec) {
+        if (rewardSpec == null || !rewardSpec.isValid()) {
+            return PriceSpec.ZERO;
+        }
+        if (rewardSpec.mode == CurrencyMode.PHYS_ONLY) {
+            long fee = feeOf(rewardSpec.physCount);
+            return fee > 0L ? PriceSpec.phys(rewardSpec.physTierKey, fee) : PriceSpec.ZERO;
+        }
+        long fee = feeOf(rewardSpec.starPrice);
+        return fee > 0L ? PriceSpec.star(fee) : PriceSpec.ZERO;
+    }
+
+    private static PriceSpec escrowSpecOf(@Nullable PriceSpec rewardSpec) {
+        if (rewardSpec == null || !rewardSpec.isValid()) {
+            return PriceSpec.ZERO;
+        }
+        if (rewardSpec.mode == CurrencyMode.PHYS_ONLY) {
+            long fee = feeOf(rewardSpec.physCount);
+            return PriceSpec.phys(rewardSpec.physTierKey, safeAdd(rewardSpec.physCount, fee));
+        }
+        long fee = feeOf(rewardSpec.starPrice);
+        return PriceSpec.star(safeAdd(rewardSpec.starPrice, fee));
+    }
+
+    private PriceSpec previewRewardSpec() {
+        if (this.priceEditor != null) {
+            if (this.priceEditor.mode() == CurrencyMode.PHYS_ONLY) {
+                return PriceSpec.phys(this.priceEditor.selectedTierKey(),
+                        Math.max(0L, this.priceEditor.physCountOr(0L)));
+            }
+            return PriceSpec.star(Math.max(0L, this.priceEditor.starValueOr(0L)));
+        }
+        long m = 0L;
+        if (this.moneyBox != null) {
+            try {
+                m = Math.max(0L, Long.parseLong(this.moneyBox.getValue().trim()));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return PriceSpec.star(m);
+    }
+
+    @Nullable
+    private String rewardProblem() {
+        if (this.priceEditor == null) {
+            return null;
+        }
+        String editorErr = this.priceEditor.validateError();
+        if (editorErr != null) {
+            return editorErr;
+        }
+        PriceSpec spec = this.priceEditor.buildSpec();
+        if (spec == null) {
+            return ClientHomeCurrencyState.tr("gui.module_shop.demand.money_bad_spec", "请填写合法的悬赏金额");
+        }
+        if (spec.mode == CurrencyMode.STAR_ONLY && ClientShopData.demandMaxReward > 0L
+                && spec.starPrice > ClientShopData.demandMaxReward) {
+            return ClientHomeCurrencyState.tr("gui.module_shop.demand.over_max_reward",
+                    "超出单笔星币上限 %s", ClientShopData.money(ClientShopData.demandMaxReward));
+        }
+        if (!spec.isValid() && !hasOffhandReward()) {
+            return Component.translatable("msg.module_shop.demand_need_reward").getString();
+        }
+        PriceSpec escrow = escrowSpecOf(spec);
+        if (!escrow.isZero() && !PriceDisplay.canAfford(escrow, 1)) {
+            if (escrow.mode == CurrencyMode.PHYS_ONLY) {
+                PhysTierView tier = ClientHomeCurrencyState.findTier(escrow.physTierKey);
+                String have = PriceDisplay.physPlain(escrow.physTierKey, tier != null ? tier.ownedCount : 0);
+                return ClientHomeCurrencyState.tr("gui.module_shop.demand.no_phys",
+                        "实体币不足或无法找零（需 %s，持有 %s）", PriceDisplay.formatPlain(escrow), have);
+            }
+            return ClientHomeCurrencyState.tr("gui.module_shop.demand.no_star",
+                    "星币余额不足（需托管 %s，当前 %s）",
+                    ClientShopData.money(escrow.starPrice), ClientShopData.money(ClientShopData.balance));
+        }
+        return null;
+    }
+
     private void publish() {
         if (this.picked.isEmpty()) {
             this.status = Component.translatable("gui.module_shop.demand.pick_first").getString();
@@ -299,12 +406,31 @@ public class DemandCreateScreen extends SkiaDialog {
             this.status = countErr;
             return;
         }
-        long money;
-        try {
-            money = Math.max(0L, Long.parseLong(this.moneyBox.getValue().trim()));
-        } catch (NumberFormatException ex) {
-            this.status = Component.translatable("gui.module_shop.demand.money_bad").getString();
-            return;
+        PriceSpec rewardSpec;
+        if (skia() && this.priceEditor != null) {
+            String rewardErr = rewardProblem();
+            if (rewardErr != null) {
+                this.status = rewardErr;
+                return;
+            }
+            rewardSpec = this.priceEditor.buildSpec();
+            if (rewardSpec == null) {
+                this.status = ClientHomeCurrencyState.tr("gui.module_shop.demand.money_bad_spec", "请填写合法的悬赏金额");
+                return;
+            }
+        } else {
+            long money;
+            try {
+                money = Math.max(0L, Long.parseLong(this.moneyBox.getValue().trim()));
+            } catch (NumberFormatException ex) {
+                this.status = Component.translatable("gui.module_shop.demand.money_bad").getString();
+                return;
+            }
+            if (money <= 0L && !hasOffhandReward()) {
+                this.status = Component.translatable("msg.module_shop.demand_need_reward").getString();
+                return;
+            }
+            rewardSpec = PriceSpec.star(money);
         }
         if (this.minecraft == null || this.minecraft.level == null) {
             return;
@@ -319,7 +445,8 @@ public class DemandCreateScreen extends SkiaDialog {
             list.add(line);
         }
         tag.put("wants", list);
-        tag.putString("reward_money", Long.toString(money));
+        tag.put("rewardSpec", rewardSpec.toTag());
+        tag.putString("reward_money", Long.toString(rewardSpec.supportsStar() ? rewardSpec.starPrice : 0L));
         ServerboundShopActionPayload.send(tag);
         Nav.back();
     }
@@ -406,7 +533,7 @@ public class DemandCreateScreen extends SkiaDialog {
             Bricks.slot(g, rx, ry);
             g.renderItem(entry.stack, rx, ry);
             drawSmallLabel(g, rx + 20, ry + 5,
-                    Component.literal(this.font.plainSubstrByWidth(entry.stack.getHoverName().getString(), 74)),
+                    Component.literal(this.font.plainSubstrByWidth(cn.autoforged.module_shop.client.ui.ItemNames.display(entry.stack), 74)),
                     IOStyle.TEXT);
             drawSmallLabel(g, rx + 104, ry + 5, Component.literal("x" + entry.count), IOStyle.TEXT_2);
             IOStyle.button(g, rx + 120, ry + 2, 12, 12, Component.literal("-"), this.font, mouseX, mouseY,
@@ -475,14 +602,20 @@ public class DemandCreateScreen extends SkiaDialog {
             new cn.autoforged.module_shop.client.ui.widget.ScrollController();
     private cn.autoforged.module_shop.client.ui.widget.SkiaTextField skSearch;
     private cn.autoforged.module_shop.client.ui.widget.SkiaTextField skCount;
-    private cn.autoforged.module_shop.client.ui.widget.SkiaTextField skMoney;
+    private PriceSpecEditor priceEditor;
     private String skFilterKey;
     private List<ItemStack> skFiltered = List.of();
 
     @Override
     protected void initSkia() {
-        String keepMoney = this.moneyBox == null ? "0" : this.moneyBox.getValue();
-        this.skSearch = field(32, Component.translatable("gui.module_shop.demand.search_hint").getString());
+        boolean hadPrev = this.priceEditor != null;
+        CurrencyMode prevMode = hadPrev ? this.priceEditor.mode() : CurrencyMode.STAR_ONLY;
+        String prevTier = hadPrev ? this.priceEditor.selectedTierKey() : "";
+        String prevStar = hadPrev ? this.priceEditor.starField().value() : "0";
+        String prevPhys = hadPrev ? this.priceEditor.physField().value() : "";
+
+        this.skSearch = field(48, Component.translatable("gui.module_shop.search.placeholder").getString())
+                .clearable(true);
         this.searchBox = this.skSearch.editBox();
         this.searchBox.setValue(this.filter);
         this.skSearch.onChange(text -> {
@@ -494,10 +627,23 @@ public class DemandCreateScreen extends SkiaDialog {
         this.countBox.setFilter(t -> t.isEmpty() || t.matches("[0-9]{0,2}"));
         this.skCount.onChange(this::onCountInputChanged);
         syncCountField(false);
-        this.skMoney = field(12, "0");
-        this.moneyBox = this.skMoney.editBox();
-        this.moneyBox.setFilter(t -> t.isEmpty() || t.matches("[0-9]{0,12}"));
-        this.moneyBox.setValue(keepMoney);
+
+        this.priceEditor = new PriceSpecEditor(this, this.font, PriceSpecEditor.Scope.PLAYER)
+                .allowZero(true)
+                .starPlaceholder("0")
+                .items(this.items);
+        if (hadPrev) {
+            if (prevMode == CurrencyMode.PHYS_ONLY && prevTier != null && !prevTier.isEmpty()) {
+                this.priceEditor.setInitial(PriceSpec.phys(prevTier, 1L));
+            } else {
+                this.priceEditor.setInitial(PriceSpec.ZERO);
+            }
+            this.priceEditor.starField().setValue(prevStar);
+            this.priceEditor.physField().setValue(prevPhys);
+        } else {
+            this.priceEditor.setInitial(PriceSpec.ZERO);
+        }
+        this.priceEditor.registerInputs(this::addWidget);
         this.skSearch.focus();
     }
 
@@ -511,8 +657,8 @@ public class DemandCreateScreen extends SkiaDialog {
 
     @Override
     protected void paint(io.github.humbleui.skija.Canvas c) {
-        float w = 392.0F;
-        float h = 258.0F;
+        float w = Math.min(420.0F, this.width - 16.0F);
+        float h = Math.min(272.0F, this.height - 16.0F);
         float x = Math.round((this.width - w) / 2.0F);
         float y = Math.round((this.height - h) / 2.0F);
         float innerX = x + PAD;
@@ -520,6 +666,7 @@ public class DemandCreateScreen extends SkiaDialog {
         // 左：搜索 + 物品网格（左键添加/选中+1，右键直接拉满64并选中）
         float gridW = COLS * CELL + 8;
         float top = y + HEADER_H + 8;
+        float bottom = y + h - PAD;
         this.skSearch.bounds(innerX, top, gridW, 16);
         float gridY = top + 22;
         float gridH = 7 * CELL;
@@ -549,13 +696,52 @@ public class DemandCreateScreen extends SkiaDialog {
         endList(c);
         small(c, Component.translatable("gui.module_shop.mall.count", list.size()).getString(), innerX,
                 gridY + gridH + 8, gridW, IOStyle.TEXT_3);
-        // 右：已选清单 + 下方固定数量编辑区（参考摊位上架设计）
+
+        // 副手物品悬赏状态预览（与货币悬赏互补/可纯物品悬赏）
+        float offY = gridY + gridH + 16;
+        ItemStack offhand = this.minecraft != null && this.minecraft.player != null
+                ? this.minecraft.player.getOffhandItem()
+                : ItemStack.EMPTY;
+        if (!offhand.isEmpty()) {
+            item(offhand, innerX, offY);
+            small(c, ClientHomeCurrencyState.tr("gui.module_shop.demand.offhand_badge",
+                    "副手悬赏：%s ×%s", offhand.getHoverName().getString(), offhand.getCount()),
+                    innerX + 19, offY + 8, gridW - 19, IOStyle.BLUE);
+        } else {
+            small(c, Component.translatable("gui.module_shop.demand.offhand_hint").getString(),
+                    innerX, offY + 8, gridW, IOStyle.TEXT_3);
+        }
+
+        // 左下：校验提示 + 发布 / 取消按钮
+        float by = bottom - 20;
+        String countErr = countProblem();
+        String rewErr = rewardProblem();
+        String prob = countErr != null ? countErr : rewErr;
+        String tipText = !this.status.isEmpty() ? this.status : (prob != null ? prob : "");
+        if (!tipText.isEmpty()) {
+            boolean isErr = this.status.isEmpty() || prob != null
+                    || this.status.contains("失败") || this.status.contains("不足") || this.status.contains("错误");
+            paragraph(c, tipText, innerX, by - 20, gridW,
+                    cn.autoforged.module_shop.client.ui.render.Text.SMALL,
+                    isErr ? IOStyle.RED : IOStyle.TEXT_2, 2, false);
+        }
+        boolean canPublish = countErr == null && rewErr == null;
+        float bw = (gridW - 6.0F) / 2.0F;
+        button(c, "publish", Component.translatable("gui.module_shop.demand.publish").getString(), innerX, by, bw, 20,
+                cn.autoforged.module_shop.client.ui.widget.Button.Kind.ACCENT, canPublish, this::publish);
+        button(c, "cancel", Component.translatable("gui.module_shop.cancel").getString(), innerX + bw + 6.0F, by, bw,
+                20, cn.autoforged.module_shop.client.ui.widget.Button.Kind.NORMAL, true, Nav::back);
+
+        // 右：已选清单 + 数量编辑条 + 悬赏货币编辑器（双账本）
         float rx = innerX + gridW + 10;
         float rw = x + w - PAD - rx;
         text(c, Component.translatable("gui.module_shop.demand.picked", this.picked.size(), MAX_LINES).getString(),
                 rx, top + 8, rw, IOStyle.ORANGE);
         float listY = gridY - 2;
-        float listH = 104.0F;
+        float editH = 24.0F;
+        float editorH = this.priceEditor.preferredHeight();
+        float rewardCardH = editorH + 24.0F;
+        float listH = Math.max(48.0F, bottom - listY - 4.0F - editH - 5.0F - rewardCardH);
         card(c, rx, listY, rw, listH);
         if (this.picked.isEmpty()) {
             paragraph(c, Component.translatable("gui.module_shop.demand.pick_first").getString(), rx + 6,
@@ -581,8 +767,8 @@ public class DemandCreateScreen extends SkiaDialog {
                 item(entry.stack, rx + 5, ry + 2);
                 float bx = rx + rw - 6 - 17 * 3;
                 hit(rx + 3, ry + 1, bx - (rx + 3) - 2, rowH - 2, () -> selectPick(idx, true), null);
-                text(c, entry.stack.getHoverName().getString(), rx + 24, ry + 7, bx - rx - 28, IOStyle.TEXT);
-                small(c, "×" + entry.count, rx + 24, ry + 15, 44, selected ? IOStyle.BLUE : IOStyle.TEXT_2);
+                text(c, cn.autoforged.module_shop.client.ui.ItemNames.display(entry.stack), rx + 24, ry + 7, bx - rx - 27.5F, IOStyle.TEXT);
+                small(c, "×" + entry.count, rx + 24, ry + 15, 44.5F, selected ? IOStyle.BLUE : IOStyle.TEXT_2);
                 cn.autoforged.module_shop.client.ui.widget.Button.Kind n =
                         cn.autoforged.module_shop.client.ui.widget.Button.Kind.NORMAL;
                 button(c, "dec" + i, "-", bx, ry + 3, 16, 14, n, entry.count > 1, () -> {
@@ -599,9 +785,9 @@ public class DemandCreateScreen extends SkiaDialog {
             }
             endList(c);
         }
-        // 右侧固定「数量」编辑条（选中哪条就改哪条的数量，可直接打数字）
-        float editY = listY + listH + 6;
-        float editH = 26.0F;
+
+        // 右侧固定「数量」编辑条
+        float editY = listY + listH + 4.0F;
         card(c, rx, editY, rw, editH);
         Entry sel = selectedEntry();
         if (sel == null) {
@@ -609,33 +795,61 @@ public class DemandCreateScreen extends SkiaDialog {
             small(c, Component.translatable("gui.module_shop.stall.pick_item").getString(), rx + 8,
                     editY + editH / 2.0F, rw - 16, IOStyle.TEXT_3);
         } else {
-            item(sel.stack, rx + 5, editY + 5);
+            item(sel.stack, rx + 5, editY + 4);
             small(c, Component.translatable("gui.module_shop.stall.f_count").getString(), rx + 25,
                     editY + editH / 2.0F, 28, IOStyle.TEXT_2);
-            this.skCount.bounds(rx + 54, editY + 5, 70, 16).visible(true);
+            float setX = rx + rw - 60.0F;
+            float cntW = Math.max(44.0F, setX - (rx + 54.0F) - 4.0F);
+            this.skCount.bounds(rx + 54.0F, editY + 4.0F, cntW, 16.0F).visible(true);
             cn.autoforged.module_shop.client.ui.widget.Button.Kind n =
                     cn.autoforged.module_shop.client.ui.widget.Button.Kind.NORMAL;
-            button(c, "set1", "1", rx + 128, editY + 5, 24, 16, n, sel.count != 1,
+            button(c, "set1", "1", setX, editY + 4.0F, 24.0F, 16.0F, n, sel.count != 1,
                     () -> setSelectedCount(1, true));
-            button(c, "set64", "64", rx + 154, editY + 5, 28, 16, n, sel.count != 64,
+            button(c, "set64", "64", setX + 26.0F, editY + 4.0F, 28.0F, 16.0F, n, sel.count != 64,
                     () -> setSelectedCount(64, true));
         }
-        // 底部：提示 / 悬赏 / 发布 / 取消
-        float by = y + h - PAD - 20;
-        String countErr = countProblem();
-        String tipText = countErr != null ? countErr : this.status;
-        boolean err = !tipText.isEmpty();
-        small(c, err ? tipText : Component.translatable("gui.module_shop.demand.offhand_hint").getString(),
-                innerX, by - 8, w - PAD * 2, err ? IOStyle.RED : IOStyle.TEXT_3);
-        button(c, "publish", Component.translatable("gui.module_shop.demand.publish").getString(), innerX, by, 76, 20,
-                cn.autoforged.module_shop.client.ui.widget.Button.Kind.ACCENT, countErr == null, this::publish);
-        button(c, "cancel", Component.translatable("gui.module_shop.cancel").getString(), innerX + 82, by, 70, 20,
-                cn.autoforged.module_shop.client.ui.widget.Button.Kind.NORMAL, true, Nav::back);
-        String moneyLabel = Component.translatable("gui.module_shop.field.reward_money").getString();
-        float fieldW = 70;
-        float fx = x + w - PAD - fieldW;
-        right(c, moneyLabel, innerX, by + 10, fx - innerX - 6, IOStyle.TEXT_2);
-        this.skMoney.bounds(fx, by + 1, fieldW, 18);
+
+        // 右下：悬赏货币编辑器 + 同账本手续费与托管总额预览
+        float rewardY = editY + editH + 5.0F;
+        card(c, rx, rewardY, rw, rewardCardH);
+        this.priceEditor.bounds(rx + 6.0F, rewardY + 5.0F, rw - 12.0F);
+        this.priceEditor.render(c, this.items, this.mouseX, this.mouseY, this.dtMs);
+        Component editorTip = this.priceEditor.hoveredTooltip();
+        if (editorTip != null) {
+            tip(editorTip);
+        }
+        float footY = rewardY + 5.0F + editorH + 10.0F;
+        String edErr = this.priceEditor.validateError();
+        if (edErr != null) {
+            small(c, edErr, rx + 8.0F, footY, rw - 16.0F, IOStyle.RED);
+        } else {
+            PriceSpec preview = previewRewardSpec();
+            if (preview == null || preview.isZero()) {
+                small(c, ClientHomeCurrencyState.tr("gui.module_shop.demand.reward_zero_preview",
+                        "无货币悬赏 · 手续费 0"), rx + 8.0F, footY, rw - 16.0F, IOStyle.TEXT_3);
+            } else if (preview.supportsStar() && ClientShopData.demandMaxReward > 0
+                    && preview.starPrice > ClientShopData.demandMaxReward) {
+                small(c, ClientHomeCurrencyState.tr("gui.module_shop.demand.over_max_reward",
+                        "超出悬赏上限 %s", PriceDisplay.formatNumber(ClientShopData.demandMaxReward, false)),
+                        rx + 8.0F, footY, rw - 16.0F, IOStyle.RED);
+            } else {
+                PriceSpec feeSpec = feeSpecOf(preview);
+                PriceSpec escrowSpec = escrowSpecOf(preview);
+                boolean canPay = escrowSpec != null && PriceDisplay.canAfford(escrowSpec, 1);
+                if (feeSpec == null || feeSpec.isZero()) {
+                    small(c, ClientHomeCurrencyState.tr("gui.module_shop.demand.fee_zero_lbl", "费: 免费"),
+                            rx + 8.0F, footY, 76.0F, IOStyle.TEXT_2);
+                } else {
+                    PriceDisplay.drawCell(c, this.items, feeSpec, rx + 8.0F, footY, 86.0F,
+                            Text.Align.LEFT, IOStyle.TEXT_2, false,
+                            ClientHomeCurrencyState.tr("gui.module_shop.demand.fee_prefix", "费:"));
+                }
+                int escrowCol = canPay ? IOStyle.TEXT : IOStyle.RED;
+                PriceDisplay.drawCell(c, this.items, escrowSpec, rx + 96.0F, footY, rw - 104.0F,
+                        Text.Align.RIGHT, escrowCol, false,
+                        ClientHomeCurrencyState.tr("gui.module_shop.demand.escrow_prefix", "托管:"));
+            }
+        }
     }
 
     /** 0.8 倍小字（左对齐）。 */
@@ -648,6 +862,14 @@ public class DemandCreateScreen extends SkiaDialog {
     }
 
     // ---------------------------------------------------------------- 交互
+
+    @Override
+    protected boolean onScroll(double mx, double my, double amount) {
+        if (this.priceEditor != null && this.priceEditor.mouseScrolled(mx, my, amount)) {
+            return true;
+        }
+        return super.onScroll(mx, my, amount);
+    }
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
@@ -669,8 +891,48 @@ public class DemandCreateScreen extends SkiaDialog {
     }
 
     @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (skia() && this.priceEditor != null) {
+            float k = Math.max(0.01F, SkiaFrame.unitsToGui());
+            this.priceEditor.mouseReleased((float) (mouseX / k), (float) (mouseY / k), button);
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double dx, double dy) {
+        if (skia() && this.priceEditor != null) {
+            float k = Math.max(0.01F, SkiaFrame.unitsToGui());
+            if (this.priceEditor.mouseDragged(mouseX / k, mouseY / k, button, dx / k, dy / k)) {
+                return true;
+            }
+        }
+        return super.mouseDragged(mouseX, mouseY, button, dx, dy);
+    }
+
+    @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
         if (skia()) {
+            if (this.priceEditor != null) {
+                float k = Math.max(0.01F, SkiaFrame.unitsToGui());
+                float sx = (float) (mouseX / k);
+                float sy = (float) (mouseY / k);
+                if (this.priceEditor.mouseClicked(sx, sy, button)) {
+                    // 只让本界面的「搜索 / 数量」输入框失焦。**绝不能再 setFocused(null)**：
+                    // PriceSpecEditor 内的 SkiaTextField.focus() 刚把 Screen 焦点交给星币/实体币 EditBox，
+                    // 清空 Screen 焦点会连带 EditBox.setFocused(false)，键盘与字符事件再也送不进去——
+                    // 星币框永远停在默认的「0」，并行模式下只能靠默认「1」枚的实体币发布求购（v1.5.1 修复）。
+                    if (this.skSearch != null) {
+                        this.skSearch.blur();
+                    }
+                    if (this.skCount != null) {
+                        this.skCount.blur();
+                    }
+                    return true;
+                }
+
+                this.priceEditor.blur();
+            }
             return skiaClicked(mouseX, mouseY, button);
         }
         int x = left();

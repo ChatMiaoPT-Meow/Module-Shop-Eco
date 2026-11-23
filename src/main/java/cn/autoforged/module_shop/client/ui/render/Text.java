@@ -23,6 +23,7 @@ public final class Text {
     public static final float TITLE = 10.0F;
 
     private static final int MAX_LENGTH = 32768;
+    private static final float WIDTH_EPS = 0.05F;
 
     private Text() {
     }
@@ -31,7 +32,7 @@ public final class Text {
 
     /** 单行布局（超宽时省略号截断）。maxWidth ≤ 0 表示不限宽。 */
     public static TextLayout line(String text, FontId font, float size, int color, float maxWidth) {
-        Constraints.Axis width = maxWidth > 0 ? Constraints.Axis.atMost(maxWidth) : Constraints.Axis.undefined();
+        Constraints.Axis width = maxWidth > 0 ? Constraints.Axis.atMost(maxWidth + WIDTH_EPS) : Constraints.Axis.undefined();
         return AtomUi.text().layout(new TextRequest(sanitize(text), font, size, color, 1, maxWidth > 0),
                 new Constraints(width, Constraints.Axis.undefined()));
     }
@@ -93,8 +94,15 @@ public final class Text {
         int i = 0;
         while (i < raw.length() && out.length() < MAX_LENGTH - 2) {
             char c = raw.charAt(i);
-            if (c == '§') { // § 格式码：连同后一个字符一起跳过
-                i += 2;
+            if (c == '§') { // § 格式码：支持 §#RRGGBB 与完整 Unicode 码点跳过（避免截断代理对）
+                if (isHexColorAt(raw, i)) {
+                    i += 8;
+                } else {
+                    i++;
+                    if (i < raw.length()) {
+                        i += Character.charCount(raw.codePointAt(i));
+                    }
+                }
                 continue;
             }
             int cp = raw.codePointAt(i);
@@ -111,6 +119,12 @@ public final class Text {
             if (Character.isISOControl(cp)) {
                 continue;
             }
+            // 私有使用区（PUA）等「图标字符」：不少食物 / 营养模组会往物品名里塞自己字体的图标
+            // （饥饿值、饱食度之类）。我们的字体没有这些字形，画出来就是一串「□」，
+            // 所以在这里统一丢掉，只保留真正的文字。
+            if (isIconGlyph(cp)) {
+                continue;
+            }
             if (len == 1 && Character.isSurrogate(c)) { // 孤立代理项
                 out.append('?');
                 continue;
@@ -125,5 +139,37 @@ public final class Text {
             out.appendCodePoint(cp);
         }
         return out.toString();
+    }
+
+    /** 是否是「图标字符」（私有使用区 / 变体选择符 / 零宽字符）——这些在我们的字体里没有字形。 */
+    private static boolean isIconGlyph(int cp) {
+        if (cp >= 0xE000 && cp <= 0xF8FF) {
+            return true;
+        }
+        if (cp >= 0xF0000 && cp <= 0xFFFFD) {
+            return true;
+        }
+        if (cp >= 0x100000 && cp <= 0x10FFFD) {
+            return true;
+        }
+        if (cp >= 0xFE00 && cp <= 0xFE0F) {
+            return true;
+        }
+        return cp == 0x200B || cp == 0x200C || cp == 0x200D || cp == 0x200E || cp == 0x200F
+                || cp == 0x2060 || cp == 0xFEFF;
+    }
+
+    private static boolean isHexColorAt(String raw, int index) {
+        if (index + 7 >= raw.length() || raw.charAt(index + 1) != '#') {
+            return false;
+        }
+        for (int k = index + 2; k < index + 8; k++) {
+            char h = raw.charAt(k);
+            boolean hex = (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
+            if (!hex) {
+                return false;
+            }
+        }
+        return true;
     }
 }

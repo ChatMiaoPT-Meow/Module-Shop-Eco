@@ -43,7 +43,8 @@ public final class PlayerProfessionProfile {
         public static Progress load(CompoundTag t) {
             Progress p = new Progress();
             if (t != null) {
-                p.level = Math.max(1, Math.min(MAX_LEVEL, t.getInt("lv")));
+                int maxLv = Math.max(effectiveMaxLevel(), 500);
+                p.level = Math.max(1, Math.min(maxLv, t.getInt("lv")));
                 p.xp = Math.max(0L, t.getLong("xp"));
                 p.totalXp = Math.max(0L, t.getLong("totalXp"));
             }
@@ -51,8 +52,24 @@ public final class PlayerProfessionProfile {
         }
     }
 
-    /** 升到下一级所需经验：平滑递增曲线（Lv.1->2 需 60 XP，Lv.50->51 需 ~1,580 XP，Lv.99->100 需 ~5,150 XP）。 */
+    /** 当前生效的最大职业等级（未加载自定义配置时回退默认 {@link #MAX_LEVEL}）。 */
+    public static int effectiveMaxLevel() {
+        cn.autoforged.module_shop.eco.profession.ProfessionConfig cfg =
+                cn.autoforged.module_shop.eco.profession.ProfessionConfig.getIfLoaded();
+        return cfg != null ? cfg.resolvedMaxLevel() : MAX_LEVEL;
+    }
+
+    /** 升到下一级所需经验：优先按管理员配置的每级经验表，未配置则走平滑递增公式。 */
     public static long xpRequiredForNextLevel(int currentLevel) {
+        return xpRequiredForNextLevel(currentLevel,
+                cn.autoforged.module_shop.eco.profession.ProfessionConfig.getIfLoaded());
+    }
+
+    public static long xpRequiredForNextLevel(int currentLevel,
+                                              cn.autoforged.module_shop.eco.profession.ProfessionConfig cfg) {
+        if (cfg != null) {
+            return cfg.xpRequiredForNextLevel(currentLevel);
+        }
         if (currentLevel >= MAX_LEVEL) {
             return 0L;
         }
@@ -66,7 +83,8 @@ public final class PlayerProfessionProfile {
 
     public int getLevel(String professionId) {
         Progress p = professions.get(professionId);
-        return p == null ? 1 : Math.max(1, Math.min(MAX_LEVEL, p.level));
+        int maxLv = effectiveMaxLevel();
+        return p == null ? 1 : Math.max(1, Math.min(maxLv, p.level));
     }
 
     public long getXp(String professionId) {
@@ -76,25 +94,35 @@ public final class PlayerProfessionProfile {
 
     /** 增加职业经验并自动处理连升多级，返回升级后的等级。 */
     public int addXp(String professionId, long amount) {
+        return addXp(professionId, amount,
+                cn.autoforged.module_shop.eco.profession.ProfessionConfig.getIfLoaded());
+    }
+
+    public int addXp(String professionId, long amount,
+                     cn.autoforged.module_shop.eco.profession.ProfessionConfig cfg) {
+        int maxLv = cfg != null ? cfg.resolvedMaxLevel() : MAX_LEVEL;
         if (professionId == null || professionId.isBlank() || amount <= 0L) {
-            return getLevel(professionId);
+            Progress p = professions.get(professionId);
+            return p == null ? 1 : Math.max(1, Math.min(maxLv, p.level));
         }
         Progress p = getOrCreate(professionId);
         p.totalXp = Math.min(Long.MAX_VALUE - amount, p.totalXp) + amount;
-        if (p.level >= MAX_LEVEL) {
+        if (p.level >= maxLv) {
+            p.level = maxLv;
             p.xp = 0L;
-            return MAX_LEVEL;
+            return maxLv;
         }
         p.xp += amount;
-        while (p.level < MAX_LEVEL) {
-            long req = xpRequiredForNextLevel(p.level);
+        while (p.level < maxLv) {
+            long req = xpRequiredForNextLevel(p.level, cfg);
             if (req <= 0L || p.xp < req) {
                 break;
             }
             p.xp -= req;
             p.level++;
         }
-        if (p.level >= MAX_LEVEL) {
+        if (p.level >= maxLv) {
+            p.level = maxLv;
             p.xp = 0L;
         }
         return p.level;

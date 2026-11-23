@@ -24,6 +24,7 @@ import net.minecraft.world.item.ItemStack;
 public final class MallItem {
     public ItemStack stack = ItemStack.EMPTY;
     public long price;
+    public PriceSpec priceSpec = PriceSpec.ZERO;
     public Rarity rarity = Rarity.COMMON;
     /** 库存：-1 = 无限；0 = 售罄；>0 = 剩余数量。 */
     public int stock = -1;
@@ -38,7 +39,12 @@ public final class MallItem {
     /** 做市货架断货定时微补货百分比（默认 10%，即只补齐 10% 高价应急底仓，绝不凭空补满抢玩家市场）。 */
     public int floorRestockPercent = 10;
     /**
-     * 「个人库存」模式下**每个玩家已经买走的件数**（玩家 → 已买）。
+     * 每人永久限购（不随商城定时刷新 / 自动补货 / 切换库存模式重置）：
+     * 开启后，无论全服库存还是个人库存模式，每个玩家终身最多购买 {@link #permanentCap()} 件。
+     */
+    public boolean permanentLimit = false;
+    /**
+     * 「个人库存」或「每人永久限购」模式下**每个玩家已经买走的件数**（玩家 → 已买）。
      *
      * <p>个人库存时 {@link #stock} 表示「每个玩家各自的上限」，不再被购买直接扣减；
      * 某玩家还剩几件 = {@code stock - 已买}（见 {@link #remainingFor}）。
@@ -46,17 +52,66 @@ public final class MallItem {
      * 刷新 / 补货（{@link #clearPersonalUsed}）时整张表清空 = 每个人的库存都恢复。
      */
     public final java.util.Map<java.util.UUID, Integer> personalUsed = new java.util.LinkedHashMap<>();
+    /** 物品 NBT 编码缓存（不存档）：购物城上万件商品重复下发时避免每次重跑 ItemStack.CODEC。 */
+    private transient Tag cachedItemTag;
+    private transient ItemStack cachedItemRef;
+    private transient int cachedItemCount;
+    private transient HolderLookup.Provider cachedItemRegs;
+
+    private CompoundTag saveCachedStack(HolderLookup.Provider registries) {
+        CompoundTag tag = new CompoundTag();
+        if (stack == null || stack.isEmpty()) {
+            return tag;
+        }
+        Tag encoded = this.cachedItemTag;
+        if (encoded == null || this.cachedItemRef != stack
+                || this.cachedItemCount != stack.getCount()
+                || this.cachedItemRegs != registries) {
+            CompoundTag fresh = ShopNbt.saveStack(stack, registries);
+            encoded = fresh.get("item");
+            this.cachedItemTag = encoded;
+            this.cachedItemRef = stack;
+            this.cachedItemCount = stack.getCount();
+            this.cachedItemRegs = registries;
+        }
+        if (encoded != null) {
+            tag.put("item", encoded);
+        }
+        return tag;
+    }
 
     public MallItem() {
     }
 
     public MallItem(ItemStack stack, long price, Rarity rarity, int stock) {
+        this(stack, PriceSpec.star(price), rarity, stock);
+    }
+
+    public MallItem(ItemStack stack, PriceSpec spec, Rarity rarity, int stock) {
         this.stack = stack;
-        this.price = price;
-        this.basePrice = price;
+        setPriceSpec(spec);
+        this.basePrice = this.priceSpec.supportsStar() ? this.priceSpec.starPrice : 0L;
         this.rarity = rarity;
         this.supplyMode = stock < 0 ? SupplyMode.SYSTEM_SINK : SupplyMode.PLAYER_POOL;
         setStock(stock);
+    }
+
+    public void setPriceSpec(PriceSpec spec) {
+        this.priceSpec = spec == null ? PriceSpec.ZERO : spec;
+        this.price = this.priceSpec.supportsStar() ? this.priceSpec.starPrice : 0L;
+        if (!this.priceSpec.supportsStar()) {
+            this.basePrice = 0L;
+        }
+    }
+
+    public PriceSpec resolvePriceSpec() {
+        if (priceSpec == null) {
+            return PriceSpec.star(price);
+        }
+        if (priceSpec.mode == PriceSpec.CurrencyMode.STAR_ONLY && priceSpec.starPrice != price) {
+            return PriceSpec.star(price);
+        }
+        return priceSpec;
     }
 
     /** 设置库存（同时把「补货目标」记成同一个数：管理员填多少，定时补货就补回多少）。 */
@@ -98,22 +153,48 @@ public final class MallItem {
         this.personalUsed.merge(playerId, count, Integer::sum);
     }
 
-    /** 清空所有玩家的已买记录（刷新 / 补货时调用 = 每个人的库存都补回原量）。 */
+    /** 「每人永久限购」模式的终身限购上限（至少为 1）。 */
+    public int permanentCap() {
+        if (stockMax > 0) {
+            return stockMax;
+        }
+        return stock > 0 ? stock : 1;
+    }
+
+    /** 「每人永久限购」模式下某玩家累计已购买次数。 */
+    public int permanentUsedFor(java.util.UUID playerId) {
+        if (playerId == null) {
+            return 0;
+        }
+        return Math.max(0, this.personalUsed.getOrDefault(playerId, 0));
+    }
+
+    /** 「每人永久限购」模式下某玩家终身剩余可购次数。 */
+    public int permanentRemainingFor(java.util.UUID playerId) {
+        return Math.max(0, permanentCap() - permanentUsedFor(playerId));
+    }
+
+    /** 清空所有玩家的已买记录（刷新 / 补货时调用 = 每个人的库存都补回原量；永久限购商品绝不清空）。 */
     public void clearPersonalUsed() {
+        if (this.permanentLimit) {
+            return;
+        }
         this.personalUsed.clear();
     }
 
     public CompoundTag save(HolderLookup.Provider registries) {
         CompoundTag tag = ShopNbt.saveStack(stack, registries);
-        tag.putLong("price", price);
-        tag.putLong("basePrice", basePrice > 0L ? basePrice : price);
+        PriceSpec spec = resolvePriceSpec();
+        spec.writeToParent(tag, "priceSpec", "price");
+        tag.putLong("basePrice", spec.supportsStar() ? (basePrice > 0L ? basePrice : spec.starPrice) : 0L);
         tag.putString("supplyMode", supplyMode.id());
         tag.putInt("floorRestockPct", floorRestockPercent);
+        tag.putBoolean("permanentLimit", permanentLimit);
         tag.putString("rarity", rarity.id());
         tag.putInt("stock", stock);
         tag.putInt("stockMax", stockMax);
         tag.putInt("sort", sort);
-        // 个人库存：每个玩家买了多少（空表不写，全服库存模式下这一段永远是空的）
+        // 个人库存 / 每人永久限购：每个玩家买了多少
         if (!personalUsed.isEmpty()) {
             ListTag usedList = new ListTag();
             for (java.util.Map.Entry<java.util.UUID, Integer> entry : personalUsed.entrySet()) {
@@ -136,24 +217,48 @@ public final class MallItem {
      * 下发给**某个玩家**的货架数据：与 {@link #save} 相同，但
      * <ul>
      *     <li>永远不带 {@code personalUsed}（别人买走了多少既没必要下发，也能省流量）；</li>
-     *     <li>「个人库存」模式时把 {@code stock} 换成**该玩家自己的剩余量**。</li>
+     *     <li>「个人库存」或「每人永久限购」时把 {@code stock} 换成**该玩家自己的剩余量**。</li>
      * </ul>
-     * 客户端只认 {@code stock} 字段，所以界面代码不需要区分两种模式。
      */
     public CompoundTag saveForView(HolderLookup.Provider registries, java.util.UUID viewer, boolean personal) {
-        // 直接按字段拼，不走 save()：save() 会把 personalUsed（每个买过的玩家一条）整表序列化，
-        // 这里又马上删掉 —— 货架上千件、买家上百人时，每次下发快照都要白白构造几十万个 NBT 节点。
-        CompoundTag tag = ShopNbt.saveStack(stack, registries);
-        long shownPrice = (!personal && supplyMode == SupplyMode.PLAYER_POOL && !unlimited())
-                ? cn.autoforged.module_shop.eco.EcoPricing.computeMallAskAtStock(this, Math.max(0, stock))
-                : price;
-        tag.putLong("price", shownPrice);
-        tag.putLong("basePrice", basePrice > 0L ? basePrice : price);
+        // 直接按字段拼并复用物品 NBT 缓存：货架上万件时免去重复 ItemStack.CODEC 与 personalUsed 序列化。
+        CompoundTag tag = saveCachedStack(registries);
+        PriceSpec baseSpec = resolvePriceSpec();
+        boolean perPlayer = personal || this.permanentLimit;
+        long shownStar;
+        if (!baseSpec.supportsStar()) {
+            shownStar = 0L;
+        } else if (!perPlayer && supplyMode == SupplyMode.PLAYER_POOL && !unlimited()) {
+            shownStar = cn.autoforged.module_shop.eco.EcoPricing.computeMallAskAtStock(this, Math.max(0, stock));
+        } else {
+            shownStar = baseSpec.starPrice;
+        }
+        PriceSpec shownSpec = baseSpec.withStarPrice(shownStar);
+        shownSpec.writeToParent(tag, "priceSpec", "price");
+        if (baseSpec.supportsStar() && shownStar != baseSpec.starPrice) {
+            tag.putLong("adminStarPrice", baseSpec.starPrice);
+        }
+        tag.putLong("basePrice", baseSpec.supportsStar() ? (basePrice > 0L ? basePrice : baseSpec.starPrice) : 0L);
         tag.putString("supplyMode", supplyMode.id());
         tag.putInt("floorRestockPct", floorRestockPercent);
+        tag.putBoolean("permanentLimit", permanentLimit);
         tag.putString("rarity", rarity.id());
-        tag.putInt("stock", personal ? remainingFor(viewer) : stock);
-        tag.putInt("stockMax", stockMax);
+        if (this.permanentLimit) {
+            int cap = permanentCap();
+            int used = permanentUsedFor(viewer);
+            tag.putInt("stock", Math.max(0, cap - used));
+            tag.putInt("globalStock", cap);
+            tag.putInt("stockMax", cap);
+            tag.putInt("permanentLimitMax", cap);
+            tag.putInt("permanentLimitUsed", Math.min(cap, used));
+        } else {
+            int viewStock = personal ? remainingFor(viewer) : stock;
+            tag.putInt("stock", viewStock);
+            if (personal && viewStock != stock) {
+                tag.putInt("globalStock", stock);
+            }
+            tag.putInt("stockMax", stockMax);
+        }
         tag.putInt("sort", sort);
         return tag;
     }
@@ -161,14 +266,21 @@ public final class MallItem {
     public static MallItem load(CompoundTag tag, HolderLookup.Provider registries) {
         MallItem item = new MallItem();
         item.stack = ShopNbt.loadStack(tag, registries);
-        item.price = tag.getLong("price");
-        item.basePrice = tag.contains("basePrice") ? tag.getLong("basePrice") : item.price;
+        item.setPriceSpec(PriceSpec.readFromParent(tag, "priceSpec", "price"));
+        item.basePrice = item.priceSpec.supportsStar()
+                ? (tag.contains("basePrice") ? tag.getLong("basePrice") : item.price)
+                : 0L;
         item.rarity = Rarity.byId(tag.getString("rarity"));
         // 老存档没有 stock 字段时按"无限"处理（读成 0 会变成整店售罄）。
         item.stock = tag.contains("stock") ? tag.getInt("stock") : -1;
         // 老存档没有 stockMax：把当前库存当成补货目标（第一次补货时补回这个数）。
         item.stockMax = tag.contains("stockMax") ? tag.getInt("stockMax") : item.stock;
-        SupplyMode fallbackMode = item.stock < 0 ? SupplyMode.SYSTEM_SINK : SupplyMode.PLAYER_POOL;
+        item.permanentLimit = tag.getBoolean("permanentLimit");
+        if (item.permanentLimit && item.stock <= 0 && item.stockMax <= 0) {
+            item.setStock(1);
+        }
+        SupplyMode fallbackMode = item.permanentLimit ? SupplyMode.STATIC
+                : (item.stock < 0 ? SupplyMode.SYSTEM_SINK : SupplyMode.PLAYER_POOL);
         item.supplyMode = SupplyMode.byId(tag.getString("supplyMode"), fallbackMode);
         item.floorRestockPercent = tag.contains("floorRestockPct")
                 ? Math.max(0, Math.min(100, tag.getInt("floorRestockPct"))) : 10;
