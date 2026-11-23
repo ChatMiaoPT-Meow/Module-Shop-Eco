@@ -402,4 +402,209 @@ class PhysicalCurrencyEngineTest {
         assertEquals(PriceSpec.both(200L, "gold_coin", 1L), r2.resolvePriceSpec());
         assertEquals(0, r2.dailyMax());
     }
+
+    @Test
+    @DisplayName("API 1.5.0 版本探测、附属默认实体币配置规范化与最大可付枚数二分求解")
+    void apiVersionAddonDefaultTierAndMaxPayable(@TempDir Path configDir) {
+        // 1. ApiVersion 1.5.0 非内联运行期探测
+        assertEquals("1.5.0", cn.autoforged.module_shop.api.ApiVersion.API_VERSION);
+        assertEquals(1, cn.autoforged.module_shop.api.ApiVersion.API_MAJOR);
+        assertEquals(5, cn.autoforged.module_shop.api.ApiVersion.API_MINOR);
+        assertEquals(1, cn.autoforged.module_shop.api.ApiVersion.runtimeMajor());
+        assertEquals(5, cn.autoforged.module_shop.api.ApiVersion.runtimeMinor());
+        assertTrue(cn.autoforged.module_shop.api.ApiVersion.atLeast(1, 0));
+        assertTrue(cn.autoforged.module_shop.api.ApiVersion.atLeast(1, 4));
+        assertTrue(cn.autoforged.module_shop.api.ApiVersion.atLeast(1, 5));
+        assertFalse(cn.autoforged.module_shop.api.ApiVersion.atLeast(1, 6));
+        assertFalse(cn.autoforged.module_shop.api.ApiVersion.atLeast(2, 0));
+
+        // 2. PhysicalCurrencyConfig.addonDefaultTierKey 规范化与开关生效判断
+        PhysicalCurrencyConfig cfg = PhysicalCurrencyConfig.createDefault();
+        cfg.enabled = false;
+        cfg.addonDefaultTierKey = "minecraft:gold_ingot|";
+        cfg.normalize();
+        assertEquals("minecraft:gold_ingot", cfg.addonDefaultTierKey);
+        assertNull(cfg.activeAddonDefaultTier(), "未开启实体货币时不应生效附属默认档位");
+
+        cfg.enabled = true;
+        assertNotNull(cfg.activeAddonDefaultTier());
+        assertEquals("minecraft:gold_ingot", cfg.activeAddonDefaultTier().tierKey());
+
+        cfg.addonDefaultTierKey = "minecraft:nonexistent_coin";
+        cfg.normalize();
+        assertEquals("", cfg.addonDefaultTierKey, "找不到对应档位时应自动清空回退虚拟主货币");
+        assertNull(cfg.activeAddonDefaultTier());
+
+        // 持久化往返保留 addonDefaultTierKey
+        cfg.addonDefaultTierKey = "minecraft:iron_ingot";
+        assertTrue(PhysicalCurrencyConfig.replaceAndSave(configDir, cfg));
+        PhysicalCurrencyConfig.reload(configDir);
+        assertEquals("minecraft:iron_ingot", PhysicalCurrencyConfig.get().addonDefaultTierKey);
+
+        // 3. maxPayableTierCount 精确求解（含高档破整找零与非整倍边界）
+        // 持有 2 个金币(100) + 3 个铁币(10) + 15 个泥土币(1) = 总面值 245
+        int[] ownedStd = {15, 3, 2, 0, 0};
+        assertEquals(245L, PhysicalCurrencyEngine.maxPayableTierCount(0, STD_VALUES, ownedStd));
+        assertEquals(24L, PhysicalCurrencyEngine.maxPayableTierCount(1, STD_VALUES, ownedStd));
+        assertEquals(2L, PhysicalCurrencyEngine.maxPayableTierCount(2, STD_VALUES, ownedStd));
+        assertEquals(0L, PhysicalCurrencyEngine.maxPayableTierCount(3, STD_VALUES, ownedStd));
+        assertTrue(PhysicalCurrencyEngine.planPhysicalTierPay(1, 24L, STD_VALUES, ownedStd).ok());
+        assertFalse(PhysicalCurrencyEngine.planPhysicalTierPay(1, 25L, STD_VALUES, ownedStd).ok());
+
+        // 仅持有 1 个下界合金币(5000)，查钻石币(1000) 可付 5 枚、金币(100) 可付 50 枚
+        int[] oneNetherite = {0, 0, 0, 0, 1};
+        assertEquals(5L, PhysicalCurrencyEngine.maxPayableTierCount(3, STD_VALUES, oneNetherite));
+        assertEquals(50L, PhysicalCurrencyEngine.maxPayableTierCount(2, STD_VALUES, oneNetherite));
+        assertEquals(500L, PhysicalCurrencyEngine.maxPayableTierCount(1, STD_VALUES, oneNetherite));
+
+        // 找零件数上限约束（maxChangeItems=10）
+        long maxWithCap = PhysicalCurrencyEngine.maxPayableTierCount(1, STD_VALUES, oneNetherite, 10);
+        assertTrue(maxWithCap > 0L && maxWithCap <= 500L);
+        assertTrue(PhysicalCurrencyEngine.planPhysicalTierPay(1, maxWithCap, STD_VALUES, oneNetherite, 10).ok());
+    }
+
+    @Test
+    @DisplayName("11. PhysicalCurrencyConfig 读取 UTF-8 BOM 与 Windows 记事本 GB18030 编码容错")
+    void configReloadSupportsUtf8BomAndGb18030(@TempDir Path configDir) throws Exception {
+        Path file = PhysicalCurrencyConfig.resolveFile(configDir);
+        Files.createDirectories(file.getParent());
+
+        // UTF-8 BOM (EF BB BF)
+        String bomJson = """
+                {
+                  "enabled": true,
+                  "tiers": [
+                    { "itemId": "minecraft:gold_ingot", "stepRatio": 1, "value": 100, "label": "金币" }
+                  ]
+                }
+                """;
+        byte[] bomBody = bomJson.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] withBom = new byte[3 + bomBody.length];
+        withBom[0] = (byte) 0xEF;
+        withBom[1] = (byte) 0xBB;
+        withBom[2] = (byte) 0xBF;
+        System.arraycopy(bomBody, 0, withBom, 3, bomBody.length);
+        Files.write(file, withBom);
+
+        PhysicalCurrencyConfig.reload(configDir);
+        PhysicalCurrencyConfig bomCfg = PhysicalCurrencyConfig.get();
+        assertTrue(bomCfg.isActive());
+        assertEquals(1, bomCfg.tiers.size());
+        assertEquals("金币", bomCfg.tiers.get(0).label);
+
+        // Windows 记事本 ANSI/GB18030（含中文，非合法 UTF-8 字节序列）
+        String gbJson = """
+                {
+                  "enabled": true,
+                  "tiers": [
+                    { "itemId": "minecraft:iron_ingot", "stepRatio": 1, "value": 10, "label": "银币" }
+                  ]
+                }
+                """;
+        Files.write(file, gbJson.getBytes(java.nio.charset.Charset.forName("GB18030")));
+
+        PhysicalCurrencyConfig.reload(configDir);
+        PhysicalCurrencyConfig gbCfg = PhysicalCurrencyConfig.get();
+        assertTrue(gbCfg.isActive());
+        assertEquals(1, gbCfg.tiers.size());
+        assertEquals("银币", gbCfg.tiers.get(0).label);
+
+        // UTF-16LE BOM (FF FE)
+        String utf16LeJson = """
+                {
+                  "enabled": true,
+                  "tiers": [
+                    { "itemId": "minecraft:diamond", "stepRatio": 1, "value": 1000, "label": "钻石币" }
+                  ]
+                }
+                """;
+        byte[] leBody = utf16LeJson.getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+        byte[] withLeBom = new byte[2 + leBody.length];
+        withLeBom[0] = (byte) 0xFF;
+        withLeBom[1] = (byte) 0xFE;
+        System.arraycopy(leBody, 0, withLeBom, 2, leBody.length);
+        Files.write(file, withLeBom);
+
+        PhysicalCurrencyConfig.reload(configDir);
+        PhysicalCurrencyConfig leCfg = PhysicalCurrencyConfig.get();
+        assertTrue(leCfg.isActive());
+        assertEquals(1, leCfg.tiers.size());
+        assertEquals("钻石币", leCfg.tiers.get(0).label);
+
+        // UTF-16BE BOM (FE FF)
+        String utf16BeJson = """
+                {
+                  "enabled": true,
+                  "tiers": [
+                    { "itemId": "minecraft:netherite_ingot", "stepRatio": 1, "value": 5000, "label": "合金币" }
+                  ]
+                }
+                """;
+        byte[] beBody = utf16BeJson.getBytes(java.nio.charset.StandardCharsets.UTF_16BE);
+        byte[] withBeBom = new byte[2 + beBody.length];
+        withBeBom[0] = (byte) 0xFE;
+        withBeBom[1] = (byte) 0xFF;
+        System.arraycopy(beBody, 0, withBeBom, 2, beBody.length);
+        Files.write(file, withBeBom);
+
+        PhysicalCurrencyConfig.reload(configDir);
+        PhysicalCurrencyConfig beCfg = PhysicalCurrencyConfig.get();
+        assertTrue(beCfg.isActive());
+        assertEquals(1, beCfg.tiers.size());
+        assertEquals("合金币", beCfg.tiers.get(0).label);
+
+        // 损坏的二进制字节序列（非合法 UTF-8 且非合法 GB18030）必须拒绝解码，禁止静默产出乱码
+        byte[] corrupt = new byte[]{(byte) 0xFF, (byte) 0x80, (byte) 0xFE, (byte) 0xFF};
+        assertThrows(IllegalArgumentException.class, () -> PhysicalCurrencyConfig.decodeConfigText(corrupt));
+    }
+
+    @Test
+    @DisplayName("12. resolveCurrency 严格保真币种：停用或删档后严禁偷换成第 0 档或虚拟星币")
+    void resolveCurrencyNeverSwitchesCurrencyUnit(@TempDir Path configDir) {
+        PhysicalCurrencyConfig cfg = PhysicalCurrencyConfig.createDefault();
+        cfg.enabled = true;
+        PhysicalCurrencyConfig.replaceAndSave(configDir, cfg);
+
+        var econ = new cn.autoforged.module_shop.api.internal.ApiImpl.Economy();
+
+        // 空/null/"star" 严格解析为虚拟主货币
+        for (String starKey : new String[]{null, "", "   ", "star", "STAR"}) {
+            var u = econ.resolveCurrencyMeta(starKey);
+            assertFalse(u.physical(), "starKey=" + starKey + " 必须解析为虚拟主货币");
+            assertEquals("", u.tierKey());
+            assertEquals("星币", u.displayName());
+        }
+
+        // 启用时命中已有档位
+        var goldActive = econ.resolveCurrencyMeta("minecraft:gold_ingot");
+        assertTrue(goldActive.physical());
+        assertEquals("minecraft:gold_ingot", goldActive.tierKey());
+        assertEquals("金币", goldActive.displayName());
+        assertEquals(100L, goldActive.unitValue());
+
+        // 实体币停用后仍保留原实体币档位，严禁退回虚拟星币
+        cfg.enabled = false;
+        PhysicalCurrencyConfig.replaceAndSave(configDir, cfg);
+        var goldDisabled = econ.resolveCurrencyMeta("minecraft:gold_ingot");
+        assertTrue(goldDisabled.physical());
+        assertEquals("minecraft:gold_ingot", goldDisabled.tierKey());
+        assertEquals("金币", goldDisabled.displayName());
+        assertEquals(100L, goldDisabled.unitValue());
+
+        // 档位被服主删除后原样保留 tierKey，严禁回退第 0 档或虚拟星币
+        var deletedTier = econ.resolveCurrencyMeta("mod:deleted_gold");
+        assertTrue(deletedTier.physical());
+        assertEquals("mod:deleted_gold", deletedTier.tierKey());
+        assertEquals("mod:deleted_gold", deletedTier.displayName());
+        assertEquals(1L, deletedTier.unitValue());
+
+        // 全部档位清空后同样原样保留 tierKey
+        cfg.tiers.clear();
+        PhysicalCurrencyConfig.replaceAndSave(configDir, cfg);
+        var emptyCfgTier = econ.resolveCurrencyMeta("minecraft:diamond");
+        assertTrue(emptyCfgTier.physical());
+        assertEquals("minecraft:diamond", emptyCfgTier.tierKey());
+        assertEquals("minecraft:diamond", emptyCfgTier.displayName());
+        assertEquals(1L, emptyCfgTier.unitValue());
+    }
 }

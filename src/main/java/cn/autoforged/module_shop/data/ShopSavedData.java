@@ -319,6 +319,9 @@ public final class ShopSavedData extends SavedData {
     public long mallRefreshLastReal;
     /** 购物城「库存周期刷新」上次刷新时刻：游戏刻（0 = 还没记录基准）。 */
     public long mallRefreshLastGame;
+    /** 活动日离线补发当日运行期缓存（不存档，避免跨档污染）。 */
+    public transient long lastOfflineGrantDay = Long.MIN_VALUE;
+    public transient int lastOfflineGrantSig;
     // 同 IP 多账号登录限制已按需求移除（不再记录 IP 绑定）。
     /** 商店侧栏自定义布局（管理员拖动后保存，热同步给所有玩家）。 */
     public final SidebarLayout sidebarLayout = new SidebarLayout();
@@ -600,8 +603,8 @@ public final class ShopSavedData extends SavedData {
         }
         // 老存档没有这两个标签时按「开启 + 用配置默认金额」处理。
         if (tag.contains("shopSlotCount")) {
-            data.shopSlotCount = Math.max(1, Math.min(64, tag.getInt("shopSlotCount")));
-            data.buybackSlotCount = Math.max(1, Math.min(64, tag.getInt("buybackSlotCount")));
+            data.shopSlotCount = Math.max(0, Math.min(64, tag.getInt("shopSlotCount")));
+            data.buybackSlotCount = Math.max(0, Math.min(64, tag.getInt("buybackSlotCount")));
             copyInts(tag.getIntArray("shopWeights"), data.shopWeights);
             copyInts(tag.getIntArray("shopGuarantee"), data.shopGuarantee);
             copyInts(tag.getIntArray("buybackWeights"), data.buybackWeights);

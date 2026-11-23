@@ -38,6 +38,15 @@ public final class ShopNbt {
         beginBatch();
     }
 
+    /** 若当前尚未处于批量编码上下文则开启并返回 true；嵌套调用直接复用现有缓存返回 false。 */
+    public static boolean beginBatchIfAbsent(@Nullable HolderLookup.Provider registries) {
+        if (batchCache != null) {
+            return false;
+        }
+        beginBatch(registries);
+        return true;
+    }
+
     public static void endBatch() {
         batchCache = null;
     }

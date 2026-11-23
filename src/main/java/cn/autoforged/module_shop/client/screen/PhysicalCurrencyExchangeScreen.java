@@ -147,16 +147,16 @@ public class PhysicalCurrencyExchangeScreen extends SkiaDialog {
     private void paintOverview(Canvas canvas, float x, float y, float w, float h, List<PhysTierView> tiers) {
         float leftW = Math.min(168.0F, w * 0.44F);
         float lx = x + 9.0F;
-        small(canvas, tr("gui.module_shop.phys_ex.bag_total", "背包实体总值 · %s",
-                        ClientHomeCurrencyState.modeLabel(ClientHomeCurrencyState.physMode)),
+        small(canvas, tr("gui.module_shop.phys_ex.bag_total_dual", "背包实体总面值 · 双独立账本"),
                 lx, y + 10.0F, leftW - 10.0F, IOStyle.TEXT_3);
-        String valStr = ClientShopData.money(ClientHomeCurrencyState.physPlayerValue);
+        String valStr = ClientHomeCurrencyState.formatPhysUnits(ClientHomeCurrencyState.physPlayerValue);
         if (ClientHomeCurrencyState.physDailyConvertLimit > 0L) {
             long rem = Math.max(0L, ClientHomeCurrencyState.physDailyConvertLimit - ClientHomeCurrencyState.physConvertToday);
             Text.drawLine(canvas, valStr, AtomUi.BOLD, Text.BODY, IOStyle.GREEN,
                     lx, y + 20.0F, leftW - 10.0F, Text.Align.LEFT);
             small(canvas, tr("gui.module_shop.phys_ex.daily_remain", "今日兑换剩余：%s / %s",
-                            ClientShopData.money(rem), ClientShopData.money(ClientHomeCurrencyState.physDailyConvertLimit)),
+                            ClientHomeCurrencyState.formatPhysUnits(rem),
+                            ClientHomeCurrencyState.formatPhysUnits(ClientHomeCurrencyState.physDailyConvertLimit)),
                     lx, y + 30.0F, leftW - 10.0F, rem <= 0L ? IOStyle.RED : IOStyle.ORANGE);
         } else {
             Text.drawLine(canvas, valStr, AtomUi.BOLD, Text.TITLE, IOStyle.GREEN,
@@ -197,7 +197,8 @@ public class PhysicalCurrencyExchangeScreen extends SkiaDialog {
                     tx, py + 18.0F, tw, Text.Align.LEFT);
             if (over(px, py, pillW, pillH)) {
                 tip(Component.literal(tv.displayName() + " · "
-                        + tr("gui.module_shop.phys_ex.unit_val", "单枚面值 %s", ClientShopData.money(tv.value))
+                        + tr("gui.module_shop.phys_ex.unit_val", "单枚面值 %s",
+                                ClientHomeCurrencyState.formatPhysUnits(tv.value))
                         + " · " + tr("gui.module_shop.phys_ex.owned_tip", "持有 %s", tv.ownedCount)));
             }
         }

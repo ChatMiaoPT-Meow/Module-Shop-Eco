@@ -113,7 +113,13 @@ public final class MailEntry {
             }
         }
         if (!rest.isEmpty()) {
-            stacks.add(rest.copy());
+            int maxStack = Math.max(1, rest.getMaxStackSize());
+            int remain = rest.getCount();
+            while (remain > 0) {
+                int take = Math.min(remain, maxStack);
+                stacks.add(rest.copyWithCount(take));
+                remain -= take;
+            }
         }
         syncLegacyStack();
     }
@@ -149,11 +155,12 @@ public final class MailEntry {
         this.sender = sender == null ? "" : sender;
     }
 
-    /** 构造一封物品类邮件（stack 需为调用方已 copy 的完整物品）。 */
+    /** 构造一封物品类邮件（stack 需为调用方已 copy 的完整物品；超出单叠上限时自动拆叠）。 */
     public static MailEntry item(ItemStack stack, String source, String sender, UUID senderUUID, long receivedDay) {
-        MailEntry entry = new MailEntry(stack, source, sender == null ? "" : sender, receivedDay);
+        MailEntry entry = new MailEntry(ItemStack.EMPTY, source, sender == null ? "" : sender, receivedDay);
         entry.type = MailType.ITEM;
         entry.senderUUID = senderUUID;
+        entry.addStack(stack);
         return entry;
     }
 

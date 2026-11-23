@@ -809,74 +809,12 @@ public final class ClearingHouse {
         if (data.buybackPool.isEmpty()) {
             return;
         }
-        long gameDay = player.server.overworld().getDayTime() / 24000L;
-        boolean eco = EcoPricing.isEcoActive();
-        int defaultCap = Config.INSTANCE.buybackCapacity.get();
-        PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
-        boolean physActive = physCfg.isActive();
-
         java.util.IdentityHashMap<ConfiguredOffer, PriceSpec> quotedSpecs = new java.util.IdentityHashMap<>();
-        List<ConfiguredOffer> allPool = new ArrayList<>();
-        for (ConfiguredOffer offer : data.buybackPool) {
-            if (offer == null || offer.stack == null || offer.stack.isEmpty()) {
-                continue;
-            }
-            PriceSpec spec = offer.resolvePriceSpec();
-            if (!spec.isValid()) {
-                continue;
-            }
-            if (CurrencySettlement.isBlockingBuybackAndShippingForSpec(
-                    offer.stack, spec, player.server.registryAccess(), true)) {
-                continue;
-            }
-            boolean physReady = spec.supportsPhys() && physActive
-                    && physCfg.findResolvedTier(spec.physTierKey, player.server.registryAccess()) != null;
-            if ((spec.mode == CurrencyMode.PHYS_ONLY || spec.mode == CurrencyMode.BOTH) && !physReady) {
-                continue;
-            }
-            if (eco) {
-                QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(offer.stack);
-                if (qr.rejected()) {
-                    continue;
-                }
-            }
-
-            PriceSpec effectiveSpec = spec;
-            if (spec.supportsStar()) {
-                long starUnit = spec.starPrice;
-                if (eco) {
-                    QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(offer.stack);
-                    double profMult = ProfessionManager.previewProfessionMultiplier(data, account, gameDay, offer.stack);
-                    long dyn = EcoPricing.computeBuyoutUnitAtStock(
-                            data, offer.stack, Math.max(spec.starPrice, qr.intrinsicBaseFloor()),
-                            Math.max(1.0D, qr.multiplier()), profMult,
-                            offer.amountOr(defaultCap), 0);
-                    if (dyn <= 0L) {
-                        if (spec.mode == CurrencyMode.EITHER && physReady) {
-                            effectiveSpec = PriceSpec.phys(physCfg.canonicalTierKey(spec.physTierKey), spec.physCount);
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        effectiveSpec = spec.withStarPrice(dyn);
-                    }
-                }
-            } else if (eco && EcoPricing.remainingWarehouseCapacity(data, offer.stack, offer.amountOr(defaultCap)) <= 0) {
-                continue;
-            }
-
-            if (effectiveSpec.supportsPhys() && physReady) {
-                effectiveSpec = effectiveSpec.withPhysTierKey(physCfg.canonicalTierKey(effectiveSpec.physTierKey));
-            } else if (effectiveSpec.mode == CurrencyMode.EITHER && !physReady) {
-                effectiveSpec = PriceSpec.star(effectiveSpec.starPrice);
-            }
-
-            quotedSpecs.put(offer, effectiveSpec);
-            allPool.add(offer);
-        }
+        List<ConfiguredOffer> allPool = collectEligibleBuybackOffersEco(player, account, data, quotedSpecs);
         if (allPool.isEmpty()) {
             return;
         }
+        List<ConfiguredOffer> eligiblePool = new ArrayList<>(allPool);
 
         RandomSource random = player.getRandom();
         int slots = Math.min(maxDailySlots, Math.min(Math.max(0, data.buybackSlotCount), allPool.size()));
@@ -918,6 +856,7 @@ public final class ClearingHouse {
             pickedList.add(p);
         }
 
+        int defaultCap = Config.INSTANCE.buybackCapacity.get();
         for (ConfiguredOffer picked : pickedList) {
             PriceSpec finalSpec = quotedSpecs.getOrDefault(picked, picked.resolvePriceSpec());
             if (!finalSpec.isValid()) {
@@ -928,6 +867,191 @@ public final class ClearingHouse {
             entry.limit = Math.max(1, picked.amountOr(defaultCap));
             account.dailyBuyback.add(entry);
         }
+        if (slots > 0) {
+            applyBuybackGuaranteeEco(random, account.dailyBuyback, eligiblePool, quotedSpecs,
+                    data.buybackGuarantee, defaultCap, maxDailySlots);
+        }
+    }
+
+    /**
+     * 同日增量同步补齐（Eco 模式）：当玩家当日收购清单未满（如空池先登后摆、或池内新增收购品且未达上限）时，
+     * 按与 {@link #generateDailyBuybackEco} 相同的筛选、动态报价与双账本降级逻辑实时补齐。
+     */
+    public static boolean topUpDailyBuybackEco(ServerPlayer player, PlayerAccount account, ShopSavedData data,
+                                               int maxSlots) {
+        if (player == null || account == null || data == null || data.buybackPool.isEmpty()
+                || account.dailyBuyback.size() >= maxSlots) {
+            return false;
+        }
+        java.util.IdentityHashMap<ConfiguredOffer, PriceSpec> quotedSpecs = new java.util.IdentityHashMap<>();
+        List<ConfiguredOffer> eligible = collectEligibleBuybackOffersEco(player, account, data, quotedSpecs);
+        if (eligible.isEmpty()) {
+            return false;
+        }
+        List<ConfiguredOffer> freshPool = new ArrayList<>();
+        for (ConfiguredOffer offer : eligible) {
+            if (!containsBuybackStack(account.dailyBuyback, offer.stack)) {
+                freshPool.add(offer);
+            }
+        }
+        if (freshPool.isEmpty()) {
+            return false;
+        }
+        int defaultCap = Config.INSTANCE.buybackCapacity.get();
+        RandomSource random = player.getRandom();
+        boolean changed = false;
+        while (account.dailyBuyback.size() < maxSlots && !freshPool.isEmpty()) {
+            ConfiguredOffer picked = freshPool.remove(random.nextInt(freshPool.size()));
+            freshPool.removeIf(o -> ItemStack.isSameItemSameTags(o.stack, picked.stack));
+            PriceSpec finalSpec = quotedSpecs.getOrDefault(picked, picked.resolvePriceSpec());
+            if (!finalSpec.isValid()) {
+                continue;
+            }
+            DailyBuybackEntry entry = new DailyBuybackEntry(picked.stack.copy(), finalSpec);
+            entry.rarity = picked.rarity == null ? Rarity.COMMON : picked.rarity;
+            entry.limit = Math.max(1, picked.amountOr(defaultCap));
+            account.dailyBuyback.add(entry);
+            changed = true;
+        }
+        return changed;
+    }
+
+    private static List<ConfiguredOffer> collectEligibleBuybackOffersEco(
+            ServerPlayer player, PlayerAccount account, ShopSavedData data,
+            java.util.IdentityHashMap<ConfiguredOffer, PriceSpec> quotedSpecs) {
+        long gameDay = player.server.overworld().getDayTime() / 24000L;
+        boolean eco = EcoPricing.isEcoActive();
+        int defaultCap = Config.INSTANCE.buybackCapacity.get();
+        PhysicalCurrencyConfig physCfg = PhysicalCurrencyConfig.get();
+        boolean physActive = physCfg.isActive();
+
+        List<ConfiguredOffer> allPool = new ArrayList<>();
+        for (ConfiguredOffer offer : data.buybackPool) {
+            if (offer == null || offer.stack == null || offer.stack.isEmpty()) {
+                continue;
+            }
+            PriceSpec spec = offer.resolvePriceSpec();
+            if (!spec.isValid()) {
+                continue;
+            }
+            if (CurrencySettlement.isBlockingBuybackAndShippingForSpec(
+                    offer.stack, spec, player.server.registryAccess(), true)) {
+                continue;
+            }
+            boolean physReady = spec.supportsPhys() && physActive
+                    && physCfg.findResolvedTier(spec.physTierKey, player.server.registryAccess()) != null;
+            if ((spec.mode == CurrencyMode.PHYS_ONLY || spec.mode == CurrencyMode.BOTH) && !physReady) {
+                continue;
+            }
+            if (eco) {
+                QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(offer.stack);
+                if (qr.rejected()) {
+                    continue;
+                }
+            }
+
+            PriceSpec effectiveSpec = spec;
+            if (spec.supportsStar()) {
+                if (eco) {
+                    QualityEvaluator.QualityResult qr = QualityEvaluator.evaluate(offer.stack);
+                    double profMult = ProfessionManager.previewProfessionMultiplier(data, account, gameDay, offer.stack);
+                    long dyn = EcoPricing.computeBuyoutUnitAtStock(
+                            data, offer.stack, Math.max(spec.starPrice, qr.intrinsicBaseFloor()),
+                            Math.max(1.0D, qr.multiplier()), profMult,
+                            offer.amountOr(defaultCap), 0);
+                    if (dyn <= 0L) {
+                        if (spec.mode == CurrencyMode.EITHER && physReady) {
+                            effectiveSpec = PriceSpec.phys(physCfg.canonicalTierKey(spec.physTierKey), spec.physCount);
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        effectiveSpec = spec.withStarPrice(dyn);
+                    }
+                }
+            } else if (eco && EcoPricing.remainingWarehouseCapacity(data, offer.stack, offer.amountOr(defaultCap)) <= 0) {
+                continue;
+            }
+
+            if (effectiveSpec.supportsPhys() && physReady) {
+                effectiveSpec = effectiveSpec.withPhysTierKey(physCfg.canonicalTierKey(effectiveSpec.physTierKey));
+            } else if (effectiveSpec.mode == CurrencyMode.EITHER && !physReady) {
+                effectiveSpec = PriceSpec.star(effectiveSpec.starPrice);
+            }
+
+            quotedSpecs.put(offer, effectiveSpec);
+            allPool.add(offer);
+        }
+        return allPool;
+    }
+
+    private static void applyBuybackGuaranteeEco(
+            RandomSource random,
+            List<DailyBuybackEntry> entries,
+            List<ConfiguredOffer> pool,
+            java.util.IdentityHashMap<ConfiguredOffer, PriceSpec> quotedSpecs,
+            int[] guarantee,
+            int defaultCap,
+            int maxDailySlots) {
+        if (guarantee == null || pool.isEmpty()) {
+            return;
+        }
+        Rarity[] order = {Rarity.RARE, Rarity.EPIC, Rarity.LEGENDARY};
+        for (int i = 0; i < order.length && i < guarantee.length; i++) {
+            int need = Math.max(0, guarantee[i]);
+            if (need <= 0) {
+                continue;
+            }
+            Rarity rarity = order[i];
+            long have = 0L;
+            for (DailyBuybackEntry entry : entries) {
+                if (entry.rarity == rarity) {
+                    have++;
+                }
+            }
+            while (have < need) {
+                List<ConfiguredOffer> candidates = new ArrayList<>();
+                for (ConfiguredOffer offer : pool) {
+                    if (offer.rarity == rarity && !offer.stack.isEmpty()
+                            && !containsBuybackStack(entries, offer.stack)) {
+                        candidates.add(offer);
+                    }
+                }
+                if (candidates.isEmpty()) {
+                    break;
+                }
+                ConfiguredOffer picked = candidates.get(random.nextInt(candidates.size()));
+                PriceSpec finalSpec = quotedSpecs.getOrDefault(picked, picked.resolvePriceSpec());
+                if (!finalSpec.isValid()) {
+                    pool.remove(picked);
+                    continue;
+                }
+                DailyBuybackEntry replacement = new DailyBuybackEntry(picked.stack.copy(), finalSpec);
+                replacement.rarity = picked.rarity == null ? Rarity.COMMON : picked.rarity;
+                replacement.limit = Math.max(1, picked.amountOr(defaultCap));
+                boolean replaced = false;
+                for (int k = entries.size() - 1; k >= 0; k--) {
+                    if (entries.get(k).rarity == Rarity.COMMON) {
+                        entries.set(k, replacement);
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced && entries.size() < maxDailySlots) {
+                    entries.add(replacement);
+                }
+                have++;
+            }
+        }
+    }
+
+    private static boolean containsBuybackStack(List<DailyBuybackEntry> entries, ItemStack stack) {
+        for (DailyBuybackEntry entry : entries) {
+            if (!entry.stack.isEmpty() && ItemStack.isSameItemSameTags(entry.stack, stack)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 拼装下发给客户端的 Eco 职业专精、每日专注点、官方总钱箱与外币额度快照。 */

@@ -142,4 +142,63 @@ class ShopTemplateStoreTest {
         assertNull(ShopTemplateStore.resolveSafeServerFile(configDir, "C:\\evil.json"));
         assertNull(ShopTemplateStore.resolveSafeServerFile(configDir, "not_json.txt"));
     }
+
+    @Test
+    @DisplayName("模板 JSON 读取支持 UTF-8 BOM 剥离与 GB18030 中文编码回退")
+    void readTemplateSupportsUtf8BomAndGb18030(@TempDir Path configDir) throws Exception {
+        Path root = ShopTemplateStore.dir(configDir);
+        Files.createDirectories(root);
+
+        byte[] utf8 = "{\"format_version\":1,\"name\":\"繁星商店\"}".getBytes(StandardCharsets.UTF_8);
+        byte[] withBom = new byte[3 + utf8.length];
+        withBom[0] = (byte) 0xEF;
+        withBom[1] = (byte) 0xBB;
+        withBom[2] = (byte) 0xBF;
+        System.arraycopy(utf8, 0, withBom, 3, utf8.length);
+        Path bomFile = root.resolve("bom_tpl.json");
+        Files.write(bomFile, withBom);
+        ShopTemplateStore.ReadDetailedResult bomRes = ShopTemplateStore.readDetailed(bomFile);
+        assertTrue(bomRes.ok(), () -> "UTF-8 BOM 读取失败: " + bomRes.errorCode() + " / " + bomRes.errorDetail());
+        assertEquals("繁星商店", bomRes.template().name);
+
+        byte[] gbBytes = "{\"format_version\":1,\"name\":\"记事本中文模板\"}"
+                .getBytes(java.nio.charset.Charset.forName("GB18030"));
+        Path gbFile = root.resolve("gb_tpl.json");
+        Files.write(gbFile, gbBytes);
+        ShopTemplateStore.ReadDetailedResult gbRes = ShopTemplateStore.readDetailed(gbFile);
+        assertTrue(gbRes.ok(), () -> "GB18030 读取失败: " + gbRes.errorCode() + " / " + gbRes.errorDetail());
+        assertEquals("记事本中文模板", gbRes.template().name);
+
+        // UTF-16LE BOM (FF FE)
+        byte[] leBody = "{\"format_version\":1,\"name\":\"UTF16小端模板\"}".getBytes(StandardCharsets.UTF_16LE);
+        byte[] leBytes = new byte[2 + leBody.length];
+        leBytes[0] = (byte) 0xFF;
+        leBytes[1] = (byte) 0xFE;
+        System.arraycopy(leBody, 0, leBytes, 2, leBody.length);
+        Path leFile = root.resolve("utf16le_tpl.json");
+        Files.write(leFile, leBytes);
+        ShopTemplateStore.ReadDetailedResult leRes = ShopTemplateStore.readDetailed(leFile);
+        assertTrue(leRes.ok(), () -> "UTF-16LE BOM 读取失败: " + leRes.errorCode() + " / " + leRes.errorDetail());
+        assertEquals("UTF16小端模板", leRes.template().name);
+
+        // UTF-16BE BOM (FE FF)
+        byte[] beBody = "{\"format_version\":1,\"name\":\"UTF16大端模板\"}".getBytes(StandardCharsets.UTF_16BE);
+        byte[] beBytes = new byte[2 + beBody.length];
+        beBytes[0] = (byte) 0xFE;
+        beBytes[1] = (byte) 0xFF;
+        System.arraycopy(beBody, 0, beBytes, 2, beBody.length);
+        Path beFile = root.resolve("utf16be_tpl.json");
+        Files.write(beFile, beBytes);
+        ShopTemplateStore.ReadDetailedResult beRes = ShopTemplateStore.readDetailed(beFile);
+        assertTrue(beRes.ok(), () -> "UTF-16BE BOM 读取失败: " + beRes.errorCode() + " / " + beRes.errorDetail());
+        assertEquals("UTF16大端模板", beRes.template().name);
+
+        // 损坏二进制必须被严格拒绝，不静默产出乱码
+        byte[] corrupt = new byte[]{(byte) 0xFF, (byte) 0x80, (byte) 0xFE, (byte) 0xFF};
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> ShopTemplateStore.decodeJsonText(corrupt));
+        ShopTemplateStore.ReadDetailedResult corruptRes = ShopTemplateStore.readBytesDetailed(corrupt, "broken.json");
+        assertFalse(corruptRes.ok());
+        assertEquals("invalid_json", corruptRes.errorCode());
+    }
 }

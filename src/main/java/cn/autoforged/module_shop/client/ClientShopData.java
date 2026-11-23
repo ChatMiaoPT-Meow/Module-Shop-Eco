@@ -142,6 +142,8 @@ public final class ClientShopData {
     public static List<PriceSpec> shippingUpgradeSpecs = List.of();
     /** 每天结算的游戏刻（0 = 早上 6:00）。 */
     public static int shipSettleTick;
+    /** 当前是否处于永昼/时间停滞自动兜底模式（按运行刻每 20 分钟结算）。 */
+    public static boolean shipUseGameTime;
     /** 额度重置时间（现实时间 HH:mm；展示与「每日额度」弹窗回填用）。 */
     public static String shipResetTimeText = "00:00";
     // ---- 购物城定时补货（管理页「补货设置」弹窗回填 + 玩家页一天一行提示）----
@@ -579,8 +581,8 @@ public final class ClientShopData {
             buybackGuarantee = bg;
         }
         if (tag.contains("shopSlotCount")) {
-            shopSlotCount = Math.max(1, tag.getInt("shopSlotCount"));
-            buybackSlotCount = Math.max(1, tag.getInt("buybackSlotCount"));
+            shopSlotCount = Math.max(0, tag.getInt("shopSlotCount"));
+            buybackSlotCount = Math.max(0, tag.getInt("buybackSlotCount"));
         }
         int[] td = tag.getIntArray("signInTierDays");
         if (td.length > 0) { signInTierDays = td; }
@@ -699,13 +701,17 @@ public final class ClientShopData {
 
         adminShop = parseOffers(tag.getList("adminShop", Tag.TAG_COMPOUND), registries);
         adminBuyback = parseOffers(tag.getList("adminBuyback", Tag.TAG_COMPOUND), registries);
-        ListTag adminMallTag = tag.getList("adminMall", Tag.TAG_COMPOUND);
-        adminMall = parseOffers(adminMallTag, registries);
-        List<Boolean> nextAdminMallPerm = new ArrayList<>(adminMallTag.size());
-        for (int i = 0; i < adminMallTag.size(); i++) {
-            nextAdminMallPerm.add(adminMallTag.getCompound(i).getBoolean("permanentLimit"));
+        boolean mallUnchanged = tag.getBoolean("mallUnchanged");
+        boolean hasExplicitAdminMall = tag.contains("adminMall", Tag.TAG_LIST);
+        if (hasExplicitAdminMall) {
+            ListTag adminMallTag = tag.getList("adminMall", Tag.TAG_COMPOUND);
+            adminMall = parseOffers(adminMallTag, registries);
+            List<Boolean> nextAdminMallPerm = new ArrayList<>(adminMallTag.size());
+            for (int i = 0; i < adminMallTag.size(); i++) {
+                nextAdminMallPerm.add(adminMallTag.getCompound(i).getBoolean("permanentLimit"));
+            }
+            adminMallPermanent = nextAdminMallPerm;
         }
-        adminMallPermanent = nextAdminMallPerm;
         adminShipping = parseOffers(tag.getList("adminShipping", Tag.TAG_COMPOUND), registries);
         List<String> rawRules = new ArrayList<>();
         ListTag rawTag = tag.getList("adminShippingRaw", Tag.TAG_STRING);
@@ -720,29 +726,46 @@ public final class ClientShopData {
         }
         adminShippingErrors = ruleErrors;
 
-        // 购物城货架
-        List<MallView> newMall = new ArrayList<>();
-        ListTag mallTag = tag.getList("mall", Tag.TAG_COMPOUND);
-        for (int i = 0; i < mallTag.size(); i++) {
-            CompoundTag c = mallTag.getCompound(i);
-            MallView view = new MallView();
-            view.shelf = newMall.size();
-            view.stack = ShopNbt.loadStack(c, registries);
-            view.priceSpec = PriceSpec.readFromParent(c, "priceSpec", "price");
-            view.price = view.priceSpec.supportsStar() ? view.priceSpec.starPrice : c.getLong("price");
-            view.rarity = Rarity.byId(c.getString("rarity"));
-            view.stock = c.contains("stock") ? c.getInt("stock") : -1;
-            view.permanentLimit = c.getBoolean("permanentLimit");
-            view.permanentLimitMax = Math.max(0, c.getInt("permanentLimitMax"));
-            view.permanentLimitUsed = Math.max(0, c.getInt("permanentLimitUsed"));
-            view.sort = c.getInt("sort");
-            if (!view.stack.isEmpty()) {
-                newMall.add(view);
+        // 购物城货架：服务端未变化时沿用本地缓存；更新时单遍解析并直接派生 adminMall（复用已解析 ItemStack）。
+        if (!mallUnchanged) {
+            ListTag mallTag = tag.getList("mall", Tag.TAG_COMPOUND);
+            List<MallView> newMall = new ArrayList<>(mallTag.size());
+            List<ConfiguredOffer> derivedAdminMall = hasExplicitAdminMall ? null : new ArrayList<>(mallTag.size());
+            List<Boolean> derivedAdminPerm = hasExplicitAdminMall ? null : new ArrayList<>(mallTag.size());
+            for (int i = 0; i < mallTag.size(); i++) {
+                CompoundTag c = mallTag.getCompound(i);
+                MallView view = new MallView();
+                view.shelf = newMall.size();
+                view.stack = ShopNbt.loadStack(c, registries);
+                view.priceSpec = PriceSpec.readFromParent(c, "priceSpec", "price");
+                view.price = view.priceSpec.supportsStar() ? view.priceSpec.starPrice : c.getLong("price");
+                view.rarity = Rarity.byId(c.getString("rarity"));
+                view.stock = c.contains("stock") ? c.getInt("stock") : -1;
+                view.permanentLimit = c.getBoolean("permanentLimit");
+                view.permanentLimitMax = Math.max(0, c.getInt("permanentLimitMax"));
+                view.permanentLimitUsed = Math.max(0, c.getInt("permanentLimitUsed"));
+                view.sort = c.getInt("sort");
+                if (!view.stack.isEmpty()) {
+                    newMall.add(view);
+                }
+                if (derivedAdminMall != null) {
+                    PriceSpec adminSpec = c.contains("adminStarPrice")
+                            ? view.priceSpec.withStarPrice(c.getLong("adminStarPrice"))
+                            : view.priceSpec;
+                    ConfiguredOffer offer = new ConfiguredOffer(view.stack, adminSpec, view.rarity);
+                    offer.amount = c.contains("globalStock") ? c.getInt("globalStock") : view.stock;
+                    derivedAdminMall.add(offer);
+                    derivedAdminPerm.add(view.permanentLimit);
+                }
             }
+            mall = newMall;
+            if (derivedAdminMall != null) {
+                adminMall = derivedAdminMall;
+                adminMallPermanent = derivedAdminPerm;
+            }
+            // 每次货架变化更新版本号，避免过滤缓存拿着旧下标去购买。
+            mallVersion++;
         }
-        mall = newMall;
-        // 每次快照都换一批新对象：过滤缓存的 key 里带上版本号，避免界面还拿着旧对象的下标去购买。
-        mallVersion++;
 
         // 购物城最近购买（服务端已按最新在前下发）
         List<MallPurchaseView> newRecent = new ArrayList<>();
@@ -795,6 +818,7 @@ public final class ClientShopData {
         shipUpgradeSpec = readOptionalCostSpec(tag, "shipUpgradeSpec", shipUpgradeCost);
         shippingUpgradeSpecs = readSpecList(tag.getList("shippingUpgradeSpecs", Tag.TAG_COMPOUND));
         shipSettleTick = tag.getInt("shipSettleTick");
+        shipUseGameTime = tag.getBoolean("shipUseGameTime");
         shipResetTimeText = tag.contains("shipResetTime") ? tag.getString("shipResetTime") : "00:00";
         mallRestockOn = tag.getBoolean("mallRestockOn");
         mallRestockMode = tag.contains("mallRestockMode") ? tag.getString("mallRestockMode") : "real";
@@ -1109,6 +1133,18 @@ public final class ClientShopData {
         sidebarNames = new java.util.LinkedHashMap<>();
         shopTitle = "";
         brandIconId = "";
+        stallExpireMode = "permanent";
+        stallExpireAmount = 7;
+        demandExpireMode = "permanent";
+        demandExpireAmount = 7;
+        stall = new ArrayList<>();
+        stallPlayers = new ArrayList<>();
+        demands = new ArrayList<>();
+        mall = new ArrayList<>();
+        adminMall = new ArrayList<>();
+        adminMallPermanent = new ArrayList<>();
+        shipUseGameTime = false;
+        mallVersion++;
         cn.autoforged.module_shop.client.media.ClientMediaCache.clearMemory();
         ClientAdminAuth.clearState();
         treasuryBalance = 0L;

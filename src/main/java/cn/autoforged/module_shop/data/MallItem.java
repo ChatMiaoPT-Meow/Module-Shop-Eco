@@ -52,6 +52,29 @@ public final class MallItem {
      * 刷新 / 补货（{@link #clearPersonalUsed}）时整张表清空 = 每个人的库存都恢复。
      */
     public final java.util.Map<java.util.UUID, Integer> personalUsed = new java.util.LinkedHashMap<>();
+    /** 瞬态物品 NBT 编码缓存（不存档）：货架上万件时免去每次快照重复 save ItemStack。 */
+    private transient ItemStack cachedItemRef;
+    private transient int cachedItemCount = -1;
+    private transient Tag cachedItemTag;
+
+    private CompoundTag saveCachedStack(HolderLookup.Provider registries) {
+        if (stack == null || stack.isEmpty()) {
+            return new CompoundTag();
+        }
+        Tag encoded = cachedItemTag;
+        if (encoded == null || cachedItemRef != stack || cachedItemCount != stack.getCount()) {
+            CompoundTag full = ShopNbt.saveStack(stack, registries);
+            encoded = full.get("item");
+            cachedItemRef = stack;
+            cachedItemCount = stack.getCount();
+            cachedItemTag = encoded;
+        }
+        CompoundTag out = new CompoundTag();
+        if (encoded != null) {
+            out.put("item", encoded);
+        }
+        return out;
+    }
 
     public MallItem() {
     }
@@ -194,9 +217,8 @@ public final class MallItem {
      * </ul>
      */
     public CompoundTag saveForView(HolderLookup.Provider registries, java.util.UUID viewer, boolean personal) {
-        // 直接按字段拼，不走 save()：save() 会把 personalUsed（每个买过的玩家一条）整表序列化，
-        // 这里又马上删掉 —— 货架上千件、买家上百人时，每次下发快照都要白白构造几十万个 NBT 节点。
-        CompoundTag tag = ShopNbt.saveStack(stack, registries);
+        // 直接按字段拼并复用物品 NBT 缓存：货架上万件时免去重复 ItemStack NBT 与 personalUsed 序列化。
+        CompoundTag tag = saveCachedStack(registries);
         PriceSpec baseSpec = resolvePriceSpec();
         boolean perPlayer = personal || this.permanentLimit;
         long shownStar;
@@ -209,6 +231,9 @@ public final class MallItem {
         }
         PriceSpec shownSpec = baseSpec.withStarPrice(shownStar);
         shownSpec.writeToParent(tag, "priceSpec", "price");
+        if (baseSpec.supportsStar() && shownStar != baseSpec.starPrice) {
+            tag.putLong("adminStarPrice", baseSpec.starPrice);
+        }
         tag.putLong("basePrice", baseSpec.supportsStar() ? (basePrice > 0L ? basePrice : baseSpec.starPrice) : 0L);
         tag.putString("supplyMode", supplyMode.id());
         tag.putInt("floorRestockPct", floorRestockPercent);
@@ -218,11 +243,16 @@ public final class MallItem {
             int cap = permanentCap();
             int used = permanentUsedFor(viewer);
             tag.putInt("stock", Math.max(0, cap - used));
+            tag.putInt("globalStock", cap);
             tag.putInt("stockMax", cap);
             tag.putInt("permanentLimitMax", cap);
             tag.putInt("permanentLimitUsed", Math.min(cap, used));
         } else {
-            tag.putInt("stock", personal ? remainingFor(viewer) : stock);
+            int viewStock = personal ? remainingFor(viewer) : stock;
+            tag.putInt("stock", viewStock);
+            if (personal && viewStock != stock) {
+                tag.putInt("globalStock", stock);
+            }
             tag.putInt("stockMax", stockMax);
         }
         tag.putInt("sort", sort);

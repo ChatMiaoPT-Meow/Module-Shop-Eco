@@ -52,6 +52,7 @@ public class PhysicalCurrencyConfigScreen extends SkiaDialog {
         String label = "";
         ItemStack sampleStack = ItemStack.EMPTY;
         boolean customPicked;
+        boolean addonDefault;
 
         ItemStack displayStack() {
             if (this.sampleStack != null && !this.sampleStack.isEmpty()) {
@@ -117,9 +118,35 @@ public class PhysicalCurrencyConfigScreen extends SkiaDialog {
             d.customPicked = ClientHomeCurrencyState.hasNonEmptyTag(d.sampleStack);
             this.tiers.add(d);
         }
+        int defIdx = ClientHomeCurrencyState.findTierIndex(ClientHomeCurrencyState.physAddonDefaultTier);
+        if (defIdx >= 0 && defIdx < this.tiers.size()) {
+            this.tiers.get(defIdx).addonDefault = true;
+        }
         if (!this.tiers.isEmpty()) {
             this.selectedIndex = 0;
         }
+    }
+
+    private TierDraft addonDefaultTier() {
+        for (TierDraft d : this.tiers) {
+            if (d.addonDefault) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    private void toggleSelectedAddonDefault() {
+        TierDraft sel = selected();
+        if (sel == null) {
+            return;
+        }
+        boolean next = !sel.addonDefault;
+        for (TierDraft d : this.tiers) {
+            d.addonDefault = false;
+        }
+        sel.addonDefault = next;
+        this.errorText = "";
     }
 
     private static String tr(String key, String fallback, Object... args) {
@@ -460,19 +487,28 @@ public class PhysicalCurrencyConfigScreen extends SkiaDialog {
         }
 
         ListTag tierList = new ListTag();
+        String addonDefaultKey = "";
         for (int i = 0; i < this.tiers.size(); i++) {
             TierDraft t = this.tiers.get(i);
             CompoundTag itemTag = new CompoundTag();
-            if (t.id != null && !t.id.isBlank()) {
-                itemTag.putString("id", t.id.trim());
+            String cleanId = t.id == null ? "" : t.id.trim();
+            String cleanItemId = t.itemId == null ? "" : t.itemId.trim();
+            String cleanSnbt = t.componentsSnbt == null ? "" : t.componentsSnbt.trim();
+            if (!cleanId.isEmpty()) {
+                itemTag.putString("id", cleanId);
             }
-            itemTag.putString("itemId", t.itemId == null ? "" : t.itemId.trim());
-            itemTag.putString("componentsSnbt", t.componentsSnbt == null ? "" : t.componentsSnbt.trim());
+            itemTag.putString("itemId", cleanItemId);
+            itemTag.putString("componentsSnbt", cleanSnbt);
             itemTag.putInt("stepRatio", i == 0 ? 1 : Math.max(1, t.stepRatio));
             itemTag.putLong("value", Math.max(1L, t.value));
             itemTag.putString("label", t.label == null || t.label.isBlank() ? t.displayTitle() : t.label.trim());
             if (t.customPicked && t.sampleStack != null && !t.sampleStack.isEmpty()) {
                 itemTag.put("sampleStack", t.sampleStack.copyWithCount(1).save(new CompoundTag()));
+            }
+            if (t.addonDefault) {
+                addonDefaultKey = !cleanId.isEmpty()
+                        ? cleanId
+                        : (cleanItemId.toLowerCase(java.util.Locale.ROOT) + "|" + cleanSnbt);
             }
             tierList.add(itemTag);
         }
@@ -482,6 +518,7 @@ public class PhysicalCurrencyConfigScreen extends SkiaDialog {
         payload.putBoolean("physEnabled", this.enabled);
         payload.putBoolean("physBlockBuyback", this.blockBuyback);
         payload.putLong("physDailyConvertLimit", Math.max(0L, this.dailyConvertLimit));
+        payload.putString("physAddonDefaultTier", addonDefaultKey);
         payload.put("physTiers", tierList);
         ServerboundShopActionPayload.send(payload);
         Nav.back();
@@ -586,11 +623,16 @@ public class PhysicalCurrencyConfigScreen extends SkiaDialog {
         }
         float bannerX = limFieldX + limFieldW + 8.0F;
         float bannerW = Math.max(40.0F, x + w - 8.0F - bannerX);
-        Draw.fill(canvas, bannerX, row2Y, bannerW, 16.0F, 3.0F, Draw.alpha(IOStyle.BLUE, 0.10F));
-        Draw.stroke(canvas, bannerX, row2Y, bannerW, 16.0F, 3.0F, 0.6F, Draw.alpha(IOStyle.BLUE, 0.35F));
-        String descTxt = tr("gui.module_shop.phys_cfg.dual_desc_short",
-                "双独立账本 · 实体链内支持阶梯凑整与拆零");
-        small(canvas, descTxt, bannerX + 6.0F, row2Y + 8.0F, Math.max(20.0F, bannerW - 12.0F), IOStyle.TEXT_2);
+        TierDraft defTier = addonDefaultTier();
+        int bannerAccent = defTier != null ? IOStyle.ORANGE : IOStyle.BLUE;
+        Draw.fill(canvas, bannerX, row2Y, bannerW, 16.0F, 3.0F, Draw.alpha(bannerAccent, 0.10F));
+        Draw.stroke(canvas, bannerX, row2Y, bannerW, 16.0F, 3.0F, 0.6F, Draw.alpha(bannerAccent, 0.40F));
+        String descTxt = defTier != null
+                ? tr("gui.module_shop.phys_cfg.addon_def_banner", "附属默认：%s（点档位可切换）", defTier.displayTitle())
+                : tr("gui.module_shop.phys_cfg.dual_desc_addon_star", "双独立账本 · 附属默认：%s",
+                        cn.autoforged.module_shop.client.ClientShopData.currencyName());
+        small(canvas, descTxt, bannerX + 6.0F, row2Y + 8.0F, Math.max(20.0F, bannerW - 12.0F),
+                defTier != null ? IOStyle.ORANGE : IOStyle.TEXT_2);
     }
 
     private void paintTierList(Canvas canvas, float x, float y, float w, float h) {
@@ -641,19 +683,28 @@ public class PhysicalCurrencyConfigScreen extends SkiaDialog {
                 float tx = rx + 24.0F;
                 float tw = Math.max(20.0F, rw - 28.0F);
                 String name = "#" + (i + 1) + " " + t.displayTitle();
+                float tagRight = rx + rw - 4.0F;
                 if (t.hasCustomComponents()) {
                     String tag = tr("gui.module_shop.phys_cfg.comp_tag", "组件");
                     float tagW = Text.width(tag, AtomUi.BOLD, 5.0F) + 6.0F;
-                    Draw.fill(canvas, rx + rw - tagW - 4.0F, ry + 3.0F, tagW, 9.0F, 2.0F, Draw.alpha(IOStyle.EPIC, 0.22F));
+                    float tagX = tagRight - tagW;
+                    Draw.fill(canvas, tagX, ry + 3.0F, tagW, 9.0F, 2.0F, Draw.alpha(IOStyle.EPIC, 0.22F));
                     Text.drawLine(canvas, tag, AtomUi.BOLD, 5.0F, IOStyle.EPIC,
-                            rx + rw - tagW - 4.0F, ry + 7.5F, tagW + 0.5F, Text.Align.CENTER);
-                    Text.drawLine(canvas, name, sel ? AtomUi.BOLD : AtomUi.REGULAR, Text.SMALL,
-                            sel ? IOStyle.TEXT : IOStyle.TEXT_2, tx, ry + 8.0F,
-                            Math.max(12.0F, tw - tagW - 4.0F) + 0.5F, Text.Align.LEFT);
-                } else {
-                    Text.drawLine(canvas, name, sel ? AtomUi.BOLD : AtomUi.REGULAR, Text.SMALL,
-                            sel ? IOStyle.TEXT : IOStyle.TEXT_2, tx, ry + 8.0F, tw + 0.5F, Text.Align.LEFT);
+                            tagX, ry + 7.5F, tagW + 0.5F, Text.Align.CENTER);
+                    tagRight = tagX - 3.0F;
                 }
+                if (t.addonDefault) {
+                    String defTag = tr("gui.module_shop.phys_cfg.addon_def_tag", "附属默认");
+                    float defTagW = Text.width(defTag, AtomUi.BOLD, 5.0F) + 6.0F;
+                    float defTagX = tagRight - defTagW;
+                    Draw.fill(canvas, defTagX, ry + 3.0F, defTagW, 9.0F, 2.0F, Draw.alpha(IOStyle.ORANGE, 0.24F));
+                    Text.drawLine(canvas, defTag, AtomUi.BOLD, 5.0F, IOStyle.ORANGE,
+                            defTagX, ry + 7.5F, defTagW + 0.5F, Text.Align.CENTER);
+                    tagRight = defTagX - 3.0F;
+                }
+                float nameMaxW = Math.max(12.0F, Math.min(tw, tagRight - tx));
+                Text.drawLine(canvas, name, sel ? AtomUi.BOLD : AtomUi.REGULAR, Text.SMALL,
+                        sel ? IOStyle.TEXT : IOStyle.TEXT_2, tx, ry + 8.0F, nameMaxW + 0.5F, Text.Align.LEFT);
 
                 String sub;
                 if (i == 0) {
@@ -713,13 +764,27 @@ public class PhysicalCurrencyConfigScreen extends SkiaDialog {
         ItemStack preview = sel.displayStack();
         item(preview, ix + 1.0F, cy + 1.0F);
 
-        float pickW = 66.0F;
+        float pickW = 50.0F;
+        float pickX = ix + iw - pickW;
         button(canvas, "pick_inv", tr("gui.module_shop.phys_cfg.pick_inv", "背包拾取"),
-                ix + iw - pickW, cy, pickW, 18.0F, Button.Kind.NORMAL, true,
+                pickX, cy, pickW, 18.0F, Button.Kind.NORMAL, true,
                 () -> this.pickingInventory = true);
 
+        float defW = 60.0F;
+        float defX = pickX - 3.0F - defW;
+        String defBtnTxt = sel.addonDefault
+                ? tr("gui.module_shop.phys_cfg.addon_def_on", "★ 附属默认")
+                : tr("gui.module_shop.phys_cfg.addon_def_set", "设为附属默认");
+        button(canvas, "addon_def", defBtnTxt, defX, cy, defW, 18.0F,
+                sel.addonDefault ? Button.Kind.ACCENT : Button.Kind.NORMAL, true,
+                this::toggleSelectedAddonDefault);
+        if (over(defX, cy, defW, 18.0F)) {
+            tip(Component.literal(tr("gui.module_shop.phys_cfg.addon_def_tip",
+                    "设为通行证/红包/盲仓/股市等附属的默认结算实体币（再次点击取消并回退虚拟主货币）")));
+        }
+
         float titleX = ix + 22.0F;
-        float titleMaxW = Math.max(20.0F, ix + iw - pickW - 6.0F - titleX);
+        float titleMaxW = Math.max(20.0F, defX - 5.0F - titleX);
         String itemTitle = preview.isEmpty()
                 ? tr("gui.module_shop.phys_cfg.invalid_item", "未匹配到物品")
                 : PageKit.plainName(preview);
