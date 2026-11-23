@@ -4847,14 +4847,14 @@ public class ShopScreen extends Screen implements JeiHoverSource, ShopHost {
                 drawSmallLabelButton(g, dExpireX, rowA, btnW, 14,
                         Component.translatable("gui.module_shop.demand.expire"),
                         IOStyle.inside(dExpireX, rowA, btnW, 14, mx, my),
-                        !"permanent".equals(ClientShopData.demandExpireMode), false);
+                        !"permanent".equals(ClientShopData.demandExpireMode) && ClientShopData.demandExpireAmount > 0, false);
             } else if (stalls) {
                 int expireX = cx + 4;
                 addRegion(expireX, rowA, btnW, 14, "stall_expire", null, null);
                 drawSmallLabelButton(g, expireX, rowA, btnW, 14,
                         Component.translatable("gui.module_shop.stall.expire"),
                         IOStyle.inside(expireX, rowA, btnW, 14, mx, my),
-                        !"permanent".equals(ClientShopData.stallExpireMode), false);
+                        !"permanent".equals(ClientShopData.stallExpireMode) && ClientShopData.stallExpireAmount > 0, false);
             } else if (mall) {
                 addRegion(genX, rowA, btnW, 14, "mall_import", null, null);
                 drawSmallLabelButton(g, genX, rowA, btnW, 14,
@@ -4877,9 +4877,15 @@ public class ShopScreen extends Screen implements JeiHoverSource, ShopHost {
                         Component.translatable("gui.module_shop.shipping.daily_limits"),
                         IOStyle.inside(genX, rowA, btnW, 14, mx, my), false, false);
             } else {
-                addRegion(genX, rowA, btnW, 14, "admin_gen_set", null, null);
+                CompoundTag modeExtra = new CompoundTag();
+                modeExtra.putString("mode", adminMode);
+                addRegion(genX, rowA, btnW, 14, "admin_gen_set", null, modeExtra);
                 drawSmallLabelButton(g, genX, rowA, btnW, 14,
                         Component.translatable("gui.module_shop.admin_gen"), false);
+                int rerollX = genX + btnW + btnGap;
+                addRegion(rerollX, rowA, btnW, 14, "admin_reroll_daily", null, modeExtra);
+                drawSmallLabelButton(g, rerollX, rowA, btnW, 14,
+                        Component.translatableWithFallback("gui.module_shop.admin_reroll", "全服重抽"), false);
             }
         }
         // 底栏第二行：翻页 → 页码 → 当前奖励金额 → 操作提示，一律**从左往右依次排**（按实际文字宽度推进），
@@ -5708,16 +5714,24 @@ public class ShopScreen extends Screen implements JeiHoverSource, ShopHost {
 
     // =========================================================== 出货箱（新增模块）
 
-    /** 客户端估算：距离下一次结算还有多少**游戏内**时间（用客户端自己的世界时间，不用服务端下发）。 */
+    /** 客户端估算：距离下一次结算还有多少时间（正常按游戏内时间，永昼兜底按运行刻真实倒计时）。 */
     private static String shippingNextText() {
         var level = Minecraft.getInstance().level;
         if (level == null) {
             return "";
         }
-        long dayTime = level.getDayTime();
-        long timeOfDay = dayTime % 24000L;
         long start = ClientShopData.shipSettleTick;
-        long remain = timeOfDay <= start ? start - timeOfDay : 24000L - timeOfDay + start;
+        if (ClientShopData.shipUseGameTime) {
+            long remain = cn.autoforged.module_shop.shop.ShippingSettleClock.remainingTicks(level.getGameTime(), start);
+            long totalSec = Math.max(0L, remain) / 20L;
+            if (totalSec < 1L) {
+                return Component.translatable("gui.module_shop.shipping.settling").getString();
+            }
+            long m = totalSec / 60L;
+            long s = totalSec % 60L;
+            return m > 0L ? (m + "分" + (s > 0L ? s + "秒后" : "后")) : (s + "秒后");
+        }
+        long remain = cn.autoforged.module_shop.shop.ShippingSettleClock.remainingTicks(level.getDayTime(), start);
         long minutes = Math.max(0L, remain) * 60L / 1000L;   // 1000 刻 = 1 游戏小时
         if (remain <= 0L || minutes < 1L) {
             return Component.translatable("gui.module_shop.shipping.settling").getString();
@@ -5760,9 +5774,11 @@ public class ShopScreen extends Screen implements JeiHoverSource, ShopHost {
         // ---------- 卡片二：结算时间（规则条数/正常与否不再占行，只有出错时才红字提醒）----------
         int card2Y = cardY + 62;
         IOStyle.card(g, cx + 2, card2Y, cw - 4, 50, 0);
-        Component settleTime = Component.translatable("gui.module_shop.shipping.settle_time",
-                String.format("%02d:%02d", (ClientShopData.shipSettleTick / 1000 + 6) % 24,
-                        (int) ((ClientShopData.shipSettleTick % 1000) * 60 / 1000)));
+        Component settleTime = ClientShopData.shipUseGameTime
+                ? Component.translatableWithFallback("gui.module_shop.shipping.settle_gametime", "永昼兜底 · 每20分钟")
+                : Component.translatable("gui.module_shop.shipping.settle_time",
+                        String.format("%02d:%02d", (ClientShopData.shipSettleTick / 1000 + 6) % 24,
+                                (int) ((ClientShopData.shipSettleTick % 1000) * 60 / 1000)));
         drawSmallLabel(g, cx + 10, card2Y + 8, settleTime, IOStyle.TEXT_2);
         drawSmallLabel(g, cx + 10, card2Y + 22, Component.translatable(
                 "gui.module_shop.shipping.reset_line", ClientShopData.shipResetTimeText), IOStyle.TEXT_2);
@@ -6154,7 +6170,7 @@ public class ShopScreen extends Screen implements JeiHoverSource, ShopHost {
                     "rename_shop_title", "rename_currency", "buyback_bonus_set", "exchange_edit",
                     "exchange_limits", "profession_config",
                     "mall_add", "mall_import", "mall_restock", "mall_refresh",
-                    "shipping_limits", "demand_settings", "demand_expire", "demand_admin_cancel",
+                    "shipping_limits", "stall_expire", "demand_settings", "demand_expire", "demand_admin_cancel",
                     "signin_activity_edit", "signin_activity_clear", "signin_edit_toggle" -> true;
             default -> action.startsWith("admin_")
                     && !"admin_prev".equals(action)
@@ -6263,8 +6279,9 @@ public class ShopScreen extends Screen implements JeiHoverSource, ShopHost {
             case "trade_requests_open" -> send("trade_requests_open", null);
             // 商店设置 → 签到：就地切换「编辑日程」态，点下面日历上的日期即可新建 / 修改。
             case "admin_signin_schedule" -> this.signInEdit = !this.signInEdit;
-            // 需求 8：修改当前模块的刷新参数。
-            case "admin_gen_set" -> openGenSet();
+            // 需求 8：修改当前模块的刷新参数 / 一键全服重抽。
+            case "admin_gen_set" -> openGenSet(extra);
+            case "admin_reroll_daily" -> confirmAdminRerollDaily(extra);
             // 侧栏布局：进入编辑模式（工具条里的"完成"退出，"重置布局"恢复默认）。
             case "sidebar_edit" -> {
                 this.layoutEdit = !this.layoutEdit;
@@ -6692,8 +6709,9 @@ public class ShopScreen extends Screen implements JeiHoverSource, ShopHost {
     }
 
     /** 管理员：修改当前编辑模块（每日商店 / 每日收购）的权重、保底与条目上限。 */
-    private void openGenSet() {
-        boolean shop = !"buyback".equals(adminMode);
+    private void openGenSet(@javax.annotation.Nullable CompoundTag extra) {
+        String m = (extra != null && extra.contains("mode")) ? extra.getString("mode") : adminMode;
+        boolean shop = !"buyback".equals(m);
         int[] weights = shop ? ClientShopData.shopWeights : ClientShopData.buybackWeights;
         int[] guarantee = shop ? ClientShopData.shopGuarantee : ClientShopData.buybackGuarantee;
         int slots = shop ? ClientShopData.shopSlotCount : ClientShopData.buybackSlotCount;
@@ -6706,6 +6724,26 @@ public class ShopScreen extends Screen implements JeiHoverSource, ShopHost {
                 ? "gui.module_shop.admin_shop" : "gui.module_shop.admin_buyback").getString());
         openInput("admin_shop_gen_set", "gui.module_shop.input.admin_gen", req,
                 "weights", "guarantee", "slots");
+    }
+
+    /** 管理员：按当前候选池立即为全服玩家（含离线）重抽今日商店 / 收购清单（先二次确认防止误触）。 */
+    private void confirmAdminRerollDaily(@javax.annotation.Nullable CompoundTag extra) {
+        String m = (extra != null && extra.contains("mode")) ? extra.getString("mode") : adminMode;
+        boolean shop = !"buyback".equals(m);
+        String targetMode = shop ? "shop" : "buyback";
+        String modLabel = Component.translatable(shop
+                ? "gui.module_shop.admin_shop" : "gui.module_shop.admin_buyback").getString();
+        Nav.open(new ShopConfirmScreen(
+                Component.translatableWithFallback("gui.module_shop.admin_reroll_confirm_title", "确认全服重抽"),
+                Component.translatableWithFallback("gui.module_shop.admin_reroll_confirm_body",
+                        "确认立即按当前商品池为全服所有玩家（含离线玩家）重新抽取今日的「%s」清单吗？", modLabel),
+                confirmed -> {
+                    if (confirmed) {
+                        CompoundTag tag = new CompoundTag();
+                        tag.putString("mode", targetMode);
+                        send("admin_reroll_daily_go", tag);
+                    }
+                }));
     }
 
     private static String joinInts(int[] values) {

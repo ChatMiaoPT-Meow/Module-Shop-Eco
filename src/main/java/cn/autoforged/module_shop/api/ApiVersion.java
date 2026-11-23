@@ -24,21 +24,61 @@ package cn.autoforged.module_shop.api;
  */
 public final class ApiVersion {
     /** 当前 API 版本（语义化版本）。 */
-    public static final String API_VERSION = "1.4.0";
+    public static final String API_VERSION = "1.5.0";
     /** 主版本号：外部可用它做依赖检查。 */
     public static final int API_MAJOR = 1;
     /**
      * 次版本号：1.1 起新增客户端扩展点 {@link cn.autoforged.module_shop.api.client.ShopModules}；
      * 1.2 起 {@link cn.autoforged.module_shop.api.client.ShopTheme} 支持皮肤；
-     * 1.4 起新增 {@link TreasuryApi}、{@link ProfessionApi} 与 {@link ShippingApi}。
+     * 1.4 起新增 {@link TreasuryApi}、{@link ProfessionApi} 与 {@link ShippingApi}；
+     * 1.5 起新增统一货币模型（{@link cn.autoforged.module_shop.api.view.CurrencyUnit} /
+     * {@link cn.autoforged.module_shop.api.view.CurrencyTierView}）与附属默认实体货币支持。
      */
-    public static final int API_MINOR = 4;
+    public static final int API_MINOR = 5;
 
     private ApiVersion() {
     }
 
     private static String runtime() {
         return API_VERSION;
+    }
+
+    /** 运行期主版本号（非编译期内联常量，供附属在运行期判断宿主能力）。 */
+    public static int runtimeMajor() {
+        return parsePart(runtime(), 0);
+    }
+
+    /** 运行期次版本号（非编译期内联常量，供附属在运行期判断宿主能力）。 */
+    public static int runtimeMinor() {
+        return parsePart(runtime(), 1);
+    }
+
+    /** 判断运行期 API 是否满足指定主版本及最低次版本要求。 */
+    public static boolean atLeast(int major, int minor) {
+        return runtimeMajor() == major && runtimeMinor() >= minor;
+    }
+
+    private static int parsePart(String version, int index) {
+        if (version == null || version.isEmpty()) {
+            return 0;
+        }
+        String[] parts = version.split("\\.");
+        if (index < 0 || index >= parts.length) {
+            return 0;
+        }
+        String raw = parts[index];
+        int end = 0;
+        while (end < raw.length() && Character.isDigit(raw.charAt(end))) {
+            end++;
+        }
+        if (end == 0) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(raw.substring(0, end));
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
 
     /** 供外部打印/日志用。 */

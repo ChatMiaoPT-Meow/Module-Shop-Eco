@@ -64,6 +64,7 @@ public final class ClientHomeCurrencyState {
     public static long physDailyConvertLimit;
     public static long physConvertToday;
     public static long physPlayerValue;
+    public static String physAddonDefaultTier = "";
     public static List<PhysTierView> physTiers = new ArrayList<>();
 
     /** 每次成功解析快照时递增，界面据此感知服务端热同步刷新。 */
@@ -249,6 +250,8 @@ public final class ClientHomeCurrencyState {
         physBlockBuyback = !data.contains("physBlockBuyback") || data.getBoolean("physBlockBuyback");
         physDailyConvertLimit = Math.max(0L, data.getLong("physDailyConvertLimit"));
         physConvertToday = Math.max(0L, data.getLong("physConvertToday"));
+        physAddonDefaultTier = data.getString("physAddonDefaultTier").trim();
+        boolean hasPlayerValue = data.contains("physPlayerValue");
         physPlayerValue = Math.max(0L, data.getLong("physPlayerValue"));
 
         List<PhysTierView> nextTiers = new ArrayList<>();
@@ -275,6 +278,16 @@ public final class ClientHomeCurrencyState {
             nextTiers.add(tier);
         }
         physTiers = nextTiers;
+        if (!hasPlayerValue && !nextTiers.isEmpty()) {
+            long[] vals = new long[nextTiers.size()];
+            int[] own = new int[nextTiers.size()];
+            for (int i = 0; i < nextTiers.size(); i++) {
+                vals[i] = Math.max(1L, nextTiers.get(i).value);
+                own[i] = Math.max(0, nextTiers.get(i).ownedCount);
+            }
+            physPlayerValue = cn.autoforged.module_shop.shop.currency.PhysicalCurrencyEngine
+                    .totalPhysicalValue(vals, own);
+        }
         snapshotVersion++;
     }
 
@@ -332,6 +345,20 @@ public final class ClientHomeCurrencyState {
         preferredEitherChannel = CHANNEL_PHYS.equals(preferredEitherChannel) ? CHANNEL_STAR : CHANNEL_PHYS;
     }
 
+    /** 当前生效的附属模组默认实体货币档位；未启用或未配置时返回 {@code null}（回退虚拟主货币）。 */
+    public static @Nullable PhysTierView activeAddonPhysTier() {
+        if (!physEnabled || physAddonDefaultTier == null || physAddonDefaultTier.isBlank()) {
+            return null;
+        }
+        return findTier(physAddonDefaultTier);
+    }
+
+    /** 格式化实体货币基准面值（绝不拼接虚拟星币单位）。 */
+    public static String formatPhysUnits(long units) {
+        long safe = Math.max(0L, units);
+        return tr("gui.module_shop.phys_ex.value_units", "%s 面值", String.format("%,d", safe));
+    }
+
     public static void reset() {
         playTimeTicks = 0L;
         playTimeSyncMillis = 0L;
@@ -345,6 +372,7 @@ public final class ClientHomeCurrencyState {
         physDailyConvertLimit = 0L;
         physConvertToday = 0L;
         physPlayerValue = 0L;
+        physAddonDefaultTier = "";
         physTiers = new ArrayList<>();
         snapshotVersion++;
         cn.autoforged.module_shop.client.media.ClientMediaCache.clearMemory();

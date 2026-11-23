@@ -5,6 +5,10 @@ import cn.autoforged.module_shop.data.ShopNbt;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -113,6 +117,8 @@ public final class PhysicalCurrencyConfig {
     public boolean blockBuybackAndShipping = true;
     /** 单人每日实体货币凑整/拆零兑换总面值上限（<=0 表示不限）。 */
     public long dailyConvertLimit = 0L;
+    /** 附属模组默认结算实体货币档位 key（空串表示沿用虚拟主货币）。 */
+    public String addonDefaultTierKey = "";
     public List<CurrencyTier> tiers = new ArrayList<>();
 
     private static volatile PhysicalCurrencyConfig instance;
@@ -134,7 +140,7 @@ public final class PhysicalCurrencyConfig {
         Path file = resolveFile(configDir);
         try {
             if (Files.isRegularFile(file)) {
-                String raw = Files.readString(file, StandardCharsets.UTF_8);
+                String raw = decodeConfigText(Files.readAllBytes(file));
                 PhysicalCurrencyConfig parsed = GsonHolder.GSON.fromJson(raw, PhysicalCurrencyConfig.class);
                 if (parsed != null) {
                     parsed.normalize();
@@ -162,6 +168,47 @@ public final class PhysicalCurrencyConfig {
         resolvedCache = null;
     }
 
+    static String decodeConfigText(byte[] raw) {
+        if (raw == null || raw.length == 0) {
+            return "";
+        }
+        String text;
+        if (raw.length >= 2 && (raw[0] & 0xFF) == 0xFF && (raw[1] & 0xFF) == 0xFE) {
+            text = decodeStrict(raw, 2, StandardCharsets.UTF_16LE);
+        } else if (raw.length >= 2 && (raw[0] & 0xFF) == 0xFE && (raw[1] & 0xFF) == 0xFF) {
+            text = decodeStrict(raw, 2, StandardCharsets.UTF_16BE);
+        } else {
+            int offset = 0;
+            if (raw.length >= 3 && (raw[0] & 0xFF) == 0xEF && (raw[1] & 0xFF) == 0xBB && (raw[2] & 0xFF) == 0xBF) {
+                offset = 3;
+            }
+            try {
+                text = decodeStrict(raw, offset, StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException utf8Ex) {
+                if (offset != 0 || !Charset.isSupported("GB18030")) {
+                    throw utf8Ex;
+                }
+                text = decodeStrict(raw, offset, Charset.forName("GB18030"));
+            }
+        }
+        while (!text.isEmpty() && text.charAt(0) == '\uFEFF') {
+            text = text.substring(1);
+        }
+        return text;
+    }
+
+    private static String decodeStrict(byte[] raw, int offset, Charset charset) {
+        try {
+            return charset.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(raw, offset, raw.length - offset))
+                    .toString();
+        } catch (CharacterCodingException ex) {
+            throw new IllegalArgumentException("无法按 " + charset.name() + " 解码文本", ex);
+        }
+    }
+
     public static synchronized boolean replaceAndSave(PhysicalCurrencyConfig next) {
         return replaceAndSave(resolveRuntimeConfigDir(), next);
     }
@@ -184,6 +231,14 @@ public final class PhysicalCurrencyConfig {
 
     public boolean isBlockingBuybackAndShipping() {
         return isActive() && blockBuybackAndShipping;
+    }
+
+    /** 当前生效的附属模组默认实体货币档位；未启用或未指定时返回 {@code null}（回退虚拟主货币）。 */
+    public @Nullable CurrencyTier activeAddonDefaultTier() {
+        if (!isActive() || addonDefaultTierKey == null || addonDefaultTierKey.isBlank()) {
+            return null;
+        }
+        return findTier(addonDefaultTierKey);
     }
 
     public synchronized void normalize() {
@@ -216,6 +271,12 @@ public final class PhysicalCurrencyConfig {
         this.tiers = clean;
         if (this.tiers.isEmpty()) {
             this.enabled = false;
+        }
+        if (this.addonDefaultTierKey == null || this.addonDefaultTierKey.isBlank()) {
+            this.addonDefaultTierKey = "";
+        } else {
+            CurrencyTier matched = findTier(this.addonDefaultTierKey);
+            this.addonDefaultTierKey = matched != null ? matched.tierKey() : "";
         }
     }
 
@@ -475,6 +536,7 @@ public final class PhysicalCurrencyConfig {
         cfg.enabled = nextEnabled;
         cfg.blockBuybackAndShipping = nextBlock;
         cfg.dailyConvertLimit = Math.max(0L, tag.getLong("physDailyConvertLimit"));
+        cfg.addonDefaultTierKey = tag.getString("physAddonDefaultTier").trim();
         cfg.tiers = parsedTiers;
         cfg.normalize();
         return new ParseSaveResult(true, "", cfg);

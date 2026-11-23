@@ -9,6 +9,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.Charset;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -346,8 +350,12 @@ public final class ShopTemplateStore {
         if (raw.length > MAX_UNCOMPRESSED_JSON_BYTES) {
             return new ReadDetailedResult(null, "too_large", raw.length + " bytes", List.of());
         }
-        String json = new String(raw, StandardCharsets.UTF_8);
-        return parseJsonResult(json);
+        try {
+            String json = decodeJsonText(raw);
+            return parseJsonResult(json);
+        } catch (IllegalArgumentException ex) {
+            return new ReadDetailedResult(null, "invalid_json", ex.getMessage(), List.of());
+        }
     }
 
     private static ReadDetailedResult readMshopArchive(byte[] raw) {
@@ -473,7 +481,48 @@ public final class ShopTemplateStore {
     }
 
     private static String readBoundedUtf8(InputStream in, long maxBytes) throws IOException {
-        return new String(readBoundedBytes(in, maxBytes), StandardCharsets.UTF_8);
+        return decodeJsonText(readBoundedBytes(in, maxBytes));
+    }
+
+    static String decodeJsonText(byte[] raw) {
+        if (raw == null || raw.length == 0) {
+            return "";
+        }
+        String text;
+        if (raw.length >= 2 && (raw[0] & 0xFF) == 0xFF && (raw[1] & 0xFF) == 0xFE) {
+            text = decodeStrict(raw, 2, StandardCharsets.UTF_16LE);
+        } else if (raw.length >= 2 && (raw[0] & 0xFF) == 0xFE && (raw[1] & 0xFF) == 0xFF) {
+            text = decodeStrict(raw, 2, StandardCharsets.UTF_16BE);
+        } else {
+            int offset = 0;
+            if (raw.length >= 3 && (raw[0] & 0xFF) == 0xEF && (raw[1] & 0xFF) == 0xBB && (raw[2] & 0xFF) == 0xBF) {
+                offset = 3;
+            }
+            try {
+                text = decodeStrict(raw, offset, StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException utf8Ex) {
+                if (offset != 0 || !Charset.isSupported("GB18030")) {
+                    throw utf8Ex;
+                }
+                text = decodeStrict(raw, offset, Charset.forName("GB18030"));
+            }
+        }
+        while (!text.isEmpty() && text.charAt(0) == '\uFEFF') {
+            text = text.substring(1);
+        }
+        return text;
+    }
+
+    private static String decodeStrict(byte[] raw, int offset, Charset charset) {
+        try {
+            return charset.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(raw, offset, raw.length - offset))
+                    .toString();
+        } catch (CharacterCodingException ex) {
+            throw new IllegalArgumentException("无法按 " + charset.name() + " 解码文本", ex);
+        }
     }
 
     private static byte[] readBoundedBytes(InputStream in, long maxBytes) throws IOException {

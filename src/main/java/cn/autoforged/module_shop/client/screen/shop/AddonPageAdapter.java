@@ -3,12 +3,21 @@ package cn.autoforged.module_shop.client.screen.shop;
 import cn.autoforged.module_shop.api.client.AddonFrame;
 import cn.autoforged.module_shop.api.client.AddonPage;
 import cn.autoforged.module_shop.api.client.AddonPageHost;
+import cn.autoforged.module_shop.api.view.CurrencyTierView;
+import cn.autoforged.module_shop.api.view.CurrencyUnit;
+import cn.autoforged.module_shop.client.ClientHomeCurrencyState;
 import cn.autoforged.module_shop.client.ClientShopData;
+import cn.autoforged.module_shop.shop.currency.PhysicalCurrencyEngine;
 import io.github.humbleui.skija.Canvas;
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.ItemStack;
 
 /**
  * 把附属模组的 {@link AddonPage}（公共 API）接到内部的 {@link ShopPage} 路由上：
@@ -275,6 +284,94 @@ public final class AddonPageAdapter implements ShopPage {
         @Override
         public cn.autoforged.module_shop.client.ui.render.ItemOverlay items() {
             return this.shop.items();
+        }
+
+        @Override
+        public boolean physicalCurrencyEnabled() {
+            return ClientHomeCurrencyState.physEnabled && !ClientHomeCurrencyState.physTiers.isEmpty();
+        }
+
+        @Override
+        public List<CurrencyTierView> physicalTiers() {
+            if (!physicalCurrencyEnabled()) {
+                return List.of();
+            }
+            List<ClientHomeCurrencyState.PhysTierView> src = ClientHomeCurrencyState.physTiers;
+            int[] owned = liveClientOwnedCounts(src);
+            List<CurrencyTierView> out = new ArrayList<>(src.size());
+            for (int i = 0; i < src.size(); i++) {
+                ClientHomeCurrencyState.PhysTierView tv = src.get(i);
+                out.add(new CurrencyTierView(
+                        tv.tierKey(),
+                        tv.displayName(),
+                        tv.itemId,
+                        tv.value,
+                        Math.max(1, tv.stepRatio),
+                        tv.itemStack,
+                        owned[i]));
+            }
+            return List.copyOf(out);
+        }
+
+        @Override
+        public CurrencyUnit activeCurrency() {
+            ClientHomeCurrencyState.PhysTierView addonTier = ClientHomeCurrencyState.activeAddonPhysTier();
+            if (addonTier != null) {
+                return CurrencyUnit.physical(
+                        addonTier.tierKey(), addonTier.displayName(), addonTier.value, addonTier.itemStack);
+            }
+            return CurrencyUnit.star(currencyName());
+        }
+
+        @Override
+        public long activeBalance() {
+            ClientHomeCurrencyState.PhysTierView addonTier = ClientHomeCurrencyState.activeAddonPhysTier();
+            if (addonTier == null) {
+                return balance();
+            }
+            List<ClientHomeCurrencyState.PhysTierView> tiers = ClientHomeCurrencyState.physTiers;
+            int targetIdx = ClientHomeCurrencyState.findTierIndex(addonTier.tierKey());
+            if (targetIdx < 0 || tiers.isEmpty()) {
+                return 0L;
+            }
+            long[] values = ClientHomeCurrencyState.tierValues();
+            int[] owned = liveClientOwnedCounts(tiers);
+            return PhysicalCurrencyEngine.maxPayableTierCount(targetIdx, values, owned);
+        }
+
+        @Override
+        public String activeCurrencyName() {
+            return activeCurrency().displayName();
+        }
+
+        private static int[] liveClientOwnedCounts(List<ClientHomeCurrencyState.PhysTierView> tiers) {
+            int n = tiers.size();
+            int[] counts = new int[n];
+            Minecraft mc = Minecraft.getInstance();
+            if (mc == null || mc.player == null) {
+                for (int i = 0; i < n; i++) {
+                    counts[i] = Math.max(0, tiers.get(i).ownedCount);
+                }
+                return counts;
+            }
+            Inventory inv = mc.player.getInventory();
+            for (int slot = 0; slot < inv.getContainerSize(); slot++) {
+                if (slot >= 36 && slot < 40) {
+                    continue;
+                }
+                ItemStack st = inv.getItem(slot);
+                if (st.isEmpty()) {
+                    continue;
+                }
+                for (int t = 0; t < n; t++) {
+                    ItemStack tpl = tiers.get(t).itemStack;
+                    if (tpl != null && !tpl.isEmpty() && PhysicalCurrencyEngine.matchesTier(st, tpl)) {
+                        counts[t] += st.getCount();
+                        break;
+                    }
+                }
+            }
+            return counts;
         }
     }
 }

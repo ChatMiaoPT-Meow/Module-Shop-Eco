@@ -36,6 +36,14 @@ public final class ShopNbt {
         batchRegistries = registries;
     }
 
+    public static boolean beginBatchIfAbsent(HolderLookup.Provider registries) {
+        if (batchCache != null && batchRegistries == registries) {
+            return false;
+        }
+        beginBatch(registries);
+        return true;
+    }
+
     public static void endBatch() {
         batchCache = null;
         batchRegistries = null;

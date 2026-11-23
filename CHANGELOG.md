@@ -1,6 +1,70 @@
 # 变更记录
 
-遵循 [语义化版本](https://semver.org/lang/zh-CN/)。模组版本与 API 版本独立维护（当前模组 `2.5.0`，公共 API `1.4.0`）。
+遵循 [语义化版本](https://semver.org/lang/zh-CN/)。模组版本与 API 版本独立维护（当前模组 `2.7.2`，公共 API `1.5.0`）。
+
+## [2.7.2]
+
+构建产物：`Module-Shop-Eco-2.7.2-for-NeoForge-1.21.1.jar` 与 `module_shop_eco-2.7.2-api.jar`；PATCH 修复与性能优化（完整同步标准版 `1.8.2 ~ 1.8.4`），向后兼容旧存档 / 配置 / 附属模组，保留历史全部版本 jar。
+
+### 修复与优化
+
+- **出货箱新增永昼/时间停滞自动兜底结算时钟（同步 `1.8.4`）**：新增 `ShippingSettleClock`，正常昼夜循环服保持按 `dayTime` 定时结算；检测到 `/gamerule doDaylightCycle false`、模组冻结 `dayTime` 或命令方块循环拉回白天时，自动平滑切至按总运行刻 `getGameTime()` 每 20 分钟（24,000 刻）定时结算，客户端同步显示实时分秒倒计时与「永昼兜底 · 每20分钟」提示。
+- **彻底解决万级购物城商品打开商店与动钱卡顿（同步 `1.8.3` 并适配 Eco 动态做市价）**：
+  - `ShopManager.sendSnapshot` 新增按玩家维度的购物城视图指纹 `LAST_SENT_MALL_HASH`，购物城未变动时仅下发 `mallUnchanged=true`；
+  - `MallItem` 增加物品 NBT 瞬态缓存并按需附带 `globalStock` 与基准价 `adminStarPrice`，取消 `adminMall` 双份重复编解码；`ShopNbt` 新增 `beginBatchIfAbsent`；
+  - `MallPage.drawFilter` 与 `filtered` 增加分类计数与附加筛选缓存，杜绝浏览万级商品每帧全量扫表。
+- **修复玩家摊位设永久仍次日下架及多项定时/持久化/API 缺陷（同步 `1.8.2`）**：
+  - 移除 `ShopManager.tickDaily` 残留的无条件跨日清摊逻辑（保留 `lastStallClearDay` 用于 `mailExpireDays` 清理并补 `setDirty()` / 防回拨 / `LOCK`）；
+  - 新增 `ShopManager.splitStacks`/`addItemsOrMail` 并加固 `MailEntry.addStack`/`MailEntry.item` 按最大堆叠拆堆，消除高库存退件 Codec 崩溃与受损装备非法堆叠；`tickStallExpire` 补 `LOCK`、离线退件改用 `MailTemplates.Template.STALL_EXPIRED`、`MailFormat` 补 `case "stall_expired"`，同步淘汰 `StallService.ITEM_CACHE`；
+  - `sendSnapshot` 补发 `listedGame`/`listedReal`；新增 `ShopExpireSupport` 修复选永久留空、永久切限时/口径互切重置存量时间戳及原子 TOML 回写兜底；修复 `ShopInputScreen` 缩放重置选项、时长 `0` 展示、`requiresAdminAuth` 漏 `stall_expire` 及 `ClientShopData.reset()`；
+  - 修复 `tickMallRestock` 游戏日回退保护与快照广播、`TemplateService.apply` 合并漏 `permanentLimit`、每日槽位 `0` 持久化、`addMailDraft` 本地日历日口径、`ApiImpl.stallList` 复用 `StallService.listFromApi`、活动日定时前可领/高频空转/静态标记跨档残留及 `PlayerAccount.load` 漏出货箱实体币结算摘要。
+
+## [2.7.1]
+
+构建产物：`Module-Shop-Eco-2.7.1-for-NeoForge-1.21.1.jar` 与 `module_shop_eco-2.7.1-api.jar`；PATCH 修复（同步标准版 `1.8.1`），向后兼容旧存档 / 配置 / 附属模组，保留历史全部版本 jar。
+
+### 修复
+
+- **加固 `Text.sanitize` 十六进制色码与 UTF-16 代理对清洗**：修复物品名含 `§#RRGGBB` 色码时残留 `RRGGBB` 字母的问题，并将 `§` 后跳过逻辑由固定 `i += 2` 升级为按 `Character.charCount(raw.codePointAt(i))` 跳过完整 Unicode 码点，避免 `§` 紧跟 Emoji/扩展区代理对时截断出孤立低代理项 `'?'` 乱码及末尾孤立 `§` 越界风险（同步惠及所有调用 `V2.text`/`V2.bold` 的附属模组）。
+- **加固 `PhysicalCurrencyConfig` 与 `ShopTemplateStore` 的 UTF-16/UTF-8 BOM 及严格 GB18030 读取容错**：读取 `physical_currency.json` 与商店模板 JSON（含 `.json` / `.json.gz` / `.mshop`）时优先识别 UTF-16LE（`FF FE`）/ UTF-16BE（`FE FF`）与 UTF-8 BOM（`EF BB BF` / `\uFEFF`），并在无 BOM 的严格 UTF-8 解码失败时使用严格模式（`CodingErrorAction.REPORT`）回退 `GB18030`，既兼容 Windows 记事本中文保存又杜绝损坏二进制被静默解成乱码。
+- **修复 `ApiImpl.Economy.resolveCurrency` 在实体币停用或档位被删时偷换币种的问题**：空串 / `null` / `"star"` 仍返回虚拟主货币；非空实体币键不再因 `!cfg.isActive()` 退回虚拟星币，若档位被删亦不再回退第 0 档，而是原样保留 `tierKey` 交由下游兜底解析或显式报错，防止退款/领包价值错配及误扣虚拟国库。
+- **对齐核心与 Eco 的实体币发放前校验及虚拟货币国库/流水记账口径**：`ApiImpl.Economy.add` 与 `ApiImpl.Reward.grantOnce` 在发放实体币前统一通过 `PhysicalCurrencyEngine.buildPhysicalTierStacks` 按实际数量预校验能否构建真实物品栈（在写入 `apiRequests` 幂等键之前失败返回 `INVALID_ARGUMENT`），并统一新旧虚拟主货币发款溢出转金钱邮件时的流水记账与 Eco 国库冲正扣减口径为实际发放总额 `amount`，杜绝凭空印钱。
+
+## [2.7.0]
+
+构建产物：`Module-Shop-Eco-2.7.0-for-NeoForge-1.21.1.jar` 与 `module_shop_eco-2.7.0-api.jar`；公共 API 升级至 `1.5.0`（与标准版 `1.8.0` 签名 100% 字节级对齐，新增接口均为 `default` 方法，完全向后兼容旧存档 / 配置 / 附属模组），保留历史全部版本 jar。
+
+### 新增与修复
+
+- **公共 API 1.5.0 统一货币体系（全面支持自定义虚拟主货币与分层实体货币，严格隔离虚拟国库）**：
+  - `ApiVersion` 升至 `1.5.0`（`API_MINOR = 5`），新增非内联运行期版本探测方法 `runtimeMajor()`、`runtimeMinor()` 与 `atLeast(int, int)`。
+  - 新增公共货币视图记录 `CurrencyUnit` 与 `CurrencyTierView`。
+  - `EconomyApi` / `ApiImpl.Economy` 新增 `currencyName()`、`isPhysicalCurrencyEnabled()`、`physicalTiers(UUID)`、`activeCurrency()`、`resolveCurrency(String)`、`balance(UUID, CurrencyUnit)`、`balanceActive(UUID)`、`add(UUID, CurrencyUnit, long, String)`、`addActive(...)`、`take(UUID, CurrencyUnit, long, String)`、`takeActive(...)`；虚拟主货币溢出全额/差额转金钱邮件并保持 Eco 国库冲正规则，实体货币在线走链内破整找零、发款支持在线背包/离线物品邮件且**严格不读写虚拟星币国库**，写操作自动推送在线玩家快照。
+  - `RewardApi` / `ApiImpl.Reward` 新增 `grantOnce(..., CurrencyUnit, long, String)` 与 `grantOnceActive(...)`，复用同一幂等键表支持实体货币发奖。
+  - `AddonPageHost` / `AddonPageAdapter.Host` 新增 `physicalCurrencyEnabled()`、`physicalTiers()`、`activeCurrency()`、`activeBalance()`（实时扫描本地背包并通过 `PhysicalCurrencyEngine.maxPayableTierCount` 二分计算精确可付枚数）与 `activeCurrencyName()`。
+- **实体货币管理配置新增「附属默认货币」与兑换页显示修复**：
+  - `PhysicalCurrencyConfig` 新增 `addonDefaultTierKey`（同步接入 `admin_phys_currency_save`、模板导入导出、`CurrencySettlement.writeSnapshot` 与 `ClientHomeCurrencyState`）；`PhysicalCurrencyConfigScreen` 支持在右侧一键设为/取消「附属默认」并在阶梯列表与顶部状态条醒目标注。
+  - 修复 `CurrencySettlement.writeSnapshot` 未写入 `physPlayerValue` 及 `PhysicalCurrencyExchangeScreen` 顶部总面值与单枚面值误拼虚拟星币单位的问题。
+
+## [2.6.0]
+
+构建产物：`Module-Shop-Eco-2.6.0-for-NeoForge-1.21.1.jar` 与 `module_shop_eco-2.6.0-api.jar`；向后兼容旧存档 / 配置 / 附属模组，保留历史全部版本 jar。
+
+### 新增与修复
+
+- **每日收购 / 每日商店全服实时同步与「全服重抽」后台能力（同步主仓 `1.7.0` 并完整适配 Eco 动态报价）**：
+  - **同日增量自动补齐与删项同步**：`ensureDaily` 新增 `syncDailyShopWithPool` 与 `syncDailyBuybackWithPool`，管理员增删改商品池（单件上架、批量上架、改价、删除）时自动触发 `broadcastSnapshots` 全服静默同步；已从候选池删除或触发实体币防套利锁的条目立即从玩家当日清单移除，玩家当日槽位未满（包括「空池先登后摆」死锁场景或池内条目数 ≤ 条目上限时新增商品）自动实时补齐，Eco 启用时走 `ClearingHouse.topUpDailyBuybackEco` 按职业与做市动态报价补齐，无需等次日 0 点。
+  - **修复「刷新参数」仅重抽管理员本人问题**：`adminShopGenSet` 改为调用 `ShopManager.rerollDailyForAll`（内部经 `resetAccountsDaily` 重置全部在线与离线玩家当日标记）并推送快照。
+  - **新增管理后台「全服重抽」按钮与指令增强**：每日商店与每日收购管理页底部新增「全服重抽」按钮（带二次确认与管理密码锁保护）；`/shop reload`（保留 Eco 职业与品质配置重载）与「配置管理 → 导入模板 / 恢复默认」同步覆盖离线玩家账户；`/shop admin refresh` 支持无参重抽全服及 `@a` 多目标选择器。
+  - **修复每日收购品质保底失效与添加模块归属同步**：`ShopManager.generateDailyBuyback` 与 `ClearingHouse.generateDailyBuybackEco` 均补齐 `applyBuybackGuarantee` 保底替换逻辑（Eco 模式按当日锁定动态报价 `quotedSpecs` 生成保底条目）；`admin_add` 携带客户端当前模块 `mode` 同步服务端 `ADMIN_EDIT_TYPE`。
+
+## [2.5.2]
+
+构建产物：`Module-Shop-Eco-2.5.2-for-NeoForge-1.21.1.jar` 与 `module_shop-2.5.2-api.jar`；PATCH 修复（同步主仓 `1.6.2`），旧存档 / 配置 / 附属模组直接兼容，保留历史全部版本 jar。
+
+### 修复
+
+- **修复与 ColorTooltips 等第三方悬浮框模组的兼容性问题（悬停不显示、移开瞬间闪一下）及大 GUI 缩放下原版提示框越界错位**：移除 `ShellV2.render` 与 `SkiaDialog.skiaRender` 在绘制 `renderTooltip` 时包裹的 `g.pose().scale(tk, tk, 1.0F)` 及 `(mouseX / tk, mouseY / tk)` 坐标缩放，统一保持单位 `pose` 并传入原始 GUI 坐标 `(mouseX, mouseY)`，消除 `ColorTooltips` 中 `GuiGraphics.enableScissor`（不随 `pose` 缩放）导致的裁剪消失与 `ScreenEvent.Render.Post` 淡出阶段闪烁；新增回归单测 `shellV2AndSkiaDialogRenderTooltipsWithIdentityPoseAndGuiCoords`。
 
 ## [2.5.1]
 

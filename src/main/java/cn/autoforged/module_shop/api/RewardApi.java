@@ -20,4 +20,24 @@ public interface RewardApi {
      * @param reason    写进流水与邮件正文的原因，例如「每日任务：采矿 10 个」
      */
     ApiResult<Void> grantOnce(UUID target, String requestId, List<ItemStack> items, long money, String reason);
+
+    /**
+     * 按指定货币单位发放一次幂等奖励（复用同一幂等键表；支持虚拟主货币与实体货币）。
+     *
+     * @since API 1.5
+     */
+    default ApiResult<Void> grantOnce(UUID target, String requestId, List<ItemStack> items,
+            cn.autoforged.module_shop.api.view.CurrencyUnit unit, long money, String reason) {
+        return grantOnce(target, requestId, items, money, reason);
+    }
+
+    /**
+     * 按当前 {@link EconomyApi#activeCurrency()} 发放一次幂等奖励。
+     *
+     * @since API 1.5
+     */
+    default ApiResult<Void> grantOnceActive(UUID target, String requestId, List<ItemStack> items,
+            long money, String reason) {
+        return grantOnce(target, requestId, items, ModuleShopApi.economy().activeCurrency(), money, reason);
+    }
 }
